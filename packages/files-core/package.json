@@ -1,0 +1,38 @@
+{
+  "name": "@gugu-acp/files-core",
+  "version": "0.1.0",
+  "description": "咕咕「打开的文件」和存储无关的核心:Yjs 表示与读写、同时建合并、限速与上限、presence 盖章。远端文件服务与桌面本地服务共用",
+  "type": "module",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "files": [
+    "src"
+  ],
+  "exports": {
+    "./content": {
+      "types": "./src/content.d.mts",
+      "default": "./src/content.mjs"
+    },
+    "./concurrent": {
+      "types": "./src/concurrent.d.mts",
+      "default": "./src/concurrent.mjs"
+    },
+    "./limits": {
+      "types": "./src/limits.d.mts",
+      "default": "./src/limits.mjs"
+    },
+    "./presence": {
+      "types": "./src/presence.d.mts",
+      "default": "./src/presence.mjs"
+    },
+    "./open-files": {
+      "types": "./src/open-files.d.mts",
+      "default": "./src/open-files.mjs"
+    }
+  },
+  "peerDependencies": {
+    "yjs": "13.6.33"
+  }
+}

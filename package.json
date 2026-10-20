@@ -1,0 +1,32 @@
+{
+  "name": "@gugu/community-backend",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@10.28.2",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "vitest run --project unit",
+    "test:integration": "node scripts/test-integration.mjs",
+    "check:functions": "deno check supabase/functions/server-login/index.ts supabase/functions/attachments/index.ts",
+    "setup": "node scripts/setup.mjs",
+    "test:db:start": "node scripts/test-db.mjs start",
+    "test:db:stop": "node scripts/test-db.mjs stop",
+    "test:installation": "node --test tests/installation/*.test.mjs"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "@hocuspocus/provider": "4.7.0",
+    "@types/node": "^20.10.0",
+    "@types/pg": "^8.11.0",
+    "jose": "6.2.12",
+    "pg": "8.16.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10",
+    "yjs": "13.6.33",
+    "supabase": "2.106.0"
+  }
+}

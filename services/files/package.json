@@ -1,0 +1,21 @@
+{
+  "name": "@gugu-supabase/files",
+  "private": true,
+  "description": "工作区文件服务:Hocuspocus + Yjs,一个文件 = chat.workspace_items 一行",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "main": "src/main.mjs",
+  "scripts": {
+    "start": "node src/main.mjs"
+  },
+  "dependencies": {
+    "@gugu/files-core": "workspace:@gugu-acp/files-core@*",
+    "@hocuspocus/server": "4.7.0",
+    "jose": "6.2.12",
+    "pg": "8.16.3",
+    "y-protocols": "1.0.7",
+    "yjs": "13.6.33"
+  }
+}

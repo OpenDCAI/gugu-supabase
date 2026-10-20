@@ -1,0 +1,8 @@
+**/node_modules
+**/.git
+.local
+tests
+supabase
+scripts
+deploy
+docs

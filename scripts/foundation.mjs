@@ -1,0 +1,43 @@
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
+export const foundationFile = fileURLToPath(new URL('../supabase/migrations/20261021000000_foundation.sql', import.meta.url))
+export const foundationSql = readFileSync(foundationFile, 'utf8')
+export const foundationDigest = createHash('sha256').update(foundationSql).digest('hex')
+
+/** query runs a complete SQL request on one connection. No historical ledger is rewritten. */
+export async function installFoundation(query) {
+  const [state] = await query(`SELECT current_setting('server_version_num')::integer AS version,
+    to_regnamespace('identity') IS NOT NULL AS has_identity,
+    to_regnamespace('billing') IS NOT NULL AS has_billing,
+    to_regclass('gugu_install.releases') IS NOT NULL AS has_ledger,
+    to_regclass('auth.users') IS NOT NULL AND to_regclass('storage.objects') IS NOT NULL
+      AND to_regclass('realtime.messages') IS NOT NULL AS has_platform`, true)
+  if (!state || Number(state.version) < 170000) throw new Error('Gugu foundation requires PostgreSQL 17 or newer')
+  if (!state.has_platform) throw new Error('Initialize Supabase Auth, Storage and Realtime before installing the foundation')
+  if (state.has_ledger) {
+    const rows = await query("SELECT digest FROM gugu_install.releases WHERE version='foundation-v1'", true)
+    if (rows.length !== 1 || rows[0].digest !== foundationDigest) throw new Error('Installed foundation differs; use an explicit upgrade, never reset its ledger')
+    if (!state.has_identity || state.has_billing) throw new Error('This is not a standalone community foundation')
+    return { installed: false, digest: foundationDigest }
+  }
+  if (state.has_identity || state.has_billing) throw new Error('Use a new dedicated project; this database already contains Gugu or official service schemas')
+  await query(`BEGIN;
+SELECT pg_advisory_xact_lock(hashtextextended('gugu:foundation-install:v1',0));
+DO $fresh$ BEGIN
+  IF to_regnamespace('identity') IS NOT NULL OR to_regnamespace('billing') IS NOT NULL OR to_regnamespace('chat') IS NOT NULL OR to_regnamespace('gugu_install') IS NOT NULL THEN
+    RAISE EXCEPTION 'Foundation requires a fresh dedicated project';
+  END IF;
+END $fresh$;
+${foundationSql}
+CREATE SCHEMA gugu_install;
+REVOKE ALL ON SCHEMA gugu_install FROM PUBLIC,anon,authenticated;
+CREATE TABLE gugu_install.releases(version text PRIMARY KEY,digest text NOT NULL,installed_at timestamptz NOT NULL DEFAULT now());
+REVOKE ALL ON gugu_install.releases FROM PUBLIC,anon,authenticated;
+INSERT INTO gugu_install.releases(version,digest) VALUES('foundation-v1','${foundationDigest}');
+COMMIT;`)
+  const [result] = await query("SELECT digest FROM gugu_install.releases WHERE version='foundation-v1'", true)
+  if (result?.digest !== foundationDigest) throw new Error('Foundation installation could not be verified')
+  return { installed: true, digest: foundationDigest }
+}

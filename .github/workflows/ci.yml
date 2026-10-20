@@ -1,0 +1,41 @@
+name: Community backend
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.6.4
+      - run: pnpm check:functions
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GUGU_INSTALL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:db:start
+      - run: pnpm test:installation
+      - run: pnpm test:integration
+      - if: ${{ always() }}
+        run: pnpm test:db:stop

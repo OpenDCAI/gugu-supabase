@@ -1,0 +1,24 @@
+export class ObjectStorageError extends Error {
+  constructor(readonly status: number, readonly code: string | null, message: string) { super(message) }
+}
+
+export interface ReadObject { bytes: Uint8Array; etag: string | null }
+export interface UploadPlan {
+  url: string
+  fields: Record<string, string>
+  expiresAt: string
+  method?: 'POST' | 'PUT'
+  headers?: Record<string, string>
+}
+
+/** Primary blob storage. Database bucket tag "oss" is retained for existing records. */
+export interface AttachmentObjectStorage {
+  upload(key: string, now: Date): Promise<UploadPlan>
+  read(key: string, limit: number): Promise<ReadObject>
+  promote(source: string, destination: string, read: ReadObject, headers: Record<string, string>): Promise<void>
+  put(key: string, bytes: Uint8Array): Promise<void>
+  exists(key: string): Promise<boolean>
+  remove(key: string): Promise<void>
+  sign(key: string, image: boolean, now: Date): Promise<{ url: string; thumbUrl: string | null; expiresAt: string }>
+  invalidate(key: string, image: boolean): Promise<void>
+}

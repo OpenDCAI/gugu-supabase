@@ -112,7 +112,7 @@ describe('Agent sends on behalf of its owner (#7299)', () => {
       expect((await db.query('SELECT chat_id FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2 AND inbox_published_at IS NOT NULL', [result.chat_id, viewer])).rows).toEqual([{ chat_id: result.chat_id }])
     }
     await db.query('RESET role')
-    expect((await db.query('SELECT id FROM chat.group_invitations WHERE inviter_agent_user_id=$1', [agent])).rows).toEqual([])
+    expect((await db.query('SELECT id FROM chat.group_invitations WHERE inviter_user_id=$1', [agent])).rows).toEqual([])
     expect((await db.query('SELECT id FROM chat.chats WHERE creator_user_id=$1 AND kind=\'group\'', [owner])).rows).toEqual([])
   })
   it('keeps the Agent identity private in direct reads, base rows, and SECURITY DEFINER synchronization', async () => {

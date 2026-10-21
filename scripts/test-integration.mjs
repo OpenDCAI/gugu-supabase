@@ -42,7 +42,7 @@ while (Date.now() < deadline) {
   await new Promise((resolve) => setTimeout(resolve, 250))
 }
 if (!ready) throw new Error('The fixture Data API did not expose the installed foundation')
-execFileSync(path.join(root, 'node_modules/.bin/vitest'), ['run', '--project', 'integration', '--maxWorkers=4', ...process.argv.slice(2)], {
+const options = {
   cwd: root, stdio: 'inherit',
   env: {
     ...process.env,
@@ -54,4 +54,13 @@ execFileSync(path.join(root, 'node_modules/.bin/vitest'), ['run', '--project', '
     GUGU_INTEGRATION_SERVICE_ROLE_KEY: status.SERVICE_ROLE_KEY,
     SUPABASE_SERVICE_ROLE_KEY: status.SERVICE_ROLE_KEY,
   },
-})
+}
+const args = process.argv.slice(2)
+const run = (filters) => execFileSync(path.join(root, 'node_modules/.bin/vitest'), ['run', '--project', 'integration', ...filters], options)
+if (args.length === 0) {
+  // Fault injection installs member-table DDL; finish it before concurrent fixtures hold that table.
+  run(['--maxWorkers=1', 'tests/integration/service/groupAdminAs.test.ts'])
+  run(['--maxWorkers=4', '--exclude', '**/groupAdminAs.test.ts'])
+} else {
+  run(['--maxWorkers=4', ...args])
+}

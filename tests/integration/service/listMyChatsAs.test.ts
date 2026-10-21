@@ -1,3 +1,4 @@
+import { createFixtureGroup } from '../../support/groupFixture'
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -75,7 +76,7 @@ async function agentOf(ownerId: string, name: string): Promise<string> {
 async function newGroup(creator: string, name: string, initial: Array<[string, string]>): Promise<string> {
   const id = randomUUID()
   await asUser(creator)
-  await database.query('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
+  await createFixtureGroup(database, [
     id, name, creator, JSON.stringify(initial.map(([user_id, role]) => ({ user_id, role }))),
   ])
   await asService()

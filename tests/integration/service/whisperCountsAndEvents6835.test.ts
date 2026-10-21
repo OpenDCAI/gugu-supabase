@@ -1,6 +1,6 @@
 // gugu #6835 悄悄话的条数与动静只给看得见它的人 —— 对着**真库**跑。
 //   · 话题列表的 message_count 按调用者读得到的数,且与他 message_history_as 读到的行数相同;
-//   · 关于一条悄悄话的事件(新建、删除、投递回执、回应、话题里引起的来源线 chat_changed)只发给看得见它的人。
+//   · 关于一条悄悄话的人类账号事件只发给看得见它的人;agent 仍经 *_as 读取消息，不消费自己的 journal。
 // 每条否定断言都配公开消息的正对照:「没收到」也可能是没发出去,只有正对照能分开。
 //
 // 与 messageViaAppF16 同形:loopback PostgreSQL、`GUGU_INTEGRATION_DATABASE_URL`,每条用例 BEGIN…ROLLBACK。
@@ -158,43 +158,46 @@ describe('#6835 whispers count and ring only for the people who can see them', (
     })
   })
 
-  it('created / reaction / delivery / deleted events of a whisper reach only its sender and recipient; a public line reaches everyone', async () => {
+  it('whisper account events reach only visible human viewers; public events reach all human members', async () => {
     await inRollback(async () => {
       const room = await seedRoom('e1')
-      const everyone = [room.owner, room.alice, room.peer, room.a, room.b].sort()
-      const theTwo = [room.alice, room.a].sort()
+      const everyone = [room.owner, room.alice, room.peer].sort()
+      const whisperHumans = [room.alice] // The other participant is an agent, not an account-event consumer.
       const whisper = room.ids()
       const open = room.ids()
 
       let since = await mark()
       await post(room, room.group, room.alice, whisper, '只给 A', room.a)
       await post(room, room.group, room.alice, open, '大家好', null)
-      expect(await notified(since, 'message_created', { entityId: whisper })).toEqual(theTwo)
+      expect(await notified(since, 'message_created', { entityId: whisper })).toEqual(whisperHumans)
       expect(await notified(since, 'message_created', { entityId: open })).toEqual(everyone)
+      // The agent still reads its whisper through the owner-authenticated RPC.
+      const read = await as<{ id: string }>(room.owner, 'SELECT id FROM chat.message_history_as($1,$2,NULL,NULL,100)', [room.group, room.a])
+      expect(read.map(({ id }) => id)).toContain(whisper)
 
       since = await mark()
       await database.query(`INSERT INTO chat.message_reactions (id, message_id, user_id, emoji) VALUES ($1,$2,$3,'👍'),($4,$5,$3,'👍')`,
         [room.ids(), whisper, room.a, room.ids(), open])
-      expect(await notified(since, 'reaction_changed', { entityId: whisper })).toEqual(theTwo)
+      expect(await notified(since, 'reaction_changed', { entityId: whisper })).toEqual(whisperHumans)
       expect(await notified(since, 'reaction_changed', { entityId: open })).toEqual(everyone)
 
       since = await mark()
       await database.query(`INSERT INTO chat.message_deliveries (message_id, device_id, status) VALUES ($1,$3,'delivered'),($2,$3,'delivered')`,
         [whisper, open, `gugu-agent:${room.a}`])
-      expect(await notified(since, 'delivery_changed', { entityId: whisper })).toEqual(theTwo)
+      expect(await notified(since, 'delivery_changed', { entityId: whisper })).toEqual(whisperHumans)
       expect(await notified(since, 'delivery_changed', { entityId: open })).toEqual(everyone)
 
       since = await mark()
       await database.query('UPDATE chat.messages SET deleted_at = now() WHERE id = ANY($1)', [[whisper, open]])
-      expect(await notified(since, 'message_deleted', { entityId: whisper })).toEqual(theTwo)
+      expect(await notified(since, 'message_deleted', { entityId: whisper })).toEqual(whisperHumans)
       expect(await notified(since, 'message_deleted', { entityId: open })).toEqual(everyone)
     })
   })
 
-  it('a whisper in a topic wakes the source line only for its sender and recipient; a public topic line wakes the whole source line', async () => {
+  it('topic source-line wakes retain visible human viewers and exclude agent accounts', async () => {
     await inRollback(async () => {
       const room = await seedRoom('t1')
-      const everyone = [room.owner, room.alice, room.peer, room.a, room.b].sort()
+      const everyone = [room.owner, room.alice, room.peer].sort()
       // Alice 与 A 先经一句公开点名进话题:进话题本身是另一条(成员变化)事件,不混进下面的读数。
       await database.query(
         `INSERT INTO chat.messages (id, chat_id, sender_user_id, content, content_type, to_user_ids) VALUES ($1,$2,$3,'@A 进来','text',$4)`,
@@ -203,11 +206,25 @@ describe('#6835 whispers count and ring only for the people who can see them', (
 
       let since = await mark()
       await post(room, room.topic, room.alice, room.ids(), '话题里只给 A', room.a)
-      expect(await notified(since, 'chat_changed', { chatId: room.group })).toEqual([room.alice, room.a].sort())
+      expect(await notified(since, 'chat_changed', { chatId: room.group })).toEqual([room.alice])
 
       since = await mark()
       await post(room, room.topic, room.alice, room.ids(), '话题里公开一句', null)
       expect(await notified(since, 'chat_changed', { chatId: room.group })).toEqual(everyone)
+    })
+  })
+
+  it('a human whisper recipient retains creation and deletion events without notifying other human members', async () => {
+    await inRollback(async () => {
+      const room = await seedRoom('f1')
+      const whisper = room.ids()
+      const viewers = [room.alice, room.peer].sort()
+      let since = await mark()
+      await post(room, room.group, room.alice, whisper, '只给 Peer', room.peer)
+      expect(await notified(since, 'message_created', { entityId: whisper })).toEqual(viewers)
+      since = await mark()
+      await database.query('UPDATE chat.messages SET deleted_at = now() WHERE id=$1', [whisper])
+      expect(await notified(since, 'message_deleted', { entityId: whisper })).toEqual(viewers)
     })
   })
 })

@@ -205,11 +205,13 @@ describe('#5856 话题的访问控制(对着真库跑)', () => {
         return { agents: commands.rows.map(({ user_id }) => user_id), notified: revisions.rows.map(({ user_id }) => user_id) }
       }
       const originalMembers = [f.owner, f.carol, participant].sort()
+      // Human account journals and agent delivery are separate contracts.
+      const humanViewers = [f.owner, f.carol].sort()
       expect(await memberIds()).toEqual(originalMembers)
       const broadcast = uid('6004', 81)
       await send(broadcast, ['*'])
       expect(await memberIds()).toEqual(originalMembers)
-      expect(await recipients(broadcast)).toEqual({ agents: [participant], notified: originalMembers })
+      expect(await recipients(broadcast)).toEqual({ agents: [participant], notified: humanViewers })
 
       // Positive control: an explicit source mention still invites and delivers. The next @all
       // includes that new participant, while the source-only human (Bob) stays outside.
@@ -226,7 +228,7 @@ describe('#5856 话题的访问控制(对着真库跑)', () => {
       const nextBroadcast = uid('6004', 83)
       await send(nextBroadcast, ['*'])
       expect(await memberIds()).toEqual(joinedMembers)
-      expect(await recipients(nextBroadcast)).toEqual({ agents: [participant, invitee].sort(), notified: joinedMembers })
+      expect(await recipients(nextBroadcast)).toEqual({ agents: [participant, invitee].sort(), notified: humanViewers })
     })
   })
 

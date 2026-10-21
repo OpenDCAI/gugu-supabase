@@ -20,7 +20,8 @@ afterAll(async () => { await db?.end() })
 beforeEach(async () => {
   await db.query('BEGIN')
   owner = randomUUID(); command = randomUUID()
-  // 没有真实设备、账号或投递：临时表只挂生产触发器函数，真实realtime.send写入也随本事务回滚。
+  await db.query("INSERT INTO identity.users(id,type,display_name) VALUES($1,'human','outcome owner')", [owner])
+  // 只有事务内的人类身份，没有真实设备或投递；临时表挂生产触发器，广播随事务回滚。
   await db.query(`CREATE TEMP TABLE outcome7503 (LIKE identity.gugu_device_commands INCLUDING DEFAULTS) ON COMMIT DROP;
     CREATE TRIGGER outcome7503 AFTER UPDATE OF status ON outcome7503 FOR EACH ROW EXECUTE FUNCTION identity.broadcast_agent_deliver_outcome_7503()`)
   await db.query(`INSERT INTO outcome7503(id,user_id,device_id,type,status,payload) VALUES($1,$2,'fixture','agent.deliver','pending',$3::jsonb)`, [command, owner, JSON.stringify({ agent_user_id: 'agent', chat_id: 'chat', thread_root_id: 'thread', content: 'private message' })])

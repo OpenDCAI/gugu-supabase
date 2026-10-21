@@ -229,7 +229,8 @@ describe('within one transaction', () => {
 
     expect(await search(owner, { query: '.md' })).toEqual(['WithAgent:seen.md', 'Without:hidden.md'])
     expect(await search(owner, { query: '.md', asUserId: agent })).toEqual(['WithAgent:seen.md'])
-    expect((await recent(owner)).map((row) => row.filename)).toEqual(['hidden.md', 'seen.md'])
+    // This case checks visibility; the dedicated recent-order case above checks ordering.
+    expect((await recent(owner)).map((row) => row.filename).sort()).toEqual(['hidden.md', 'seen.md'])
     expect((await recent(owner, agent)).map((row) => row.filename)).toEqual(['seen.md'])
 
     // 代别人的 agent、代别人，都被拒。

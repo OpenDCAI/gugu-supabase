@@ -6,7 +6,7 @@ import { foundationDigest, installFoundation, installReleases, releases } from '
 
 // Deliberately requires an empty, disposable Supabase PostgreSQL 17 instance.
 // Never resets schemas, migration history, or user data to make a test pass.
-test('fresh foundation, repeat installation, authorization and refusal guards', async () => {
+test('fresh foundation, repeat installation, authorization and refusal guards', async (t) => {
   const url = new URL(process.env.GUGU_INSTALL_TEST_DATABASE_URL ?? '')
   assert.ok(['postgres:', 'postgresql:'].includes(url.protocol))
   assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'installation tests require loopback PostgreSQL')
@@ -20,7 +20,38 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     assert.equal((await query("SELECT to_regnamespace('identity') AS existing"))[0].existing, null, 'use a fresh dedicated fixture')
     assert.deepEqual(await installFoundation(query), { installed: true, digest: foundationDigest })
     const versions = releases.map((release) => release.version)
-    assert.deepEqual(await installReleases(query), { applied: versions, versions })
+    const userEventsRelease = releases.find((release) => release.version.endsWith('_human_user_events'))
+    assert.ok(userEventsRelease, 'human user-events is an incremental release')
+    const releaseQuery = async (sql) => {
+      if (!sql.includes(userEventsRelease.sql)) return query(sql)
+      // First exercise the release on the clean community schema and roll it
+      // back. Then install it with an independent producer present. Both paths
+      // must work without the release owning or changing that extension.
+      await t.test('human user-events release installs on the community schema', async () => {
+        assert.match(sql, /COMMIT;\s*$/)
+        await query(sql.replace(/COMMIT;\s*$/, 'ROLLBACK;'))
+        assert.equal((await query("SELECT to_regprocedure('chat.send_user_event(jsonb,text,text,boolean)') AS helper"))[0].helper, null)
+      })
+      let result
+      await t.test('human user-events release preserves an independent user-event sender', async () => {
+        await query(`CREATE SCHEMA user_events_extension;
+        CREATE FUNCTION user_events_extension.emit(p_user_id text) RETURNS void
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $extension$
+        BEGIN
+          PERFORM realtime.send('{}'::jsonb,'extension_changed','gugu:user:'||p_user_id||':events',true);
+        END $extension$;
+        REVOKE ALL ON FUNCTION user_events_extension.emit(text) FROM PUBLIC,anon,authenticated;
+        GRANT EXECUTE ON FUNCTION user_events_extension.emit(text) TO service_role;`)
+        const extension = () => query(`SELECT pg_get_functiondef(oid) AS definition,proacl::text AS acl
+          FROM pg_proc WHERE oid='user_events_extension.emit(text)'::regprocedure`)
+        const before = await extension()
+        result = await query(sql)
+        assert.deepEqual(await extension(), before, 'release preserves independent producers and their ACL')
+        await query('DROP SCHEMA user_events_extension CASCADE')
+      })
+      return result
+    }
+    assert.deepEqual(await installReleases(releaseQuery), { applied: versions, versions })
     assert.equal((await query('SHOW row_security'))[0].row_security, 'on', 'dump settings stay local to the installation transaction')
     const before = await query('SELECT version,digest,installed_at FROM gugu_install.releases')
     assert.deepEqual(await installFoundation(query), { installed: false, digest: foundationDigest })

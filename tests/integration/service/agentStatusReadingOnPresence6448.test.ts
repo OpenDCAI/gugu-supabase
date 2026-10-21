@@ -80,6 +80,60 @@ async function presenceRevisions(owner: string): Promise<number> {
 }
 
 describe('#6448 presence 行带上宿主写下的读数', () => {
+  it('同群 human 收到状态 revision 和 wake，agent 只按需读快照而不收这两种写入', async () => fixture(async (f) => {
+    const human = randomUUID()
+    const agentViewer = randomUUID()
+    const chat = `presence-viewers-${randomUUID()}`
+    const topics = [f.owner, human, agentViewer].map((id) => `gugu:user:${id}:events`)
+    const wakeCounts = async (): Promise<Record<string, number>> => {
+      const { rows } = await db.query<{ topic: string; count: string }>(
+        "SELECT topic, count(*) FROM realtime.messages WHERE event='im_revision_advanced' AND topic=ANY($1::text[]) GROUP BY topic", [topics])
+      return Object.fromEntries(rows.map((row) => [row.topic, Number(row.count)]))
+    }
+    try {
+      await db.query('INSERT INTO auth.users(id,email) VALUES ($1::uuid,$2)', [human, `presence-${human}@example.test`])
+      await db.query("INSERT INTO identity.users(id,type,display_name) VALUES ($1,'human','presence viewer') ON CONFLICT (id) DO NOTHING", [human])
+      await db.query("INSERT INTO identity.users(id,type,display_name,owner_user_id,device_id,desired_status) VALUES ($1,'agent','presence agent viewer',$2,$3,'online')", [agentViewer, f.owner, f.device])
+      await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES ($1,'group','presence viewers',$2)", [chat, f.owner])
+      await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner'),($1,$3,'member'),($1,$4,'member'),($1,$5,'member')", [chat, f.owner, human, f.agent, agentViewer])
+      // Local disposable fixture only: let this source transition claim the wake
+      // regardless of any presence emitted while the membership was set up.
+      await db.query('DELETE FROM chat.presence_wake_throttles WHERE viewer_user_id=ANY($1::text[])', [[f.owner, human, agentViewer]])
+      const before = await wakeCounts()
+      const { rows: heads } = await db.query<{ user_id: string; revision: string }>(
+        'SELECT user_id,revision FROM chat.account_revision_heads WHERE user_id=ANY($1::text[])', [[f.owner, human, agentViewer]])
+      const revisionsBefore = Object.fromEntries(heads.map((row) => [row.user_id, row.revision]))
+
+      await asOwner(f.owner, WRITE, [f.agent, 'running', 'needs_user', 'approval'])
+
+      const { rows } = await db.query<{ user_id: string; count: string }>(
+        `SELECT user_id,count(*) FROM chat.account_revisions
+         WHERE event='presence_changed' AND resource_key->>'agent_user_id'=$1
+           AND revision > coalesce(($2::jsonb->>user_id)::bigint,0)
+         GROUP BY user_id ORDER BY user_id`, [f.agent, JSON.stringify(revisionsBefore)])
+      // Positive control: both owner and a different human retain exactly one
+      // journal edge; owner + shared-chat membership must not double-send.
+      expect(rows).toEqual([f.owner, human].sort().map((user_id) => ({ user_id, count: '1' })))
+      expect(rows.some((row) => row.user_id === agentViewer)).toBe(false)
+      const after = await wakeCounts()
+      for (const id of [f.owner, human]) {
+        const topic = `gugu:user:${id}:events`
+        expect((after[topic] ?? 0) - (before[topic] ?? 0)).toBe(1)
+      }
+      const agentTopic = `gugu:user:${agentViewer}:events`
+      expect((after[agentTopic] ?? 0) - (before[agentTopic] ?? 0)).toBe(0)
+      expect(await presence(f.agent)).toMatchObject({ activity_status: 'running', agent_status: 'needs_user', agent_status_detail: 'approval' })
+      // MCP's remote-status lookup keeps reading the same authoritative snapshot.
+      await asOwner(f.owner, 'SELECT identity.get_agent_presence_batch(ARRAY[$1]::text[])', [f.agent])
+    } finally {
+      await db.query('DELETE FROM chat.chats WHERE id=$1', [chat])
+      await db.query('DELETE FROM identity.users WHERE id=$1', [agentViewer])
+      await db.query('DELETE FROM auth.users WHERE id=$1::uuid', [human])
+      await db.query('DELETE FROM chat.account_revision_heads WHERE user_id=ANY($1::text[])', [[human, agentViewer]])
+      await db.query('DELETE FROM realtime.messages WHERE topic=ANY($1::text[])', [topics])
+    }
+  }))
+
   it('读数落两列、进 presence 载荷;running/idle 投影照旧', async () => fixture(async (f) => {
     await asOwner(f.owner, WRITE, [f.agent, 'running', 'needs_user', 'approval'])
     expect(await presence(f.agent)).toMatchObject({

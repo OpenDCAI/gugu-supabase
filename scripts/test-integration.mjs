@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
-import { foundationDigest } from './foundation.mjs'
+import { foundationDigest, releases } from './foundation.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const directory = path.join(root, '.local/test-db')
@@ -24,6 +24,9 @@ await db.connect()
 try {
   const { rows } = await db.query("SELECT digest FROM gugu_install.releases WHERE version='foundation-v1'")
   if (rows[0]?.digest !== foundationDigest) throw new Error('Install the matching community foundation before running integration tests')
+  const { rows: installed } = await db.query("SELECT version,digest FROM gugu_install.releases WHERE version<>'foundation-v1'")
+  const expected = releases.map((release) => release.version + ':' + release.digest).join(',')
+  if (installed.map((row) => row.version + ':' + row.digest).sort().join(',') !== expected) throw new Error('Install the matching community releases before running integration tests')
   // Expose schemas only after they exist. This is the local equivalent of the Cloud setup PATCH.
   await db.query("ALTER ROLE authenticator SET pgrst.db_schemas='public,identity,chat,moments,graphql_public'; NOTIFY pgrst, 'reload config'; NOTIFY pgrst, 'reload schema'")
 } finally { await db.end() }

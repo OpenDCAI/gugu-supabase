@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
-import { foundationDigest, installFoundation } from '../../scripts/foundation.mjs'
+import { foundationDigest, installFoundation, installReleases, releases } from '../../scripts/foundation.mjs'
 
 // Deliberately requires an empty, disposable Supabase PostgreSQL 17 instance.
 // Never resets schemas, migration history, or user data to make a test pass.
@@ -19,11 +19,14 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
   try {
     assert.equal((await query("SELECT to_regnamespace('identity') AS existing"))[0].existing, null, 'use a fresh dedicated fixture')
     assert.deepEqual(await installFoundation(query), { installed: true, digest: foundationDigest })
+    const versions = releases.map((release) => release.version)
+    assert.deepEqual(await installReleases(query), { applied: versions, versions })
     assert.equal((await query('SHOW row_security'))[0].row_security, 'on', 'dump settings stay local to the installation transaction')
     const before = await query('SELECT version,digest,installed_at FROM gugu_install.releases')
     assert.deepEqual(await installFoundation(query), { installed: false, digest: foundationDigest })
+    assert.deepEqual(await installReleases(query), { applied: [], versions })
     assert.deepEqual(await query('SELECT version,digest,installed_at FROM gugu_install.releases'), before)
-    assert.equal((await query("SELECT count(*)::integer AS n FROM pg_policies WHERE schemaname='realtime' AND policyname LIKE 'gugu_%'"))[0].n, 7)
+    assert.equal((await query("SELECT count(*)::integer AS n FROM pg_policies WHERE schemaname='realtime' AND policyname LIKE 'gugu_%'"))[0].n, 8, 'foundation 7 + forum events')
     assert.equal((await query("SELECT count(*)::integer AS n FROM cron.job WHERE active AND jobname IN ('device-lease-sweep','file-blob-upload-sweep','file-blob-gc-kick')"))[0].n, 3)
     assert.equal((await query("SELECT to_regnamespace('billing') AS billing"))[0].billing, null)
     assert.equal((await query("SELECT count(*)::integer AS n FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND p.proname IN ('model_access_reserve','cloud_computer_charge','gateway_pool_claim')"))[0].n, 0)
@@ -61,6 +64,16 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     try {
       await db.query("UPDATE gugu_install.releases SET digest='different' WHERE version='foundation-v1'")
       await assert.rejects(installFoundation(query), /explicit upgrade/)
+    } finally { await db.query('ROLLBACK') }
+    await db.query('BEGIN')
+    try {
+      await db.query("UPDATE gugu_install.releases SET digest='different' WHERE version=$1", [releases[0].version])
+      await assert.rejects(installReleases(query), /publish changes as a new release file/)
+    } finally { await db.query('ROLLBACK') }
+    await db.query('BEGIN')
+    try {
+      await db.query("INSERT INTO gugu_install.releases(version,digest) VALUES ('29991231000000_unknown','x')")
+      await assert.rejects(installReleases(query), /does not know/)
     } finally { await db.query('ROLLBACK') }
     await db.query('BEGIN')
     try {

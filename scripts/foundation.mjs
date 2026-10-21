@@ -1,10 +1,20 @@
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 export const foundationFile = fileURLToPath(new URL('../supabase/migrations/20261021000000_foundation.sql', import.meta.url))
 export const foundationSql = readFileSync(foundationFile, 'utf8')
 export const foundationDigest = createHash('sha256').update(foundationSql).digest('hex')
+
+const migrationsDir = fileURLToPath(new URL('../supabase/migrations/', import.meta.url))
+/** Releases after the foundation, in file order. A release file is immutable once published; changes ship as a new file. */
+export const releases = readdirSync(migrationsDir)
+  .filter((file) => /^\d{14}_[a-z0-9_]+\.sql$/.test(file) && file !== '20261021000000_foundation.sql')
+  .sort()
+  .map((file) => {
+    const sql = readFileSync(migrationsDir + file, 'utf8')
+    return { version: file.slice(0, -4), sql, digest: createHash('sha256').update(sql).digest('hex') }
+  })
 
 /** query runs a complete SQL request on one connection. No historical ledger is rewritten. */
 export async function installFoundation(query) {
@@ -40,4 +50,32 @@ COMMIT;`)
   const [result] = await query("SELECT digest FROM gugu_install.releases WHERE version='foundation-v1'", true)
   if (result?.digest !== foundationDigest) throw new Error('Foundation installation could not be verified')
   return { installed: true, digest: foundationDigest }
+}
+
+/** Applies every release not yet in the ledger, each in its own transaction. Recorded releases must match their source. */
+export async function installReleases(query) {
+  const rows = await query("SELECT version,digest FROM gugu_install.releases WHERE version<>'foundation-v1'", true)
+  const installed = new Map(rows.map((row) => [row.version, row.digest]))
+  for (const version of installed.keys()) {
+    if (!releases.some((release) => release.version === version)) throw new Error('Database has release ' + version + ' that this source does not know; use a matching or newer source')
+  }
+  const applied = []
+  for (const release of releases) {
+    if (installed.has(release.version)) {
+      if (installed.get(release.version) !== release.digest) throw new Error('Installed release ' + release.version + ' differs from source; publish changes as a new release file')
+      continue
+    }
+    await query(`BEGIN;
+SELECT pg_advisory_xact_lock(hashtextextended('gugu:foundation-install:v1',0));
+DO $guard$ BEGIN
+  IF EXISTS (SELECT 1 FROM gugu_install.releases WHERE version='${release.version}') THEN
+    RAISE EXCEPTION 'Release ${release.version} was installed concurrently';
+  END IF;
+END $guard$;
+${release.sql}
+INSERT INTO gugu_install.releases(version,digest) VALUES('${release.version}','${release.digest}');
+COMMIT;`)
+    applied.push(release.version)
+  }
+  return { applied, versions: releases.map((release) => release.version) }
 }

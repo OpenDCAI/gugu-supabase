@@ -4,7 +4,7 @@ import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
-import { installFoundation } from './foundation.mjs'
+import { installFoundation, installReleases } from './foundation.mjs'
 
 const exec = promisify(execFile)
 const root = fileURLToPath(new URL('../', import.meta.url))
@@ -39,6 +39,8 @@ async function cli(args) {
 await api('')
 const result = await installFoundation(query)
 console.log(result.installed ? 'Foundation installed and verified.' : 'Matching foundation verified; existing data preserved.')
+const upgrade = await installReleases(query)
+console.log(upgrade.applied.length ? 'Releases applied: ' + upgrade.applied.join(', ') : 'All ' + upgrade.versions.length + ' releases already installed.')
 const currentRest = await api('/postgrest')
 const schemas = new Set(String(currentRest.db_schema || 'public').split(',').map((item) => item.trim()).filter(Boolean))
 for (const schema of ['public', 'identity', 'chat', 'moments']) schemas.add(schema)

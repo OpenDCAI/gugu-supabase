@@ -166,7 +166,11 @@ function fakes(opts: {
         const staged = bucket.staging
         if (!staged) return new Response('<Error><Code>NoSuchKey</Code></Error>', { status: 404 })
         opts.afterGet?.(bucket)
-        return new Response(staged.bytes as unknown as BodyInit, { status: 200, headers: { 'content-length': String(staged.bytes.length), etag: staged.etag } })
+        // OSS gzip transfer starts at 1 KiB and omits ETag/Content-Length; fetch decodes the bytes.
+        const compressed = staged.bytes.length >= 1024 && new Headers(headers).get('Accept-Encoding') !== 'identity'
+        return new Response(staged.bytes as unknown as BodyInit, { status: 200, headers: compressed
+          ? { 'content-encoding': 'gzip' }
+          : { 'content-length': String(staged.bytes.length), etag: staged.etag } })
       }
       if (init?.method === 'PUT' && headers['x-oss-copy-source'] === undefined) {
         // PutObject:把字节放进暂存(转发老式附件时,边缘函数自己放)。
@@ -241,6 +245,14 @@ const pngBytes = () => {
 const commitBody = (extra: Record<string, unknown> = {}) => ({ staging_key: STAGING, message_id: 'm1', chat_id: 'c1', sender_user_id: USER, file_name: 'shot.png', ...extra })
 
 describe('提交', () => {
+  it.each([17, 1023, 1024, 30 * 1024, 150 * 1024, 5 * 1024 * 1024])('原始表示的 %i 字节保留 ETag，按原字节哈希并锁定复制源', async (size) => {
+    const bytes = new Uint8Array(size).fill(97)
+    const { deps, calls, rpcs } = fakes({ object: bytes })
+    await expect(handleCommit(deps, USER, commitBody({ file_name: 'probe.txt', content_type: 'text/plain' }))).resolves.toEqual({ id: 'm1', file_version: 1 })
+    expect(calls[1]!.headers['x-oss-copy-source-if-match']).toBe('"E1"')
+    expect(rpcs[0]!.args).toMatchObject({ p_sha256: createHash('sha256').update(bytes).digest('hex'), p_size_bytes: size })
+  })
+
   it('读暂存(内网)→ 自己算 sha256 → 复制到 <aa>/<sha256>(图片类型、一年 immutable)→ 登记 → 删暂存 → 以调用者身份发消息', async () => {
     const bytes = pngBytes()
     const { deps, calls, rpcs } = fakes({ object: bytes })

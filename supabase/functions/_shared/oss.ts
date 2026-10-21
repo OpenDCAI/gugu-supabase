@@ -192,7 +192,7 @@ export async function ossRequest(cfg: OssConfig, fetchFn: FetchLike, req: {
 
 /** 读一个对象的全部字节(上限 limit,多一个字节就停、报错)和它的 ETag。附件最大 25 MiB,整份读进内存。 */
 export async function ossGetBytes(cfg: OssConfig, fetchFn: FetchLike, key: string, opts: { internal?: boolean; limit?: number } = {}): Promise<{ bytes: Uint8Array; etag: string }> {
-  const res = await ossRequest(cfg, fetchFn, { method: 'GET', key, internal: opts.internal })
+  const res = await ossRequest(cfg, fetchFn, { method: 'GET', key, internal: opts.internal, headers: { 'Accept-Encoding': 'identity' } })
   if (res.status !== 200) throw errorOf(res.status, await res.text())
   const limit = opts.limit ?? MAX_ATTACHMENT_BYTES
   const declared = Number(res.headers.get('content-length') ?? 'NaN')

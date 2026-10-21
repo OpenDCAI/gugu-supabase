@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "咕咕「打开的文件」和存储无关的核心:Yjs 表示与读写、同时建合并、限速与上限、presence 盖章。远端文件服务与桌面本地服务共用",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "SEE LICENSE IN ../../LICENSE",
   "engines": {
     "node": ">=24.0.0"
   },

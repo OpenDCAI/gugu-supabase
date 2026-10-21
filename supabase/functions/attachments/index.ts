@@ -1,4 +1,5 @@
-// Community attachments: user-owned Supabase Storage; user/RLS and GC authorization are enforced below.
+// Community attachments: bytes in the project's Supabase Storage by default, or Alibaba Cloud OSS + CDN when every OSS
+// variable is set (see ../_shared/attachment-storage-config.ts). User/RLS and GC authorization are enforced below.
 import { createClient } from 'npm:@supabase/supabase-js@2.110.9'
 import {
   type AttachmentsDeps,
@@ -11,7 +12,8 @@ import {
   Refusal,
 } from '../_shared/attachments-core.ts'
 
-import { supabaseObjectStorage } from '../_shared/attachment-object-storage.ts'
+import { ossObjectStorage, supabaseObjectStorage } from '../_shared/attachment-object-storage.ts'
+import { type AttachmentStorageConfig, attachmentStorageConfig, StorageConfigError } from '../_shared/attachment-storage-config.ts'
 
 const env = (key: string): string => Deno.env.get(key)?.trim() ?? ''
 
@@ -48,7 +50,7 @@ function publicStorageUrl(signedUrl: string, internalBase: string): string {
   return external + signedUrl.slice(internal.length)
 }
 
-function depsFor(authorization: string): AttachmentsDeps {
+function depsFor(authorization: string, storage: AttachmentStorageConfig): AttachmentsDeps {
   const url = env('SUPABASE_URL')
   const asUser = createClient(url, env('SUPABASE_ANON_KEY'), {
     db: { schema: 'chat' },
@@ -57,20 +59,22 @@ function depsFor(authorization: string): AttachmentsDeps {
   })
   const asService = createClient(url, env('SUPABASE_SERVICE_ROLE_KEY'), { db: { schema: 'chat' }, auth: { persistSession: false } })
   return {
-    objects: supabaseObjectStorage({
-      url, serviceKey: env('SUPABASE_SERVICE_ROLE_KEY'), bucket: env('GUGU_ATTACHMENTS_BUCKET') || 'attachments',
-      fetch: (input, init) => fetch(input, init),
-      signUpload: async (key) => {
-        const { data, error } = await asService.storage.from(env('GUGU_ATTACHMENTS_BUCKET') || 'attachments').createSignedUploadUrl(key)
-        if (error || !data?.signedUrl) throw new Error('could not sign attachment upload')
-        return publicStorageUrl(data.signedUrl, url)
-      },
-      signDownload: async (key, seconds) => {
-        const { data, error } = await asService.storage.from(env('GUGU_ATTACHMENTS_BUCKET') || 'attachments').createSignedUrl(key, seconds)
-        if (error || !data?.signedUrl) throw new Error('could not sign attachment download')
-        return publicStorageUrl(data.signedUrl, url)
-      },
-    }),
+    objects: storage.kind === 'oss'
+      ? ossObjectStorage({ oss: storage.oss, cdn: storage.cdn, fetch: (input, init) => fetch(input, init) })
+      : supabaseObjectStorage({
+        url, serviceKey: env('SUPABASE_SERVICE_ROLE_KEY'), bucket: storage.bucket,
+        fetch: (input, init) => fetch(input, init),
+        signUpload: async (key) => {
+          const { data, error } = await asService.storage.from(storage.bucket).createSignedUploadUrl(key)
+          if (error || !data?.signedUrl) throw new Error('could not sign attachment upload')
+          return publicStorageUrl(data.signedUrl, url)
+        },
+        signDownload: async (key, seconds) => {
+          const { data, error } = await asService.storage.from(storage.bucket).createSignedUrl(key, seconds)
+          if (error || !data?.signedUrl) throw new Error('could not sign attachment download')
+          return publicStorageUrl(data.signedUrl, url)
+        },
+      }),
     fetch: (input, init) => fetch(input, init),
     userRpc: async (fn, args) => {
       const { data, error } = await asUser.rpc(fn, args)
@@ -103,17 +107,27 @@ Deno.serve(async (request) => {
     log('not_configured', { missing })
     return json({ error: 'not_configured', message: `attachments storage is not configured: ${missing.join(', ')}` }, 503)
   }
+  let storage: AttachmentStorageConfig
+  try {
+    storage = attachmentStorageConfig(env)
+  } catch (error) {
+    if (!(error instanceof StorageConfigError)) throw error
+    log('not_configured', { missing: error.missing })
+    return json({ error: 'not_configured', message: error.message }, 503)
+  }
   const route = new URL(request.url).pathname.split('/').filter(Boolean).at(-1) ?? ''
   const authorization = request.headers.get('Authorization') ?? ''
   try {
-    const deps = depsFor(authorization)
+    const deps = depsFor(authorization, storage)
     if (route === 'gc') {
       if (!sameSecret(authorization.replace(/^Bearer\s+/i, ''), env('SUPABASE_SERVICE_ROLE_KEY'))) {
         return json({ error: 'denied', message: 'gc is the server\'s own job' }, 401)
       }
       const result = await handleGc(deps)
+      // OSS expires abandoned staging uploads with its own lifecycle rule; only the Supabase bucket needs this sweep.
+      if (storage.kind === 'oss') return json({ ...result, staging_deleted: 0 })
       const service = createClient(env('SUPABASE_URL'), env('SUPABASE_SERVICE_ROLE_KEY'), { db: { schema: 'chat' }, auth: { persistSession: false } })
-      const bucket = env('GUGU_ATTACHMENTS_BUCKET') || 'attachments'
+      const bucket = storage.bucket
       const { data: expired, error: expiredError } = await service.rpc('attachment_expired_staging', { p_bucket: bucket })
       if (expiredError) throw new Error('Could not list expired staging uploads')
       const names = ((expired ?? []) as Array<{ name: string }>).map((row) => row.name)

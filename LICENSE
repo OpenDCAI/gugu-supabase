@@ -1,0 +1,20 @@
+# Open Source License
+
+Gugu (咕咕) is licensed under a modified version of the Apache License 2.0, with the following additional conditions:
+
+1. Gugu may be utilized commercially, including as a backend service for other applications or as an internal collaboration platform for enterprises. Should the conditions below be met, a commercial license must be obtained from the producer:
+
+a. Multi-tenant service: Unless explicitly authorized by the producer in writing, you may not use the Gugu source code to operate a multi-tenant environment.
+    - Tenant Definition: Within the context of Gugu, one tenant corresponds to one account (a person or an organization) whose identity, messages, devices, data and configurations are kept separate from those of other accounts in the same deployment. Operating one deployment that serves multiple such accounts, for example as a hosted service, constitutes a multi-tenant environment.
+
+b. LOGO and copyright information: In the process of using Gugu's frontend, you may not remove or modify the LOGO or copyright information in the Gugu applications. This restriction is inapplicable to uses of Gugu that do not involve its frontend.
+    - Frontend Definition: This repository is the Gugu backend and contains no frontend; the frontend is defined in the license of the Gugu client repository (OpenDCAI/gugu).
+
+2. As a contributor, you should agree that:
+
+a. The producer can adjust the open-source agreement to be more strict or relaxed as deemed necessary.
+b. Your contributed code may be used for commercial purposes, including but not limited to its cloud business operations.
+
+Apart from the specific conditions mentioned above, all other rights and restrictions follow the Apache License 2.0. Detailed information about the Apache License 2.0 can be found at http://www.apache.org/licenses/LICENSE-2.0.
+
+© 2026 OpenDCAI

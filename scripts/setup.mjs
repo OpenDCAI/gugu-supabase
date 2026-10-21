@@ -24,7 +24,8 @@ async function api(suffix, method = 'GET', body) {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
   if (!response.ok) throw new Error('Supabase Management API ' + suffix + ' failed: HTTP ' + response.status)
-  return response.status === 204 ? null : response.json()
+  const text = await response.text()
+  return text ? JSON.parse(text) : null
 }
 async function query(sql, readOnly = false, parameters) {
   const result = await api('/database/query', 'POST', { query: sql, read_only: readOnly, ...(parameters ? { parameters } : {}) })
@@ -46,6 +47,16 @@ const schemas = new Set(String(currentRest.db_schema || 'public').split(',').map
 for (const schema of ['public', 'identity', 'chat', 'moments']) schemas.add(schema)
 await api('/postgrest', 'PATCH', { db_schema: [...schemas].join(',') })
 const publicUrl = 'https://' + ref + '.supabase.co'
+// The client signs in with a 6-digit email code; new projects default to 8 digits and link-only templates.
+const auth = await api('/config/auth')
+const authPatch = { mailer_otp_length: 6 }
+const codeLine = '<p>Your Gugu sign-in code: <strong>{{ .Token }}</strong></p>\n'
+const templates = ['mailer_templates_magic_link_content', 'mailer_templates_confirmation_content']
+  .filter((key) => !String(auth[key] || '').includes('{{ .Token }}'))
+// Supabase refuses template edits on free projects that still use the built-in email provider.
+if (auth.smtp_host) for (const key of templates) authPatch[key] = codeLine + String(auth[key] || '')
+await api('/config/auth', 'PATCH', authPatch)
+if (templates.length && !auth.smtp_host) console.warn('WARNING: sign-in emails do not contain the 6-digit code yet. Configure custom SMTP (docs/self-hosting.md), then run setup again.')
 await api('/secrets', 'POST', [{ name: 'GUGU_PUBLIC_SUPABASE_URL', value: publicUrl }])
 await cli(['functions', 'deploy', 'server-login', '--project-ref', ref, '--use-api'])
 await cli(['functions', 'deploy', 'attachments', '--project-ref', ref, '--use-api'])

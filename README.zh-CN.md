@@ -8,17 +8,19 @@
 
 ## 在自己的 Supabase Cloud 中安装
 
+从零开始的完整步骤（含 Supabase 免费版限制、SMTP 与排错，英文）：[docs/self-hosting.md](docs/self-hosting.md)。
+
 需要 Node 24、pnpm 10.28.2、自己的 Supabase 账号，以及一个全新的专用 Postgres 17 项目。
 
 ```sh
 pnpm install --frozen-lockfile
 # 在本机设置 SUPABASE_PROJECT_REF 和 SUPABASE_ACCESS_TOKEN；不要发到聊天或提交 Git。
-pnpm setup --client-dir /path/to/gugu
+pnpm run setup --client-dir /path/to/gugu
 ```
 
 工具会检查项目为空，在一个事务里安装基线，再按顺序安装后续 release；然后配置 API schema、部署 server-login/attachments、设置附件回收任务，最后写入客户端 `.envs/local.env`。客户端文件只包含公共 URL 和 anon key；官方托管、官方模型和官方中转均关闭。模型在客户端配置你自己的 Claude 账号或 API。
 
-重复运行只接受版本和摘要一致的安装；遇到不认识的 schema 或摘要不同的安装会拒绝，不删除数据，也不改写安装账本。SMTP 与项目管理由安装者负责。
+重复运行只接受版本和摘要一致的安装；遇到不认识的 schema 或摘要不同的安装会拒绝，不删除数据，也不改写安装账本。SMTP 与项目管理由安装者负责；客户端靠邮件验证码登录，因此需要配置自己的 SMTP。
 
 ## 基线、增量与权限
 

@@ -40,7 +40,7 @@ jobs:
           node-version-file: .node-version
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm test:db:start
+      - uses: ./.github/actions/start-test-db
       - run: pnpm test:installation
       - run: pnpm test:integration
       - if: ${{ always() }}

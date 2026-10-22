@@ -1,0 +1,43 @@
+name: Start the test database
+description: >
+  Runs `pnpm test:db:start` with the Supabase images restored from the Actions cache.
+  The images are pinned by the Supabase CLI version, so they are cached under that version and the
+  registry. On a hit they are loaded locally and the CLI pulls nothing (it only pulls images it does
+  not have), so a registry's rate limit cannot fail the run. On a miss they are pulled once and saved.
+  Reads SUPABASE_INTERNAL_IMAGE_REGISTRY from the job environment.
+inputs:
+  directory:
+    description: Checkout of this repository, relative to the workspace.
+    default: .
+runs:
+  using: composite
+  steps:
+    - name: Supabase image cache key
+      id: key
+      shell: bash
+      run: echo "key=supabase-images-v2-$(pnpm --dir "${{ inputs.directory }}" exec supabase --version)-${SUPABASE_INTERNAL_IMAGE_REGISTRY:-public.ecr.aws}" >> "$GITHUB_OUTPUT"
+    - name: Restore Supabase images
+      id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/supabase-images.tar
+        key: ${{ steps.key.outputs.key }}
+    - name: Load Supabase images
+      if: steps.restore.outputs.cache-hit == 'true'
+      shell: bash
+      run: docker load -i "$RUNNER_TEMP/supabase-images.tar"
+    - name: Start Supabase
+      shell: bash
+      run: pnpm --dir "${{ inputs.directory }}" test:db:start
+    - name: Export Supabase images
+      if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      # Save exactly the images the started containers run: on Docker Hub not all of them live
+      # under supabase/ (postgrest/postgrest, kong).
+      run: docker save -o "$RUNNER_TEMP/supabase-images.tar" $(docker ps --filter name=supabase_ --format '{{.Image}}' | sort -u)
+    - name: Save Supabase images
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/supabase-images.tar
+        key: ${{ steps.key.outputs.key }}

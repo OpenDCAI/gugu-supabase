@@ -491,9 +491,9 @@ describe('#5856 话题的访问控制(对着真库跑)', () => {
       expect(await delivered(topic, 'passive', null, 12)).toBe(0)
       expect(await delivered(topic, 'passive', [agent], 13)).toBeGreaterThan(0)
 
-      // 反例:dm 没有「不点名也可能在跟我说话」这回事,放宽 kind 时不许把它一起放进来。
+      // dm 不走 listen_mode 那一支:人在私聊里没点名的话就是说给对端的(dmPeerIsAddressee),passive 也唤醒。
       await database.query(`UPDATE chat.chats SET kind = 'dm', source_chat_id = NULL, source_message_id = NULL WHERE id = $1`, [topic])
-      expect(await delivered(topic, 'active', null, 14)).toBe(0)
+      expect(await delivered(topic, 'passive', null, 14)).toBeGreaterThan(0)
     })
   })
 

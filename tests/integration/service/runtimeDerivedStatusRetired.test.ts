@@ -1,7 +1,8 @@
 /** runtime_status / derived_status 退场第一步(签名不动)。
  * 判据:① set_agent_runtime_state 不再听 p_runtime_status:新行记 offline,老行留原值,其余字段照写;
  * ② presence 载荷不再带 derived_status,runtime_status 照旧在;③ set_agent_desired_status 不再往
- * agent:<id>:runtime 发 runtime_changed,下线照旧给设备发 agent.stop(阳控)。只连 loopback 库,每个用例用自己的 agent。
+ * agent:<id>:runtime 发 runtime_changed,下线照旧给设备发 agent.stop(阳控);④ desired 一改,查看方就收到
+ * presence_changed 修订(下线 / 上线都实时到,不再等对方整页刷新)。只连 loopback 库,每个用例用自己的 agent。
  */
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
@@ -47,6 +48,7 @@ async function fixture(body: (f: Fixture) => Promise<void>): Promise<void> {
     await db.query('DELETE FROM identity.gugu_devices WHERE device_id=$1', [f.device])
     await db.query('DELETE FROM auth.users WHERE id=$1::uuid', [f.owner])
     await db.query('DELETE FROM chat.account_revision_heads WHERE user_id=$1', [f.owner])
+    await db.query('DELETE FROM chat.presence_wake_throttles WHERE viewer_user_id=$1', [f.owner])
     await db.query('DELETE FROM realtime.messages WHERE topic=$1', [`agent:${f.agent}:runtime`])
   }
 }
@@ -107,5 +109,17 @@ describe('runtime_status / derived_status 退场(签名不动)', () => {
       "SELECT count(*)::text AS n FROM identity.gugu_device_commands WHERE device_id=$1 AND type='agent.stop' AND payload->>'agent_user_id'=$2",
       [f.device, f.agent])
     expect(stops.rows[0]!.n).toBe('1')
+  }))
+
+  it('desired 一改,查看方就收到 presence_changed 修订(下线、再上线各一次)', async () => fixture(async (f) => {
+    const revisions = async (): Promise<number> => Number((await db.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM chat.account_revisions WHERE user_id=$1 AND event='presence_changed'", [f.owner])).rows[0]!.n)
+    const before = await revisions()
+    await asOwner(f.owner, 'SELECT identity.set_agent_desired_status($1, $2)', [f.agent, 'offline'])
+    const offline = await revisions()
+    expect(offline).toBeGreaterThan(before)
+    expect(await presence(f.agent)).toMatchObject({ desired_status: 'offline' })
+    await asOwner(f.owner, 'SELECT identity.set_agent_desired_status($1, $2)', [f.agent, 'online'])
+    expect(await revisions()).toBeGreaterThan(offline)
   }))
 })

@@ -12,6 +12,8 @@
 --   value is only ever online/offline, so the flag was always false, and no client reads the tombstone of a
 --   presence_changed revision (it re-reads the presence snapshot, which carries account_status = 'removed').
 -- - set_agent_desired_status no longer broadcasts runtime_changed on agent:<id>:runtime; nothing subscribes to it.
+--   It fans the presence snapshot to viewers instead, like every other presence change: before this, switching an
+--   agent offline (or back online) reached other viewers only on their next full refresh.
 -- Every function keeps its ACL: the event trigger revokes EXECUTE after CREATE OR REPLACE, so each is restated.
 
 CREATE OR REPLACE FUNCTION identity.set_agent_runtime_state(p_agent_user_id text, p_runtime_status text DEFAULT NULL::text, p_activity_status text DEFAULT 'idle'::text, p_runtime_kind text DEFAULT NULL::text, p_runtime_label text DEFAULT NULL::text, p_window_title text DEFAULT NULL::text, p_pid integer DEFAULT NULL::integer, p_last_seen_at timestamp with time zone DEFAULT NULL::timestamp with time zone, p_recent_tool_type text DEFAULT NULL::text, p_recent_actions text[] DEFAULT NULL::text[], p_last_action_at timestamp with time zone DEFAULT NULL::timestamp with time zone, p_active_chat_id text DEFAULT NULL::text, p_agent_status text DEFAULT NULL::text, p_agent_status_detail text DEFAULT NULL::text) RETURNS identity.agent_runtime_states
@@ -208,6 +210,7 @@ BEGIN
         );
     END IF;
 
+    PERFORM identity.fan_agent_presence_to_viewers(v_agent.id, identity.build_agent_presence_payload(v_agent.id));
 
     RETURN v_agent;
 END;

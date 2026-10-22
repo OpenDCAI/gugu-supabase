@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
  *   · 已经在群里的座位不动(档位是群主 / agent 主人定的);
  *   · 别人开了「Agent 加入需审批」的群:任务 agent 排队时记下要被动,群主同意后照它入座(宿主此刻不必在线);
  *   · 在对话(普通群)里派的任务,agent 经 add_group_agent(p_as_task = true)入座:同样被动、不提示,审批群里同样排队要被动
- *     (迁移 20261022172500_task_seat_from_chat);
+ *     (迁移 20261022150000_task_seat_from_chat);
  *   · 正对照:手动拉 agent 进群(add_group_agent,不带 p_as_task)照旧主动、照旧提示 —— 证明判据不是永远绿。
  * 每条用例 BEGIN…ROLLBACK,提交前先 SET CONSTRAINTS ALL IMMEDIATE 核一遍延迟约束。
  */

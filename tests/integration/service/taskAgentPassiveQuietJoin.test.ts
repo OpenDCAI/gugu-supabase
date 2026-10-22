@@ -8,7 +8,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
  *   · 任务路径(provision_taskpage_agent)进来的座位是被动档、不出「加入了群聊」,群人数照样 +1;
  *   · 已经在群里的座位不动(档位是群主 / agent 主人定的);
  *   · 别人开了「Agent 加入需审批」的群:任务 agent 排队时记下要被动,群主同意后照它入座(宿主此刻不必在线);
- *   · 正对照:手动拉 agent 进群(add_group_agent)照旧主动、照旧提示 —— 证明判据不是永远绿。
+ *   · 在对话(普通群)里派的任务,agent 经 add_group_agent(p_as_task = true)入座:同样被动、不提示,审批群里同样排队要被动
+ *     (迁移 20261022172500_task_seat_from_chat);
+ *   · 正对照:手动拉 agent 进群(add_group_agent,不带 p_as_task)照旧主动、照旧提示 —— 证明判据不是永远绿。
  * 每条用例 BEGIN…ROLLBACK,提交前先 SET CONSTRAINTS ALL IMMEDIATE 核一遍延迟约束。
  */
 interface DatabaseClient {
@@ -157,6 +159,40 @@ describe('任务 agent 进群', () => {
       expect.stringContaining(member),
       expect.stringContaining(agentId),
     ])
+  })
+
+  it('对话里派的任务(add_group_agent 带 p_as_task)⇒ 被动档、不出「加入了群聊」,群人数 +1', async () => {
+    const group = await ownerOnlyGroup()
+    const { agentId } = await provision(randomUUID())
+    await asUser(owner)
+    const result = (await database.query<{ result: { status: string } }>(
+      'SELECT chat.add_group_agent($1,$2,NULL,auth.uid()::text,true) AS result', [group, agentId])).rows[0]!.result
+    expect(result).toMatchObject({ status: 'joined' })
+    expect(await seat(group, agentId)).toEqual({ listen_mode: 'passive' })
+    expect(await memberCount(group)).toBe(2)
+    expect(await joinNotices(group)).toEqual([])
+  })
+
+  it('对话里派的任务进需审批的群:排队记下「被动」,群主同意后照它入座', async () => {
+    const member = await human('Member')
+    const group = await approvalGroupWith(member)
+    const { agentId } = await provision(randomUUID(), randomUUID(), member)
+    await asUser(member)
+    await database.query('SELECT chat.add_group_agent($1,$2,NULL,auth.uid()::text,true)', [group, agentId])
+    expect(await seat(group, agentId)).toBeUndefined()
+    expect(await approve(group, agentId)).toMatchObject({ requested_listen_mode: 'passive' })
+    expect(await seat(group, agentId)).toEqual({ listen_mode: 'passive' })
+  })
+
+  it('对话里派的任务、agent 已经在群里:座位不动', async () => {
+    const group = await ownerOnlyGroup()
+    const { agentId } = await provision(randomUUID())
+    await asUser(owner)
+    await database.query('SELECT chat.add_group_agent($1,$2,NULL,auth.uid()::text)', [group, agentId])
+    const result = (await database.query<{ result: { status: string } }>(
+      'SELECT chat.add_group_agent($1,$2,NULL,auth.uid()::text,true) AS result', [group, agentId])).rows[0]!.result
+    expect(result).toMatchObject({ status: 'already_member' })
+    expect(await seat(group, agentId)).toEqual({ listen_mode: 'active' })
   })
 
   it('正对照:需审批的群里手动拉 agent ⇒ 排队要的是主动,同意后主动入座', async () => {

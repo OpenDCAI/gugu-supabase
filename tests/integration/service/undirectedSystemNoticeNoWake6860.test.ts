@@ -153,7 +153,7 @@ describe('#6860 没有发信人、也没点名的系统行不唤醒 agent(对着
 
   it('入群灰字仍然不唤醒(#6386 由同一条规则覆盖)', () => inRollback(async () => {
     const room = await seedRoom('f2')
-    await database.query(`INSERT INTO chat.chat_members (chat_id, user_id, role) VALUES ($1,$2,'member')`, [room.group, room.alice])
+    await database.query('SELECT chat.insert_group_member($1,$2)', [room.group, room.alice])
     const joined = await systemRow(room.group, 'member-joined:')
     expect(await wokenBy(joined)).toEqual([])
     expect(await nudgedBy(joined)).toEqual([])

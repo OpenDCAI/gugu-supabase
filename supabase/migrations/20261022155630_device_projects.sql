@@ -62,8 +62,9 @@ BEGIN
     IF NULLIF(p_device_id, '') IS NULL THEN
         RAISE EXCEPTION 'Device is required';
     END IF;
-    -- The row lock serializes two publishes from the same device.
-    PERFORM 1 FROM identity.gugu_devices WHERE device_id = p_device_id AND user_id = v_me FOR UPDATE;
+    -- The row lock serializes two publishes from the same device. NO KEY keeps it from blocking the
+    -- FOR KEY SHARE that inserts into tables referencing the device take.
+    PERFORM 1 FROM identity.gugu_devices WHERE device_id = p_device_id AND user_id = v_me FOR NO KEY UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Device is not owned by current user';
     END IF;

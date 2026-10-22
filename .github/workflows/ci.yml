@@ -31,7 +31,7 @@ jobs:
       # The Supabase CLI pulls from public.ecr.aws by default, whose anonymous quota is shared by
       # GitHub-hosted runner IPs and runs out ("toomanyrequests: Data limit exceeded"). Supabase
       # mirrors the same images to GHCR, which hosted runners reach without that quota.
-      SUPABASE_INTERNAL_IMAGE_REGISTRY: ghcr.io
+      SUPABASE_INTERNAL_IMAGE_REGISTRY: public.ecr.aws
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

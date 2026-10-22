@@ -178,3 +178,29 @@ describe('任务 agent 进群', () => {
     expect(await joinNotices(group)).toEqual([expect.stringContaining(agentId)])
   })
 })
+
+describe('任务卡不叫醒任何人', () => {
+  async function post(chatId: string, contentType: string): Promise<string> {
+    await asService()
+    const id = randomUUID()
+    await database.query(
+      `INSERT INTO chat.messages (id, chat_id, sender_user_id, content, content_type) VALUES ($1,$2,$3,$4,$5)`,
+      [id, chatId, owner, contentType === 'card' ? '{"v":1,"type":"task","text":"x"}' : '大家看一下', contentType],
+    )
+    return id
+  }
+  async function woken(messageId: string): Promise<string[]> {
+    await asService()
+    return (await database.query<{ agent_user_id: string }>(
+      'SELECT agent_user_id FROM chat.message_agent_wakes WHERE message_id = $1', [messageId])).rows.map((row) => row.agent_user_id)
+  }
+
+  it('群里一个主动档的 agent:我发的任务卡不叫醒它;正对照:我发的一句没点名的话叫醒它', async () => {
+    const group = await ownerOnlyGroup()
+    const { agentId } = await provision(randomUUID())
+    await asUser(owner)
+    await database.query('SELECT chat.add_group_agent($1,$2,NULL,auth.uid()::text)', [group, agentId])
+    expect(await woken(await post(group, 'card'))).toEqual([])
+    expect(await woken(await post(group, 'text'))).toEqual([agentId])
+  })
+})

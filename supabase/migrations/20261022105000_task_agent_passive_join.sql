@@ -282,3 +282,53 @@ $_$;
 
 REVOKE ALL ON FUNCTION identity.provision_taskpage_agent(p_agent_id uuid, p_display_name text, p_name_mode text, p_agent_type text, p_device_id text, p_local_path text, p_group_chat_id text, p_new_group_id text, p_group_name text) FROM PUBLIC;
 GRANT ALL ON FUNCTION identity.provision_taskpage_agent(p_agent_id uuid, p_display_name text, p_name_mode text, p_agent_type text, p_device_id text, p_local_path text, p_group_chat_id text, p_new_group_id text, p_group_name text) TO authenticated;
+
+-- 任务卡(content_type='card')不叫醒任何人(gugu-dev#181)。推送那条触发器本来只送 text / attachment / system,
+-- 可「叫醒谁」的记录不看类型,active 的 agent 拉收件箱时照样把卡当成一条消息拉走。写下叫醒记录的这一处加同一个口径。
+CREATE OR REPLACE FUNCTION chat.record_message_agent_wakes() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+ DECLARE
+     v_reply_target    TEXT;
+     v_sender_is_agent BOOLEAN;
+ BEGIN
+     IF NEW.deleted_at IS NOT NULL THEN
+         RETURN NEW;
+     END IF;
+
+     -- 叫醒谁只认会投递的那几种(与 enqueue_agent_deliver_device_command 同一个口径):任务卡、小组件不叫醒任何人,
+     -- 推送那条本来就不送,拉取读的是这里写下的结果 —— 两头同一个事实。
+     IF NEW.content_type NOT IN ('text', 'attachment', 'system') THEN
+         RETURN NEW;
+     END IF;
+
+     v_reply_target := chat.message_reply_routing_target(NEW.reply_to_message_id);
+     v_sender_is_agent := EXISTS (
+         SELECT 1 FROM identity.users s WHERE s.id = NEW.sender_user_id AND s.type = 'agent'
+     );
+
+     INSERT INTO chat.message_agent_wakes (message_id, agent_user_id)
+     SELECT NEW.id, cm.user_id
+     FROM chat.chats c
+     JOIN chat.chat_members cm ON cm.chat_id = c.id
+     JOIN identity.users u ON u.id = cm.user_id AND u.type = 'agent'
+     WHERE c.id = NEW.chat_id
+       AND chat.message_wakes_agent(
+             cm.user_id,
+             cm.listen_mode,
+             cm.notification_level,
+             c.kind,
+             NEW.sender_user_id,
+             v_sender_is_agent,
+             NEW.sender_user_id = c.creator_user_id,
+             NEW.to_user_ids,
+             NEW.is_whisper,
+             v_reply_target
+           )
+     ON CONFLICT (message_id, agent_user_id) DO NOTHING;
+
+     RETURN NEW;
+ END;
+ $$;
+REVOKE ALL ON FUNCTION chat.record_message_agent_wakes() FROM PUBLIC;

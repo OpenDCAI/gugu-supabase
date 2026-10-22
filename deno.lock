@@ -60,6 +60,7 @@
     "packageJson": {
       "dependencies": [
         "npm:@hocuspocus/provider@4.7.0",
+        "npm:@supabase/supabase-js@^2.39.0",
         "npm:@types/node@^20.10.0",
         "npm:@types/pg@^8.11.0",
         "npm:jose@6.2.12",

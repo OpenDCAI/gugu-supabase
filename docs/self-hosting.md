@@ -19,7 +19,7 @@ Models run through the agent CLIs on your machine with your own account or API k
 - Node 24 and pnpm 10.28.2 (check `node -v`; a system Node 22/23 will not do).
 - Git, and on macOS the Xcode command line tools (native modules are rebuilt for Electron).
 - A Supabase account. A brand-new, empty project dedicated to Gugu (Postgres 17). Do not reuse a project that has other data.
-- An SMTP provider for sign-in email (see step 3). Without it nobody can sign in.
+- An SMTP provider for sign-in email ([self-hosting-smtp.md](self-hosting-smtp.md)). Without it nobody can sign in.
 
 ## 1. Create the Supabase project
 
@@ -35,9 +35,9 @@ Setup talks to the Supabase Management API and CLI, so it needs a personal acces
 
 ## 3. Configure SMTP
 
-The client signs in with a 6-digit code sent by email. Supabase's built-in email sender is for trying things out only. It allows 2 emails per hour per project, and on the free plan it cannot be used with the edited email templates that carry the code. Configure your own SMTP first:
+The client signs in with a 6-digit code sent by email, so you need your own SMTP service. Supabase's built-in sender only delivers to members of your Supabase organization, at 2 emails per hour, and its templates carry no code.
 
-**Authentication → Emails → SMTP Settings** in the dashboard ([Supabase guide](https://supabase.com/docs/guides/auth/auth-smtp)). Any provider works. Then raise **Authentication → Rate Limits → emails sent per hour** to a value that fits your users.
+Follow [self-hosting-smtp.md](self-hosting-smtp.md): pick a provider (guides for Resend, Brevo, AWS SES and others), enable custom SMTP under **Authentication → Emails → SMTP Settings**, and raise the email rate limit.
 
 You can also run setup first and add SMTP later, but sign-in will not work until you re-run setup after configuring SMTP.
 

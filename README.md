@@ -8,7 +8,7 @@ Licensed under a modified Apache License 2.0 — see [LICENSE](LICENSE). Persona
 
 ## Install on your own Supabase Cloud project
 
-Step-by-step guide, including the free Supabase plan, SMTP and troubleshooting: [docs/self-hosting.md](docs/self-hosting.md).
+Step-by-step guide: [docs/self-hosting.md](docs/self-hosting.md); SMTP setup: [docs/self-hosting-smtp.md](docs/self-hosting-smtp.md); free plan and troubleshooting: [docs/self-hosting-free-plan.md](docs/self-hosting-free-plan.md).
 
 You need Node 24, pnpm 10.28.2, your own Supabase account and a brand-new dedicated Postgres 17 project.
 

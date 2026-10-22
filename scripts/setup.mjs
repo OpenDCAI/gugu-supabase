@@ -56,7 +56,7 @@ const templates = ['mailer_templates_magic_link_content', 'mailer_templates_conf
 // Supabase refuses template edits on free projects that still use the built-in email provider.
 if (auth.smtp_host) for (const key of templates) authPatch[key] = codeLine + String(auth[key] || '')
 await api('/config/auth', 'PATCH', authPatch)
-if (templates.length && !auth.smtp_host) console.warn('WARNING: sign-in emails do not contain the 6-digit code yet. Configure custom SMTP (docs/self-hosting.md), then run setup again.')
+if (templates.length && !auth.smtp_host) console.warn('WARNING: sign-in emails do not contain the 6-digit code yet. Configure custom SMTP (docs/self-hosting-smtp.md), then run setup again.')
 await api('/secrets', 'POST', [{ name: 'GUGU_PUBLIC_SUPABASE_URL', value: publicUrl }])
 await cli(['functions', 'deploy', 'server-login', '--project-ref', ref, '--use-api'])
 await cli(['functions', 'deploy', 'attachments', '--project-ref', ref, '--use-api'])

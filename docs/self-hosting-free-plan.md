@@ -14,7 +14,7 @@ Companion to [self-hosting.md](self-hosting.md). Figures are from [supabase.com/
 | Edge Function invocations | 500,000 / month | Attachment upload, commit and download, server sign-in |
 | Realtime | 200 concurrent connections, 2 M messages / month, 256 KB per message | Roughly one connection per running client |
 | Monthly active users | 50,000 | — |
-| Built-in email | 2 emails / hour per project | Not usable for sign-in; configure SMTP |
+| Built-in email | 2 emails / hour, organization members only, default templates | Not usable for sign-in; [configure SMTP](self-hosting-smtp.md) |
 | Backups | None | Export your data yourself if it matters |
 
 A small team fits comfortably. The first limits you are likely to meet are pausing after a quiet week and storage if people share large files.
@@ -29,6 +29,7 @@ A small team fits comfortably. The first limits you are likely to meet are pausi
 | Setup: `Use a new dedicated project` | The database already has Gugu or other schemas | Use a new, empty project |
 | Setup prints `WARNING: sign-in emails do not contain the 6-digit code yet` | No custom SMTP; the free plan blocks template edits with the built-in sender | Configure SMTP, run setup again |
 | Sign-in: "too many requests" right away | Built-in sender's 2 emails / hour, or the same address asked within 60 seconds | Configure SMTP and raise the email rate limit; wait 60 seconds between codes |
+| Sign-in: `Email address not authorized` | Built-in sender only mails members of your Supabase organization | [Configure SMTP](self-hosting-smtp.md) |
 | Sign-in: email address rejected | Supabase rejects some domains, e.g. `example.com` | Use a real address |
 | Email arrives with a link but no code | Templates were not updated | Configure SMTP, re-run setup, or add `{{ .Token }}` to the Magic Link and Confirm Signup templates |
 | The code is 8 digits, the client accepts 6 | Project default OTP length is 8 | Re-run setup (sets 6) or set the email OTP length to 6 in the Email provider settings |

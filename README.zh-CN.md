@@ -8,7 +8,7 @@
 
 ## 在自己的 Supabase Cloud 中安装
 
-从零开始的完整步骤（含 Supabase 免费版限制、SMTP 与排错，英文）：[docs/self-hosting.md](docs/self-hosting.md)。
+从零开始的完整步骤（英文）：[docs/self-hosting.md](docs/self-hosting.md)；SMTP 配置：[docs/self-hosting-smtp.md](docs/self-hosting-smtp.md)；免费版限制与排错：[docs/self-hosting-free-plan.md](docs/self-hosting-free-plan.md)。
 
 需要 Node 24、pnpm 10.28.2、自己的 Supabase 账号，以及一个全新的专用 Postgres 17 项目。
 

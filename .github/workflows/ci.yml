@@ -40,7 +40,31 @@ jobs:
           node-version-file: .node-version
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # The images `supabase start` needs are pinned by the CLI version, so they are cached under it.
+      # A hit loads them locally and the CLI pulls nothing (it only pulls images it does not have);
+      # a miss pulls from the registry once and saves them for the next run.
+      - name: Supabase image cache key
+        id: images
+        run: echo "key=supabase-images-$(pnpm exec supabase --version)-$SUPABASE_INTERNAL_IMAGE_REGISTRY" >> "$GITHUB_OUTPUT"
+      - name: Restore Supabase images
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/supabase-images.tar
+          key: ${{ steps.images.outputs.key }}
+      - name: Load Supabase images
+        if: steps.restore.outputs.cache-hit == 'true'
+        run: docker load -i /tmp/supabase-images.tar
       - run: pnpm test:db:start
+      - name: Export Supabase images
+        if: steps.restore.outputs.cache-hit != 'true'
+        run: docker save -o /tmp/supabase-images.tar $(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -E '(^|/)supabase/')
+      - name: Save Supabase images
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/supabase-images.tar
+          key: ${{ steps.images.outputs.key }}
       - run: pnpm test:installation
       - run: pnpm test:integration
       - if: ${{ always() }}

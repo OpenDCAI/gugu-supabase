@@ -37,8 +37,15 @@ export interface SupabaseObjectConfig {
 export function supabaseObjectStorage(config: SupabaseObjectConfig): AttachmentObjectStorage {
   const base = config.url.replace(/\/$/, '')
   const objectUrl = (key: string) => base + '/storage/v1/object/' + encodeURIComponent(config.bucket) + '/' + key.split('/').map(encodeURIComponent).join('/')
+  // Header names are case-insensitive: merge through Headers so a caller's Content-Type replaces the default
+  // instead of being joined into "a, b", which Storage rejects as an invalid MIME type.
+  const withHeaders = (base: HeadersInit, extra?: HeadersInit) => {
+    const merged = new Headers(base)
+    new Headers(extra).forEach((value, name) => merged.set(name, value))
+    return merged
+  }
   const request = (url: string, init: RequestInit = {}) => config.fetch(url, {
-    ...init, headers: { apikey: config.serviceKey, Authorization: 'Bearer ' + config.serviceKey, ...init.headers },
+    ...init, headers: withHeaders({ apikey: config.serviceKey, Authorization: 'Bearer ' + config.serviceKey }, init.headers),
   })
   const check = async (response: Response) => {
     if (!response.ok) {
@@ -54,7 +61,7 @@ export function supabaseObjectStorage(config: SupabaseObjectConfig): AttachmentO
   const write = async (key: string, bytes: Uint8Array, headers: Record<string, string> = {}) => {
     const response = await request(objectUrl(key), {
       method: 'POST', body: bytes as BodyInit,
-      headers: { 'content-type': 'application/octet-stream', 'x-upsert': 'true', ...headers },
+      headers: withHeaders({ 'content-type': 'application/octet-stream', 'x-upsert': 'true' }, headers),
     })
     await check(response)
     await response.body?.cancel()

@@ -54,4 +54,17 @@ describe('community attachment storage', () => {
     expect(JSON.stringify(plan)).not.toContain('server-only-fixture')
     expect(plan.url).toContain('token=scoped')
   })
+
+  it('sends a single Content-Type when promoting with object headers', async () => {
+    let sent: Headers | undefined
+    const api = storage(vi.fn(async (_url, init) => {
+      if (init?.method === 'POST') { sent = new Headers(init.headers); return new Response('{}') }
+      return new Response(new Uint8Array([1]))
+    }))
+    const read = await api.read('staging/u/file', 10)
+    await api.promote('staging/u/file', 'ab/hash', read, { 'Content-Type': 'image/png', 'Cache-Control': 'immutable' })
+    expect(sent?.get('content-type')).toBe('image/png')
+    expect(sent?.get('x-upsert')).toBe('true')
+    expect(sent?.get('authorization')).toBe('Bearer server-only-fixture')
+  })
 })

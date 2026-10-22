@@ -8,17 +8,19 @@ Licensed under a modified Apache License 2.0 — see [LICENSE](LICENSE). Persona
 
 ## Install on your own Supabase Cloud project
 
+Step-by-step guide: [docs/self-hosting.md](docs/self-hosting.md); SMTP setup: [docs/self-hosting-smtp.md](docs/self-hosting-smtp.md); free plan and troubleshooting: [docs/self-hosting-free-plan.md](docs/self-hosting-free-plan.md).
+
 You need Node 24, pnpm 10.28.2, your own Supabase account and a brand-new dedicated Postgres 17 project.
 
 ```sh
 pnpm install --frozen-lockfile
 # Set SUPABASE_PROJECT_REF and SUPABASE_ACCESS_TOKEN locally; never paste them into chat or commit them.
-pnpm setup --client-dir /path/to/gugu
+pnpm run setup --client-dir /path/to/gugu
 ```
 
 The tool checks that the project is empty, installs the foundation in one transaction and then the later releases in order; it configures the API schemas, deploys the server-login and attachments functions, schedules attachment cleanup, and finally writes the client's `.envs/local.env`. The client file holds only the public URL and anon key; official hosting, official models and the official relay stay disabled. Models are configured in the client with your own Claude account or API key.
 
-Re-running only accepts an installation with matching versions and digests; an unknown schema or a different installation digest is refused without deleting data or rewriting the installation ledger. SMTP and project administration are up to the installer.
+Re-running only accepts an installation with matching versions and digests; an unknown schema or a different installation digest is refused without deleting data or rewriting the installation ledger. SMTP and project administration are up to the installer; sign-in needs custom SMTP because the client signs in with an emailed code.
 
 ## Foundation, releases and permissions
 

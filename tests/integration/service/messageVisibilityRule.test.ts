@@ -3,11 +3,13 @@ import { createRequire } from 'node:module'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 /**
- * Every actor-scoped message reader applies one visibility rule, chat.message_visible_at: can_read_message (through
- * message_visible_to), message_history_as, message_search_as, list_topics_of_chat and activity_metadata_as.
- * The proof changes that rule inside the test transaction and expects every reader to follow it at once; a
- * reader that restates the rule inline keeps answering the old way and fails here. Every case runs inside
- * BEGIN...ROLLBACK, so the changed rule never leaves the test.
+ * Every function that reads messages for an actor applies one visibility rule, chat.message_visible_at:
+ * can_read_message (through message_visible_to), message_history_as, message_search_as, list_topics_of_chat,
+ * activity_metadata_as, get_agent_join_context, list_unread_locators and mark_unread. The proof changes that rule
+ * inside the test transaction and expects every reader to follow it at once; a reader that restates the rule
+ * inline keeps answering the old way and fails here. The row policy keeps its own form (it runs as the caller);
+ * oneWhisperRule6835 holds it to the same answers. Every case runs inside BEGIN...ROLLBACK, so the changed rule
+ * never leaves the test.
  * Run: `GUGU_INTEGRATION_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:<port>/postgres pnpm exec vitest run messageVisibilityRule`
  */
 interface DatabaseClient {
@@ -65,6 +67,13 @@ async function readers(owner: string, agent: string, group: string, topic: strin
   const activity = (await database.query<{ page: { events: Array<{ message_id: string }> } }>(
     'SELECT chat.activity_metadata_as($1,$2,$3) AS page', [agent, SINCE, UNTIL])).rows[0]!.page.events.map((e) => e.message_id)
   const readable = (await database.query<{ ok: boolean }>('SELECT chat.can_read_message($1,$2) AS ok', [message, agent])).rows[0]!.ok
+  // The owner's own unread views of the group's main stream, and the agent's join context there. Both write, so
+  // each is undone before the next reader.
+  const unread = (await attempt<{ unread_count: string }>(
+    "SELECT unread_count::text FROM chat.list_unread_locators($1) WHERE stream_kind = 'main'", [group])).rows
+  const marked = await attempt('SELECT * FROM chat.mark_unread($1)', [group])
+  const join = await attempt<{ skipped_before_join: string }>(
+    'SELECT skipped_before_join::text FROM identity.get_agent_join_context($1,$2)', [agent, group])
   await asService()
   return {
     history: history.includes(message),
@@ -72,7 +81,35 @@ async function readers(owner: string, agent: string, group: string, topic: strin
     topicCount: Number(topics.find((row) => row.chat_id === topic)?.message_count ?? -1),
     activity: activity.includes(message) && activity.includes(topicMessage),
     readable,
+    unread: Number(unread[0]?.unread_count ?? 0),
+    markable: marked.error === undefined,
+    joinSkipped: Number(join.rows[0]?.skipped_before_join ?? 0),
   }
+}
+
+/** Runs one statement and undoes what it wrote; a failure comes back as its message. */
+async function attempt<Row = Record<string, unknown>>(sql: string, values: unknown[]): Promise<{ rows: Row[]; error?: string }> {
+  await database.query('SAVEPOINT attempt')
+  try {
+    return { rows: (await database.query<Row>(sql, values)).rows }
+  } catch (error) {
+    return { rows: [], error: (error as Error).message }
+  } finally {
+    await database.query('ROLLBACK TO SAVEPOINT attempt')
+  }
+}
+
+/** A group whose members start unread at zero, as the inbox publishes them. */
+async function groupWith(owner: string, members: string[]): Promise<string> {
+  await asService()
+  const id = randomUUID()
+  await database.query(`INSERT INTO chat.chats (id, kind, name, creator_user_id) VALUES ($1,'group','rule',$2)`, [id, owner])
+  for (const user of [owner, ...members]) {
+    await database.query('INSERT INTO chat.chat_members (chat_id,user_id,role) VALUES ($1,$2,$3)', [id, user, user === owner ? 'owner' : 'member'])
+  }
+  await database.query(`UPDATE chat.chat_members SET hide_history_before = NULL, inbox_published_at = now(), last_read_seq = 0,
+    join_context_shown_at = NULL WHERE chat_id = $1`, [id])
+  return id
 }
 
 beforeAll(async () => {
@@ -96,31 +133,81 @@ afterEach(async () => {
 })
 
 describe('one message-visibility rule for every actor-scoped reader', () => {
-  it('a change to chat.message_visible_at reaches can_read_message, history, search, topic counts and activity at once', async () => {
+  it('a change to chat.message_visible_at reaches every reader at once', async () => {
     const owner = await human('Owner')
     const peer = await human('Peer')
     const agent = await agentOf(owner)
-    const group = randomUUID()
-    await database.query(`INSERT INTO chat.chats (id, kind, name, creator_user_id) VALUES ($1,'group','rule',$2)`, [group, owner])
-    for (const [user, role] of [[owner, 'owner'], [agent, 'member'], [peer, 'member']]) {
-      await database.query('INSERT INTO chat.chat_members (chat_id,user_id,role) VALUES ($1,$2,$3)', [group, user, role])
-    }
-    const message = await say(group, peer, 1)
+    const chat = await groupWith(owner, [agent, peer])
+    const message = await say(chat, peer, 1)
     const topic = randomUUID()
     await database.query(`INSERT INTO chat.chats (id, kind, name, creator_user_id, source_chat_id, source_message_id)
-      VALUES ($1,'topic','topic',$2,$3,$4)`, [topic, peer, group, message])
+      VALUES ($1,'topic','topic',$2,$3,$4)`, [topic, peer, chat, message])
     const topicMessage = await say(topic, peer, 2, { to: [agent] })
 
     // Control: under the shipped rule every reader sees both messages.
-    expect(await readers(owner, agent, group, topic, message, topicMessage))
-      .toEqual({ history: true, search: true, topicCount: 1, activity: true, readable: true })
+    expect(await readers(owner, agent, chat, topic, message, topicMessage)).toEqual({
+      history: true, search: true, topicCount: 1, activity: true, readable: true, unread: 1, markable: true, joinSkipped: 1 })
 
     // Tighten the one rule (as a future rule would). Nothing else changes.
     await asService()
     await database.query(`CREATE OR REPLACE FUNCTION chat.message_visible_at(p_floor timestamptz, p_created_at timestamptz,
       p_is_whisper boolean, p_sender_user_id text, p_to_user_ids text[], p_actor text) RETURNS boolean
       LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT p_sender_user_id IS DISTINCT FROM '${peer}' $$`)
-    expect(await readers(owner, agent, group, topic, message, topicMessage))
-      .toEqual({ history: false, search: false, topicCount: 0, activity: false, readable: false })
+    expect(await readers(owner, agent, chat, topic, message, topicMessage)).toEqual({
+      history: false, search: false, topicCount: 0, activity: false, readable: false, unread: 0, markable: false, joinSkipped: 0 })
+  })
+
+  it('the rule stays a plain SQL function, so readers inline it and keep the floor in their own plan', async () => {
+    // A SQL function is inlined only if it is not SECURITY DEFINER and sets no configuration; inlined, a reader's
+    // floor is an ordinary condition the planner can put in the index scan instead of a call per row.
+    const shape = (await database.query<{ lanname: string; provolatile: string; prosecdef: boolean; proconfig: string[] | null }>(
+      `SELECT l.lanname, p.provolatile, p.prosecdef, p.proconfig FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+        WHERE p.oid = 'chat.message_visible_at(timestamptz,timestamptz,boolean,text,text[],text)'::regprocedure`)).rows
+    expect(shape).toEqual([{ lanname: 'sql', provolatile: 'i', prosecdef: false, proconfig: null }])
+    const plan = (await database.query<{ 'QUERY PLAN': string }>(`EXPLAIN (COSTS OFF) SELECT m.id FROM chat.messages m
+      WHERE m.chat_id = 'x' AND m.deleted_at IS NULL
+        AND chat.message_visible_at(now(), m.created_at, m.is_whisper, m.sender_user_id, m.to_user_ids, 'y')`)).rows
+      .map((row) => row['QUERY PLAN']).join('\n')
+    expect(plan).toMatch(/created_at >= /)
+    expect(plan).not.toMatch(/message_visible_at/)
+  })
+
+  it('mark_unread refuses a main stream whose every message is before the member\'s floor, as the unread locator sees it', async () => {
+    const owner = await human('Owner')
+    const late = await human('Late')
+    const chat = await groupWith(owner, [late])
+    await say(chat, owner, 1)
+    await database.query('UPDATE chat.chat_members SET hide_history_before = $3 WHERE chat_id = $1 AND user_id = $2', [chat, late, at(2)])
+
+    await asUser(late)
+    expect((await attempt('SELECT * FROM chat.mark_unread($1)', [chat])).error).toMatch(/cannot mark an empty main stream unread/)
+    expect((await attempt('SELECT * FROM chat.list_unread_locators($1)', [chat])).rows).toEqual([])
+    // Control: the member without a floor can mark it.
+    await asUser(owner)
+    expect((await attempt('SELECT * FROM chat.mark_unread($1)', [chat])).error).toBeUndefined()
+  })
+
+  it('the join context counts the topic lines the agent can page back to through the source chat', async () => {
+    const owner = await human('Owner')
+    const peer = await human('Peer')
+    const agent = await agentOf(owner)
+    const chat = await groupWith(owner, [agent, peer])
+    const source = await say(chat, peer, 1)
+    const topic = randomUUID()
+    await database.query(`INSERT INTO chat.chats (id, kind, name, creator_user_id, source_chat_id, source_message_id)
+      VALUES ($1,'topic','topic',$2,$3,$4)`, [topic, peer, chat, source])
+    await say(topic, peer, 2)
+    await say(topic, peer, 3)
+    // The agent joins the topic now; its own row starts there, as in a chat that hides earlier history.
+    await database.query(`INSERT INTO chat.chat_members (chat_id, user_id, role) VALUES ($1,$2,'member')`, [topic, agent])
+    await database.query(`UPDATE chat.chat_members SET hide_history_before = now(), joined_at = now(), last_read_seq = 0,
+      join_context_shown_at = NULL WHERE chat_id = $1 AND user_id = $2`, [topic, agent])
+
+    await asUser(owner)
+    const history = (await database.query<{ id: string }>('SELECT id FROM chat.message_history_as($1,$2)', [topic, agent])).rows
+    expect(history).toHaveLength(2)
+    const join = await attempt<{ skipped_before_join: string }>(
+      'SELECT skipped_before_join::text FROM identity.get_agent_join_context($1,$2)', [agent, topic])
+    expect(join.rows.map((row) => Number(row.skipped_before_join))).toEqual([history.length])
   })
 })

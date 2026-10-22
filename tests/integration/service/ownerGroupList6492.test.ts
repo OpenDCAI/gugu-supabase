@@ -1,3 +1,4 @@
+import { createFixtureGroup } from '../../support/groupFixture'
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -74,7 +75,7 @@ async function agentOf(ownerId: string, name: string): Promise<string> {
 async function newGroup(creator: string, name: string, initial: Array<[string, string]>, settings: Record<string, unknown> = {}): Promise<string> {
   const id = randomUUID()
   await asUser(creator)
-  await database.query('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
+  await createFixtureGroup(database, [
     id, name, creator, JSON.stringify(initial.map(([user_id, role]) => ({ user_id, role }))),
   ])
   await asService()
@@ -174,17 +175,19 @@ describe('chat.list_owner_groups_as', () => {
     expect(byId((await listAs(owner, ownerAgent)).rows).has(group)).toBe(false)
   })
 
-  it('agent_join_needs_approval = 开了审批且主人不是群主/管理员', async () => {
+  it('agent_join_needs_approval follows the actual Agent role, not its owner', async () => {
     const asMember = await newGroup(stranger, 'Owner is member', [[owner, 'member']], { agent_join_approval: true })
     const asAdmin = await newGroup(stranger, 'Owner is admin', [[owner, 'admin']], { agent_join_approval: true })
     const asCreator = await newGroup(owner, 'Owner created', [[stranger, 'member']], { agent_join_approval: true })
+    const agentAdmin = await newGroup(stranger, 'Agent admin', [[owner, 'member'], [ownerAgent, 'admin']], { agent_join_approval: true })
     const open = await newGroup(stranger, 'No approval', [[owner, 'member']], { agent_join_approval: false })
 
     const groups = byId((await listAs(owner, ownerAgent)).rows)
     expect(groups.get(asMember)?.agent_join_needs_approval).toBe(true)
-    expect(groups.get(asAdmin)?.agent_join_needs_approval).toBe(false)
-    expect(groups.get(asCreator)?.agent_join_needs_approval).toBe(false)
+    expect(groups.get(asAdmin)?.agent_join_needs_approval).toBe(true)
+    expect(groups.get(asCreator)?.agent_join_needs_approval).toBe(true)
     expect(groups.get(open)?.agent_join_needs_approval).toBe(false)
+    expect(groups.get(agentAdmin)?.agent_join_needs_approval).toBe(false)
   })
 
   it('只给入群要用的元数据,不给预览或正文', async () => {

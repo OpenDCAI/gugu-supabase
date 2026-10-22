@@ -1,3 +1,4 @@
+import { createFixtureGroup } from '../../support/groupFixture'
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -53,7 +54,7 @@ async function agentOf(ownerId: string, name: string): Promise<string> {
 async function newGroup(approval: boolean): Promise<string> {
   const id = randomUUID()
   await asUser(owner)
-  await database.query('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
+  await createFixtureGroup(database, [
     id, 'Join request revisions', owner, JSON.stringify([{ user_id: ownerAgent, role: 'member' }]),
   ])
   await asService()
@@ -65,7 +66,7 @@ async function newGroup(approval: boolean): Promise<string> {
 async function addAgent(actor: string, chatId: string, agentId: string) {
   await asUser(actor)
   return (await database.query<{ result: { status: string; request_id?: string } }>(
-    'SELECT chat.add_group_agent($1,$2,$3) AS result', [chatId, agentId, '请让它帮忙评审'])).rows[0]!.result
+    'SELECT chat.add_group_agent($1,$2,$3,auth.uid()::text) AS result', [chatId, agentId, '请让它帮忙评审'])).rows[0]!.result
 }
 /** The friend_requests_changed revisions a user has received so far: the join request each one names. */
 async function inbox(userId: string): Promise<(string | null)[]> {
@@ -124,8 +125,8 @@ describe('入群申请推到审批人', () => {
       'SELECT id, requester_user_id FROM chat.group_join_requests WHERE chat_id = $1', [group])).rows
       .map((row) => [row.requester_user_id, row.id]))
     await asUser(admin)
-    await database.query('SELECT chat.decide_group_join($1,true)', [idOf.get(memberAgent)])
-    await database.query('SELECT chat.decide_group_join($1,false)', [idOf.get(second)])
+    await database.query('SELECT chat.decide_group_join($1,true,auth.uid()::text)', [idOf.get(memberAgent)])
+    await database.query('SELECT chat.decide_group_join($1,false,auth.uid()::text)', [idOf.get(second)])
     const expected = [idOf.get(memberAgent), idOf.get(second), idOf.get(memberAgent), idOf.get(second)]
     for (const recipient of [owner, admin, member]) expect(await inbox(recipient)).toEqual(expected)
     expect(await inbox(bystander)).toEqual([])

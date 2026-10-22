@@ -1,3 +1,4 @@
+import { createFixtureGroup } from '../../support/groupFixture'
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -58,7 +59,7 @@ async function human(name: string): Promise<string> {
 async function newGroup(creator: string, name: string, initial: Array<[string, string]>): Promise<string> {
   const id = randomUUID()
   await asUser(creator)
-  await database.query('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
+  await createFixtureGroup(database, [
     id, name, creator, JSON.stringify(initial.map(([user_id, role]) => ({ user_id, role }))),
   ])
   await asService()
@@ -196,13 +197,13 @@ describe('chat.app_enablements', () => {
   })
 
   it('人退群,他在这个群的启用由级联带走;别人的不动', async () => {
-    // 活跃群至少两个人(延迟约束,收尾时判):先多一个人,Carol 走了还剩两个。
+    // Existing roster fixture; Carol leaves through the shared product door.
     const dave = await human('Dave')
     await database.query(`INSERT INTO chat.chat_members (chat_id, user_id, role) VALUES ($1,$2,'member')`, [group, dave])
     await enable(owner, group)
     await enable(carol, group)
     await asUser(carol)
-    expect((await database.query('DELETE FROM chat.chat_members WHERE chat_id = $1 AND user_id = $2', [group, carol])).rowCount).toBe(1)
+    expect((await database.query('SELECT chat.remove_group_member_as($1,$2,auth.uid()::text)', [group, carol])).rowCount).toBe(1)
     expect(await rowsAsService(group)).toEqual([{ user_id: owner, app_id: VOTE.id }])
   })
 

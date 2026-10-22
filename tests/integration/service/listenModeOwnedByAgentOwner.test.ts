@@ -41,7 +41,7 @@ async function listenMode(userId: string) {
 async function setListenMode(actor: string, userId: string, mode: string) {
   await asUser(actor)
   const { rows } = await database.query<{ user_id: string }>(
-    'UPDATE chat.chat_members SET listen_mode = $3 WHERE chat_id = $1 AND user_id = $2 RETURNING user_id', [group, userId, mode])
+    'SELECT chat.set_agent_listen_mode_as($1,$2,$3,auth.uid()::text)', [group, userId, mode])
   return rows.length
 }
 async function rejected(body: () => Promise<unknown>) {
@@ -110,7 +110,7 @@ describe('listen_mode belongs to the agent owner', () => {
   })
 
   it('refuses the group owner on someone else\'s agent, but not on their own', async () => {
-    expect(await rejected(() => setListenMode(groupOwner, memberAgent, 'active'))).toMatch(/主人/)
+    expect(await rejected(() => setListenMode(groupOwner, memberAgent, 'active'))).toMatch(/agent_owner_required/)
     expect(await listenMode(memberAgent)).toBe('passive')
     // 阳控:同一个人、同一条路径,改自己的 agent 照样改得动 —— 拦下的是「别人的」,不是这条 UPDATE。
     expect(await setListenMode(groupOwner, ownerAgent, 'active')).toBe(1)
@@ -119,15 +119,15 @@ describe('listen_mode belongs to the agent owner', () => {
 
   it('keeps the group owner\'s other powers over that agent: role and removal', async () => {
     await asUser(groupOwner)
-    const promoted = await database.query('UPDATE chat.chat_members SET role = $3 WHERE chat_id = $1 AND user_id = $2 RETURNING user_id', [group, memberAgent, 'admin'])
+    const promoted = await database.query('SELECT chat.set_group_member_role_as($1,$2,$3,auth.uid()::text)', [group, memberAgent, 'admin'])
     expect(promoted.rows).toHaveLength(1)
-    const removed = await database.query('DELETE FROM chat.chat_members WHERE chat_id = $1 AND user_id = $2 RETURNING user_id', [group, memberAgent])
+    const removed = await database.query('SELECT chat.remove_group_member_as($1,$2,auth.uid()::text)', [group, memberAgent])
     expect(removed.rows).toHaveLength(1)
   })
 
   it('lets the owner take their agent out of the group', async () => {
     await asUser(member)
-    const left = await database.query('DELETE FROM chat.chat_members WHERE chat_id = $1 AND user_id = $2 RETURNING user_id', [group, memberAgent])
+    const left = await database.query('SELECT chat.remove_group_member_as($1,$2,auth.uid()::text)', [group, memberAgent])
     expect(left.rows).toHaveLength(1)
     expect(await listenMode(memberAgent)).toBeNull()
   })
@@ -143,19 +143,20 @@ describe('listen_mode belongs to the agent owner', () => {
     expect(await listenMode(memberAgent)).toBe('active')
   })
 
-  it('refuses a non-owner inserting someone else\'s agent with a chosen listen mode (topic insert skips ownership)', async () => {
-    const insert = (actor: string, agent: string, mode?: string) => async () => {
-      await asUser(actor)
-      const { rows } = mode
-        ? await database.query<{ listen_mode: string }>('INSERT INTO chat.chat_members (chat_id, user_id, role, listen_mode) VALUES ($1,$2,\'member\',$3) RETURNING listen_mode', [topic, agent, mode])
-        : await database.query<{ listen_mode: string }>('INSERT INTO chat.chat_members (chat_id, user_id, role) VALUES ($1,$2,\'member\') RETURNING listen_mode', [topic, agent])
-      return rows
+  it('revokes chosen/default listen-mode inserts, including the owner; topic admission still uses its RPC', async () => {
+    for (const mode of ['passive', 'active']) {
+      await asUser(groupOwner)
+      expect(await rejected(() => database.query(
+        "INSERT INTO chat.chat_members(chat_id,user_id,role,listen_mode) VALUES ($1,$2,'member',$3)",
+        [topic, memberAgent, mode]))).toMatch(/permission denied/)
     }
-    expect(await rejected(insert(groupOwner, memberAgent, 'passive'))).toMatch(/主人/)
-    // 不带档位照旧能拉进来,按默认档(移出就是退出,新成员行用默认值)。
-    expect(await insert(groupOwner, memberAgent)()).toEqual([{ listen_mode: 'active' }])
-    // 阳控:主人把自己的 agent 带着档位插进同一个话题,照样成立。
-    expect(await insert(groupOwner, ownerAgent, 'passive')()).toEqual([{ listen_mode: 'passive' }])
+    await asService()
+    await database.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'member')", [topic, memberAgent])
+    await asUser(member)
+    await database.query("SELECT chat.set_agent_listen_mode_as($1,$2,'passive',auth.uid()::text)", [topic, memberAgent])
+    await asService()
+    expect((await database.query<{ listen_mode: string }>('SELECT listen_mode FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [topic, memberAgent])).rows)
+      .toEqual([{ listen_mode: 'passive' }])
   })
 
   it('pins the column default the insert guard compares against', async () => {

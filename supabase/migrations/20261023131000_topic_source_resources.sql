@@ -13,7 +13,7 @@ BEGIN
     FOR v IN
         SELECT n.nspname, c.relname,
                CASE WHEN n.nspname IN ('auth','storage','realtime')
-                          OR (n.nspname = 'chat' AND c.relname = 'workspace_items')
+                          OR (n.nspname = 'chat' AND c.relname IN ('chats','workspace_items'))
                     THEN 'ACCESS EXCLUSIVE' ELSE 'EXCLUSIVE' END AS lock_mode
           FROM pg_catalog.pg_class c
           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -54,6 +54,88 @@ $$;
 REVOKE ALL ON FUNCTION chat.workspace_require_room_member(text, text) FROM PUBLIC, anon, authenticated;
 
 
+ALTER TABLE chat.chats ADD CONSTRAINT chats_id_uuid
+    CHECK (id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$');
+
+CREATE OR REPLACE FUNCTION chat.create_gugu_group(p_chat_id text, p_name text, p_owner_user_id text, p_initial_members jsonb, p_default_agent_type text DEFAULT NULL::text, p_group_prompt text DEFAULT NULL::text)
+ RETURNS chat.chats
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'chat', 'identity', 'public', 'pg_catalog'
+AS $function$
+DECLARE
+    caller_user_id TEXT;
+    inserted       chat.chats;
+    m              JSONB;
+    member_user_id TEXT;
+    member_role    TEXT;
+    inserted_member_count INT := 0;
+    inserted_member_rows  INT := 0;
+    member_denial  TEXT;
+BEGIN
+    caller_user_id := (SELECT auth.uid()::text);
+    IF caller_user_id IS NULL OR caller_user_id <> p_owner_user_id THEN
+        RAISE EXCEPTION 'caller % cannot create group on behalf of %',
+                        caller_user_id, p_owner_user_id;
+    END IF;
+
+    IF p_chat_id IS NULL OR p_chat_id !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', HINT = 'chat_id_not_uuid',
+            MESSAGE = 'chat id must be a UUID in 8-4-4-4-12 hexadecimal form';
+    END IF;
+
+    IF p_initial_members IS NULL OR jsonb_typeof(p_initial_members) <> 'array' THEN
+        RAISE EXCEPTION 'p_initial_members must be a jsonb array';
+    END IF;
+
+    SET CONSTRAINTS ALL DEFERRED;
+
+    INSERT INTO chat.chats (
+        id, kind, name, status, creator_user_id,
+        group_prompt, default_agent_type
+    ) VALUES (
+        p_chat_id, 'group', p_name, 'active', p_owner_user_id,
+        p_group_prompt, p_default_agent_type
+    ) RETURNING * INTO inserted;
+
+    INSERT INTO chat.chat_members (chat_id, user_id, role)
+    VALUES (p_chat_id, p_owner_user_id, 'owner');
+
+    FOR m IN SELECT * FROM jsonb_array_elements(p_initial_members) LOOP
+        member_user_id := m ->> 'user_id';
+        member_role    := COALESCE(m ->> 'role', 'member');
+        IF member_user_id IS NULL OR member_user_id = p_owner_user_id THEN
+            CONTINUE;
+        END IF;
+        -- #1761 云 agent 禁入群（fail-loud，不静默跳过）
+        IF chat.is_cloud_agent_user(member_user_id) THEN
+            RAISE EXCEPTION 'cloud agent % cannot join groups (#1761)', member_user_id;
+        END IF;
+        -- 群只有一个 owner(= 创建者);初始成员只能是 member/admin。
+        IF member_role NOT IN ('member', 'admin') THEN
+            RAISE EXCEPTION 'initial member % cannot have role %', member_user_id, member_role;
+        END IF;
+        -- 与其余入口同一道「能否加此人」(调用者就是 owner:拦的是上限、身份存在、别人名下的 agent ——
+        -- 别人的 agent 要走 agent 群邀请,由它的主人接受)。
+        IF NOT chat.group_related(p_owner_user_id, member_user_id) THEN
+            RAISE EXCEPTION 'initial_member_requires_invitation';
+        END IF;
+        member_denial := chat.group_add_denial(p_chat_id, member_user_id, p_owner_user_id);
+        IF member_denial IS NOT NULL THEN
+            RAISE EXCEPTION 'cannot add % to group %: %', member_user_id, p_chat_id, member_denial;
+        END IF;
+        INSERT INTO chat.chat_members (chat_id, user_id, role)
+        VALUES (p_chat_id, member_user_id, member_role)
+        ON CONFLICT (chat_id, user_id) DO NOTHING;
+        GET DIAGNOSTICS inserted_member_rows = ROW_COUNT;
+        inserted_member_count := inserted_member_count + inserted_member_rows;
+    END LOOP;
+
+
+    RETURN inserted;
+END;
+$function$;
+
 CREATE OR REPLACE FUNCTION chat.chat_facts(p_chat_id text, p_as_user_id text DEFAULT NULL::text) RETURNS TABLE(id text, kind text, source_chat_id text, group_prompt text, public_id integer)
     LANGUAGE plpgsql STABLE SECURITY DEFINER
     SET search_path TO ''
@@ -73,8 +155,7 @@ BEGIN
         RAISE EXCEPTION 'Not allowed to act as %', v_actor;
     END IF;
 
-    -- Numeric addresses identify public_id only. An opaque numeric text id
-    -- must be addressed through its own public number, never an OR match.
+    -- Chat IDs are UUIDs; numeric addresses identify public_id only.
     IF p_chat_id ~ '^[0-9]+$' THEN
         SELECT c.id INTO v_chat_id FROM chat.chats c WHERE c.public_id = v_public_id;
     END IF;
@@ -1040,6 +1121,7 @@ GRANT ALL ON FUNCTION chat.create_topic(p_source_chat_id text, p_source_message_
 GRANT ALL ON FUNCTION chat.create_topic(p_source_chat_id text, p_source_message_id text, p_name text, p_member_user_ids text[], p_as_user_id text) TO authenticated;
 GRANT ALL ON FUNCTION chat.chat_facts(p_chat_id text, p_as_user_id text) TO service_role;
 GRANT ALL ON FUNCTION chat.chat_facts(p_chat_id text, p_as_user_id text) TO authenticated;
+GRANT ALL ON FUNCTION chat.create_gugu_group(p_chat_id text, p_name text, p_owner_user_id text, p_initial_members jsonb, p_default_agent_type text, p_group_prompt text) TO authenticated;
 GRANT EXECUTE ON FUNCTION chat.add_group_agent(TEXT,TEXT,TEXT,TEXT,BOOLEAN) TO authenticated,service_role;
 GRANT EXECUTE ON FUNCTION chat.group_add_denial(TEXT,TEXT,TEXT,BOOLEAN,BOOLEAN) TO service_role;
 

@@ -32,6 +32,25 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
         await t.test('topic resources install on an empty community database', async () => {
           await query(rolledBack)
         })
+        await t.test('a legacy non-UUID chat aborts and rolls back the complete upgrade', async () => {
+          const owner = randomUUID(), id = '123456789'
+          await db.query('BEGIN')
+          await db.query("INSERT INTO identity.users(id,type,display_name) VALUES ($1,'human','legacy id fixture')", [owner])
+          await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES ($1,'group','legacy id',$2)", [id, owner])
+          await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner')", [id, owner])
+          await db.query('COMMIT')
+          try {
+            await assert.rejects(query(sql), { code: '23514', constraint: 'chats_id_uuid' })
+            await db.query('ROLLBACK')
+            assert.equal((await query("SELECT count(*)::int AS n FROM pg_constraint WHERE conrelid='chat.chats'::regclass AND conname='chats_id_uuid'"))[0].n, 0)
+            assert.equal((await db.query('SELECT id FROM chat.chats WHERE id=$1', [id])).rows[0].id, id)
+            assert.equal((await query("SELECT prorettype::regtype::text AS type FROM pg_proc WHERE oid='chat.workspace_require_room_member(text,text)'::regprocedure"))[0].type, 'void')
+          } finally {
+            await db.query('ROLLBACK')
+            await db.query('DELETE FROM chat.chats WHERE id=$1', [id])
+            await db.query('DELETE FROM identity.users WHERE id=$1', [owner])
+          }
+        })
         const fixture = await topicResourcesFixture(db)
         await t.test('topic metadata upgrade rolls back without changing rows, functions or guards', async () => {
           const started = performance.now()

@@ -25,7 +25,7 @@ async function denied(id: string, sql: string, values: unknown[] = []) {
   } catch (error) {
     await db.query('ROLLBACK TO SAVEPOINT denied')
     await admin()
-    return { message: (error as Error).message, hint: (error as { hint?: string }).hint }
+    return { message: (error as Error).message, hint: (error as { hint?: string }).hint, code: (error as { code?: string }).code }
   }
   throw new Error('expected resource access to be denied')
 }
@@ -128,17 +128,21 @@ describe('topics use one source resource container', () => {
     expect(await facts(agentOwner, number, agent)).toEqual([])
   })
 
-  it('a numeric opaque chat id cannot collide with public-number lookup', async () => {
+  it('normal creation and direct group/topic inserts require UUID ids, so public numbers cannot collide', async () => {
     const number = String((await db.query('SELECT public_id FROM chat.chats WHERE id=$1', [topic])).rows[0].public_id)
-    const [numeric] = await rpc(owner, "SELECT id,public_id FROM chat.create_gugu_group($1,'numeric opaque id',$2,'[]'::jsonb)", [number, owner])
-    expect(numeric.id).toBe(number)
+    for (const invalid of [number, 'not-a-uuid', randomUUID().replaceAll('-', ''), null]) {
+      const failure = await denied(owner, "SELECT id FROM chat.create_gugu_group($1,'invalid id',$2,'[]'::jsonb)", [invalid, owner])
+      expect(failure).toMatchObject({ code: '22023', hint: 'chat_id_not_uuid' })
+    }
+    const group = randomUUID()
+    expect((await rpc(owner, "SELECT id FROM chat.create_gugu_group($1,'UUID group',$2,'[]'::jsonb)", [group, owner]))[0].id).toBe(group)
+    const anchor = (await db.query('SELECT source_message_id FROM chat.chats WHERE id=$1', [topic])).rows[0].source_message_id
+    expect((await denied(owner, "INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES ($1,'group','numeric id',$2)", [number, owner])).code).toBe('23514')
+    expect((await denied(owner, "INSERT INTO chat.chats(id,kind,name,creator_user_id,source_chat_id,source_message_id) VALUES ($1,'topic','numeric id',$2,$3,$4)", [number, owner, source, anchor])).code).toBe('23514')
+    expect((await db.query('SELECT id FROM chat.chats WHERE id=$1', [number])).rows).toEqual([])
     const byId = await rpc(owner, 'SELECT * FROM chat.chat_facts($1,$2)', [topic, owner])
     const byNumber = await rpc(owner, 'SELECT * FROM chat.chat_facts($1,$2)', [number, owner])
     expect(byId).toHaveLength(1); expect(byNumber).toEqual(byId)
-    const numericByNumber = await rpc(owner, 'SELECT * FROM chat.chat_facts($1,$2)', [String(numeric.public_id), owner])
-    expect(numericByNumber).toHaveLength(1)
-    expect(numericByNumber[0]).toMatchObject({ id: number, public_id: numeric.public_id })
-    expect(await rpc(outsider, 'SELECT * FROM chat.chat_facts($1,$2)', [String(numeric.public_id), outsider])).toEqual([])
   })
 
   it('adding an owned agent to a topic joins the source normally; leaving the topic retains file access', async () => {
@@ -250,14 +254,11 @@ describe('topics use one source resource container', () => {
     expect((await denied(outsider, `INSERT INTO storage.objects(bucket_id,name) VALUES ('workspace',$1)`, [`${topic}/${outsider}/denied.txt`])).message).toMatch(/row-level security/)
   })
 
-  it('a numeric Storage prefix is an opaque chat id, never another chat public number', async () => {
+  it('Storage key prefixes cannot use another chat public number as a chat id', async () => {
     const number = String((await db.query('SELECT public_id FROM chat.chats WHERE id=$1', [topic])).rows[0].public_id)
-    await rpc(outsider, "SELECT id FROM chat.create_gugu_group($1,'numeric storage owner',$2,'[]'::jsonb)", [number, outsider])
-    const pointer = `${number}/${outsider}/${randomUUID()}.txt`
-    expect((await rpc(outsider, "INSERT INTO storage.objects(bucket_id,name) VALUES ('workspace',$1) RETURNING name", [pointer]))[0].name).toBe(pointer)
+    const pointer = `${number}/${owner}/${randomUUID()}.txt`
+    expect((await denied(owner, "INSERT INTO storage.objects(bucket_id,name) VALUES ('workspace',$1)", [pointer])).message).toMatch(/row-level security/)
     expect(await rpc(owner, "SELECT name FROM storage.objects WHERE bucket_id='workspace' AND name=$1", [pointer])).toEqual([])
-    expect((await rpc(outsider, "SELECT name FROM storage.objects WHERE bucket_id='workspace' AND name=$1", [pointer]))[0].name).toBe(pointer)
-    expect((await rpc(outsider, "DELETE FROM storage.objects WHERE bucket_id='workspace' AND name=$1 RETURNING name", [pointer]))[0].name).toBe(pointer)
   })
 
   it('shared files do not expose hidden topic history or whisper bytes', async () => {

@@ -5,7 +5,7 @@
  * 老客户端「添加失败」正是只在 REST 那一层坏的)。这里用和客户端 groupAdmin.addAgent 一样的调用:owner 的真 session、
  * chat schema、四个具名参数,不传 p_as_task:
  *   · 老调用照旧调得通,agent 主动入座、照常出「加入了群聊」;
- *   · 对照:同一条路径带上 p_as_task = true,入座被动、不提示 —— 证明两次调用确实落在同一个函数上,参数也确实生效。
+ *   · 对照:同一条路径带上 p_as_task = true,不提示 —— 证明两次调用确实落在同一个函数上,参数也确实生效。
  *
  * 红线:仅回环本机库。
  */
@@ -109,12 +109,12 @@ describe('chat.add_group_agent 经 PostgREST', () => {
     expect(await joinNoticeFor(AGENT_OLD)).toBe(1)
   })
 
-  it('对照:同一条路径带上 p_as_task = true ⇒ 被动入座,不提示', async () => {
+  it('对照:同一条路径带上 p_as_task = true ⇒ 主动入座,不提示', async () => {
     const result = await must<{ status: string }>(ownerChat.rpc('add_group_agent', {
       p_chat_id: CHAT, p_agent_user_id: AGENT_TASK, p_message: null, p_as_user_id: ownerUid, p_as_task: true,
     }), 'add_group_agent (task seat)')
     expect(result).toMatchObject({ status: 'joined', chat_id: CHAT })
-    expect(await seat(AGENT_TASK)).toBe('passive')
+    expect(await seat(AGENT_TASK)).toBe('active')
     expect(await joinNoticeFor(AGENT_TASK)).toBe(0)
   })
 })

@@ -65,6 +65,8 @@ beforeAll(async () => {
 afterAll(async () => { await db?.end() })
 beforeEach(async () => {
   await db.query('BEGIN')
+  // Storage API sets this before remove(); RLS still governs the tested actor.
+  await db.query("SELECT set_config('storage.allow_delete_query','true',true)")
   ;[owner, reader, outsider, agentOwner, agent, topicOnlyAgent] = Array.from({ length: 6 }, randomUUID)
   for (const id of [owner, reader, outsider, agentOwner]) await db.query(`INSERT INTO auth.users(id,aud,role,email,raw_app_meta_data,raw_user_meta_data,created_at,updated_at)
     VALUES ($1,'authenticated','authenticated',$2,'{"provider":"email"}','{}',now(),now())`, [id, `${id}@topic-resource.example.test`])

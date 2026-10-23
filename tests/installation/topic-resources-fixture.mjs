@@ -48,7 +48,8 @@ export async function topicResourcesFixture(db) {
     const userFolder = (await db.query(`SELECT id FROM chat.workspace_items WHERE chat_id=$1 AND filename='Notes'`, [topics[0]])).rows[0].id
     const child = await document(topics[0], 'keep.json', '{"nested":true}', userFolder)
     await db.query(`INSERT INTO storage.objects(bucket_id,name,metadata) VALUES
-      ('workspace',$1,'{"size":3,"mimetype":"text/plain"}'),('chat-media',$2,'{"size":3,"mimetype":"text/plain"}')`, [pointer, legacy])
+      ('workspace',$1,'{"size":3,"mimetype":"text/plain"}'),('chat-media',$2,'{"size":3,"mimetype":"text/plain"}'),
+      ('chat-media',$3,'{"size":3,"mimetype":"text/plain"}')`, [pointer, legacy, missing])
     await db.query(`INSERT INTO chat.file_blobs(id,bucket_id,object_name,sha256,size_bytes,content_type) VALUES
       ($1,'oss',$2,$3,3,'text/plain'),($4,'workspace',$5,NULL,3,'text/plain')`, [blob, sha.slice(0, 2) + '/' + sha, sha, oldBlob, pointer])
     await db.query(`INSERT INTO chat.workspace_items(id,chat_id,parent_id,kind,filename,content_type,blob_id,size_bytes,created_by,version)
@@ -62,6 +63,10 @@ export async function topicResourcesFixture(db) {
       await db.query(`INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type,storage_bucket_id,storage_object_name)
         VALUES ($1,$2,$3,'[附件] legacy.txt (text/plain)','attachment','chat-media',$4)`, [randomUUID(), topics[0], owner, key])
     }
+    // Reproduce pre-existing object loss after a valid reference was made;
+    // inserting an already-missing reference is correctly rejected by the DB.
+    await db.query("SELECT set_config('storage.allow_delete_query','true',true)")
+    await db.query("DELETE FROM storage.objects WHERE bucket_id='chat-media' AND name=$1", [missing])
     await db.query(`INSERT INTO chat.file_blob_uploads(staging_key,uploader,blob_id,item_id,item_version)
       VALUES ($1,$2,$3,$4,3)`, [staging, owner, blob, file])
     await db.query('COMMIT')
@@ -113,6 +118,7 @@ export async function topicResourcesFixture(db) {
       async cleanup() {
         await db.query('BEGIN')
         try {
+          await db.query("SELECT set_config('storage.allow_delete_query','true',true)")
           await db.query('DELETE FROM chat.chats WHERE id=ANY($1)', [[group, dm]])
           await db.query('DELETE FROM chat.file_blob_uploads WHERE staging_key=$1', [staging])
           await db.query('DELETE FROM chat.file_blobs WHERE id=ANY($1::uuid[])', [[blob, oldBlob]])

@@ -271,6 +271,7 @@ describe('#6835 one whisper rule: every entry reads the same answer sheet', () =
       const serverOnly = [
         'chat.history_floor(text,text)',
         'chat.message_visible_to(text,timestamptz,boolean,text,text[],text)',
+        'chat.message_visible_at(timestamptz,timestamptz,boolean,text,text[],text)',
         'chat.message_reply_preview_row(text,text)',
         'chat.broadcast_to_chat_member_user_events(text,text,jsonb)',
       ]

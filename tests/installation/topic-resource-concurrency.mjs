@@ -91,6 +91,8 @@ export async function installTopicResourcesConcurrently(db, sql, test) {
     await db.query('COMMIT')
     const upload = await fetch(api.origin + storagePath, { method: 'POST', headers: { apikey: status.ANON_KEY, authorization: 'Bearer ' + token, 'content-type': 'text/plain' }, body: 'probe bytes', signal: AbortSignal.timeout(30_000) })
     assert.equal(upload.status, 200); await upload.body?.cancel(); uploaded = true
+    const before = await request(storagePath, undefined, token, 'GET')
+    assert.equal(before.status, 200); assert.equal(await before.text(), 'probe bytes')
 
     await test('a busy writer aborts the whole upgrade with an explicit retry error', async () => {
       const writer = await writerOf()
@@ -107,7 +109,7 @@ export async function installTopicResourcesConcurrently(db, sql, test) {
     async function run(phase, migrationFirst, agent) {
       const writer = await writerOf()
       const pid = (await writer.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
-      let loginPending, storagePending
+      let loginPending, storagePending, loginMs, storageMs
       const holdStart = performance.now()
       try {
         await db.query(`SET deadlock_timeout='${migrationFirst ? '100ms' : '10s'}'`)
@@ -133,9 +135,13 @@ export async function installTopicResourcesConcurrently(db, sql, test) {
           return
         }
         const loginStart = performance.now()
-        loginPending = login(); loginPending.catch(() => {})
+        loginPending = login().then((response) => { loginMs = performance.now() - loginStart; return response }); loginPending.catch(() => {})
         const storageStart = performance.now()
-        storagePending = fetch(api.origin + storagePath, { headers: { apikey: status.ANON_KEY, authorization: 'Bearer ' + token }, signal: AbortSignal.timeout(30_000) })
+        storagePending = fetch(api.origin + storagePath, { headers: { apikey: status.ANON_KEY, authorization: 'Bearer ' + token }, signal: AbortSignal.timeout(30_000) }).then(async (response) => {
+          const text = await response.text()
+          storageMs = performance.now() - storageStart
+          return { status: response.status, text }
+        })
         storagePending.catch(() => {})
         await Promise.all([blockedHttp('auth', loginPending), blockedHttp('storage', storagePending)])
         await db.query('COMMIT')
@@ -144,8 +150,12 @@ export async function installTopicResourcesConcurrently(db, sql, test) {
         await writer.query('COMMIT')
         const authResponse = await loginPending, storageResponse = await storagePending
         assert.equal(authResponse.status, 200); await authResponse.body?.cancel()
-        assert.equal(storageResponse.status, 200); assert.equal(await storageResponse.text(), 'probe bytes')
-        console.log('topic upgrade observed maintenance window ms (includes lock-observation barriers):', JSON.stringify({ transaction: holdMs, login: performance.now() - loginStart, storage: performance.now() - storageStart }))
+        if (storageResponse.status !== 200) {
+          const error = JSON.parse(storageResponse.text)
+          assert.fail('Storage GET after upgrade: ' + JSON.stringify({ status: storageResponse.status, code: error.statusCode, error: error.error, message: error.message }))
+        }
+        assert.equal(storageResponse.text, 'probe bytes')
+        console.log('topic upgrade observed maintenance window ms (includes lock-observation barriers):', JSON.stringify({ transaction: holdMs, login: loginMs, storage: storageMs }))
         assert.deepEqual((await db.query('SELECT chat.is_chat_member($1,$3) AS source,chat.is_chat_member($2,$3) AS topic', [source, topic, agent])).rows[0], { source: true, topic: true })
         await writer.query('BEGIN'); await asOwner(writer)
         assert.equal((await writer.query('SELECT total FROM chat.workspace_status_as($1,$2)', [topic, agent])).rows[0].total, 0)

@@ -67,8 +67,12 @@ describe('consistent account snapshot', () => {
     expect((await snapshot(f.owner)).previews[0]!.preview).toBe('hidden old content')
     expect((await snapshot(f.peer)).previews[0]!.preview).toBeNull()
     await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES ($1,$2,$3,'visible current content','text')", [visible, f.chat, f.owner])
+    const recipient = randomUUID()
+    await db.query("INSERT INTO identity.users(id,type,display_name) VALUES ($1,'human','whisper recipient')", [recipient])
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'member')", [f.chat, recipient])
     await db.query(`INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type,is_whisper,to_user_ids)
-      VALUES ($1,$2,$3,'private whisper content','text',true,$4)`, [secret, f.chat, f.owner, [f.owner]])
+      VALUES ($1,$2,$3,'private whisper content','text',true,$4)`, [secret, f.chat, f.owner, [recipient]])
+    expect(await as(recipient, 'SELECT id FROM chat.messages_view WHERE id=$1', [secret])).toEqual([{ id: secret }])
     const peer = await snapshot(f.peer)
     expect(peer.previews[0]!.preview).toBe('visible current content')
     expect(JSON.stringify(peer)).not.toContain('private whisper content')
@@ -100,11 +104,26 @@ describe('consistent account snapshot', () => {
       await db.query("SELECT chat.append_user_revision($1,'agent_changed','{}',false)", [owner])
       await writer.query('BEGIN')
       await writer.query("UPDATE identity.users SET display_name='committed later' WHERE id=$1", [owner])
+      const barrier = 173812403
+      await writer.query('SELECT pg_advisory_xact_lock($1)', [barrier])
       await db.query('BEGIN')
-      const before = await snapshot(owner)
+      const pid = (await db.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0]!.pid
+      const blocked = as<{ value: Snapshot }>(owner,
+        'WITH barrier AS MATERIALIZED (SELECT pg_advisory_xact_lock($1)) SELECT chat.sync_snapshot() AS value FROM barrier', [barrier])
+      // Prove the snapshot statement started; commit while that statement is
+      // blocked, rather than relying on a sleep or a wall-clock assertion.
+      let waiting = false
+      for (let attempt = 0; attempt < 1000; attempt += 1) {
+        waiting = (await writer.query<{ waiting: boolean }>("SELECT wait_event='advisory' AS waiting FROM pg_stat_activity WHERE pid=$1", [pid])).rows[0]?.waiting === true
+        if (waiting) break
+        await writer.query('SELECT pg_stat_clear_snapshot()')
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+      expect(waiting).toBe(true)
+      await writer.query('COMMIT')
+      const before = (await blocked)[0]!.value
       expect(before.identities[0]!.display_name).toBe('snapshot concurrent')
       await db.query('COMMIT')
-      await writer.query('COMMIT')
       await db.query('BEGIN')
       const after = await snapshot(owner)
       expect(after.identities[0]!.display_name).toBe('committed later')

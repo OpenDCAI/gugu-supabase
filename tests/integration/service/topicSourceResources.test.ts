@@ -198,6 +198,7 @@ describe('topics use one source resource container', () => {
   it('shared files do not expose hidden topic history or whisper bytes', async () => {
     const old = randomUUID()
     await db.query(`INSERT INTO chat.messages(id,chat_id,sender_user_id,content,created_at) VALUES ($1,$2,$3,'hidden',now()-interval '1 hour')`, [old, topic, owner])
+    await db.query('UPDATE chat.chats SET hide_history=true WHERE id=$1', [source])
     await db.query('UPDATE chat.chat_members SET hide_history_before=now() WHERE chat_id=$1 AND user_id=$2', [source, reader])
     const [doc] = await rpc(owner, 'SELECT * FROM chat.workspace_create_document_as($1,$2,$3)', [topic, owner, 'shared.md'])
     expect((await rpc(reader, 'SELECT id FROM chat.workspace_get_as($1,$2)', [doc.id, reader]))[0].id).toBe(doc.id)

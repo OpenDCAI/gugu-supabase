@@ -186,7 +186,7 @@ describe('workspace_replace_file_as', () => {
     const foreign = await object(elsewhere, outsider)
     await asUser(owner)
     expect(await fails('SELECT * FROM chat.workspace_replace_file_as($1,$2,$3,1)', [file.id, owner, foreign]))
-      .toMatch(/hint: workspace_not_member/)
+      .toMatch(/not a chat you are a member of/)
     await asUser(owner)
     expect(await fails('SELECT * FROM chat.workspace_replace_file_as($1,$2,$3,1,NULL,7)', [file.id, owner, next]))
       .toMatch(/version conflict: expected 7, got 1/)

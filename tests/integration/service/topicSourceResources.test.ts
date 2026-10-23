@@ -160,8 +160,9 @@ describe('topics use one source resource container', () => {
     expect((await db.query('SELECT count(*)::int AS n FROM chat.workspace_items WHERE blob_id=$1', [upload.blob])).rows[0].n).toBe(1)
     expect((await db.query('SELECT chat.is_chat_member($1,$2) AS member', [topic, reader])).rows[0].member).toBe(false)
     expect(await rpc(outsider, 'SELECT * FROM chat.file_urls_as($1::jsonb,$2)', [JSON.stringify([{ item_id: item.id }]), outsider])).toEqual([])
+    const envelope = (await db.query('SELECT chat.workspace_version_envelope($1,1) AS content', [item.id])).rows[0].content
     const wrong = await denied(owner, `INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type,file_item_id,file_version)
-      VALUES ($1,$2,$3,chat.workspace_version_envelope($4,1),'attachment',$4,1)`, [randomUUID(), other, owner, item.id])
+      VALUES ($1,$2,$3,$5,'attachment',$4,1)`, [randomUUID(), other, owner, item.id, envelope])
     expect(wrong.hint).toBe('message_file_not_here')
   })
 
@@ -200,6 +201,9 @@ describe('topics use one source resource container', () => {
     await db.query('UPDATE chat.chat_members SET hide_history_before=now() WHERE chat_id=$1 AND user_id=$2', [source, reader])
     const [doc] = await rpc(owner, 'SELECT * FROM chat.workspace_create_document_as($1,$2,$3)', [topic, owner, 'shared.md'])
     expect((await rpc(reader, 'SELECT id FROM chat.workspace_get_as($1,$2)', [doc.id, reader]))[0].id).toBe(doc.id)
+    expect(await rpc(reader, 'SELECT id FROM chat.messages WHERE id=$1', [old])).toEqual([])
+    // A whisper still requires an actual topic participant as its recipient.
+    await rpc(reader, `INSERT INTO chat.messages(id,chat_id,sender_user_id,content) VALUES ($1,$2,$3,'join')`, [randomUUID(), topic, reader])
     expect(await rpc(reader, 'SELECT id FROM chat.messages WHERE id=$1', [old])).toEqual([])
     const { sent, message } = await attached(topic, true)
     expect(sent.file_item_id).toBe(null); expect(sent.file_blob_id).toBeTruthy()

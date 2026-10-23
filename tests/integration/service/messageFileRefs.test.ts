@@ -224,7 +224,8 @@ describe('提交(chat.attachment_commit)', () => {
     const tries: [string, string, unknown[], RegExp][] = []
     const mine = await upload(owner, `m-${randomUUID()}`)
     tries.push(['别人的 agent', owner, [mine.key, randomUUID(), group, theirs, 'x.png', [], false], /Not allowed to act as/])
-    tries.push(['自己的 agent 不在这个群', owner, [mine.key, randomUUID(), bare, agent, 'x.png', [], false], /Not allowed to act as/])
+    // Delegation is valid, but the actor has no resource membership.
+    tries.push(['自己的 agent 不在这个群', owner, [mine.key, randomUUID(), bare, agent, 'x.png', [], false], /hint: workspace_not_member/])
     const out = await upload(outsider, `o-${randomUUID()}`)
     tries.push(['不是成员', outsider, [out.key, randomUUID(), group, outsider, 'x.png', [], false], /not a chat you are a member of/])
     const theirsUpload = await upload(member, `t-${randomUUID()}`)

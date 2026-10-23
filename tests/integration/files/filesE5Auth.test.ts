@@ -67,7 +67,7 @@ describe('current resource container authorization', () => {
     kept.doc.getText('content').insert(0, 'after:')
     expect(await waitFor(async () => (await fx.row(item)).inline_text?.startsWith('after:before:') === true)).toBeGreaterThanOrEqual(0)
     expect((await fx.row(item)).epoch).toBe(0)
-    expect(kept.events.closed).toBeUndefined()
+    expect(kept.events.closed).toBeNull()
   })
 
   it('leaving a topic does not revoke source access; leaving the source does', async () => {

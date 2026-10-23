@@ -72,6 +72,7 @@ const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,127}
  */
 export function refusalFromDb(error: DbError): Refusal {
   const byHint: Record<string, [number, string]> = {
+    session_attachment_denied: [403, 'denied'],
     attachment_upload_not_found: [404, 'upload_not_found'],
     attachment_upload_used: [409, 'upload_used'],
     attachment_source_not_found: [404, 'source_not_found'],
@@ -410,4 +411,46 @@ export async function handleGc(deps: AttachmentsDeps) {
     }
   }
   return { claimed: claimed.length, deleted, failed }
+}
+
+
+/** A session handoff grants the named Agents access; it never creates a chat. */
+export async function handleSessionCommit(deps: AttachmentsDeps, userId: string, body: Record<string, unknown>) {
+  const stagingKey = stagingOf(body, userId)
+  const id = str(body, 'attachment_id')!
+  if (!UUID.test(id)) throw new Refusal(400, 'invalid', 'attachment_id must be a uuid')
+  const args = {
+    p_staging_key: stagingKey, p_attachment_id: id,
+    p_sender_user_id: str(body, 'sender_user_id'), p_sender_session_id: str(body, 'sender_session_id'),
+    p_recipient_user_ids: strings(body, 'recipient_user_ids'), p_file_name: str(body, 'file_name'),
+  }
+  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false))
+  const rows = await call(deps.userRpc, 'session_attachment_commit', args) as unknown[]
+  if (!rows?.[0]) throw new Refusal(500, 'failed', 'session attachment commit returned no receipt')
+  return rows[0]
+}
+
+export async function handleSessionUrls(deps: AttachmentsDeps, userId: string, body: Record<string, unknown>) {
+  const ids = strings(body, 'attachment_ids')
+  if (!ids.length || ids.length > 32 || ids.some(id => !UUID.test(id))) throw new Refusal(400, 'invalid', 'expected 1 to 32 attachment ids')
+  const rows = await call(deps.userRpc, 'session_attachment_urls_as', { p_ids: ids, p_as_user_id: str(body, 'as', false) ?? userId }) as Array<{
+    attachment_id: string; file_name: string; bucket_id: string; object_name: string;
+    sha256: string; size_bytes: number; content_type: string;
+  }>
+  const now = deps.now()
+  return { attachments: await Promise.all(rows.map(async row => {
+    const signed = row.bucket_id === 'oss'
+      ? await objectStorage(deps).sign(row.object_name, false, now)
+      : { url: await deps.storageSignedUrl(row.bucket_id, row.object_name, CDN_SIGN_TTL_SECONDS), expiresAt: new Date(now.getTime() + CDN_SIGN_TTL_SECONDS * 1000).toISOString() }
+    return { attachment_id: row.attachment_id, file_name: row.file_name, sha256: row.sha256,
+      size_bytes: Number(row.size_bytes), content_type: row.content_type, url: signed.url, expires_at: signed.expiresAt }
+  })) }
+}
+
+
+export async function handleSessionRevoke(deps: AttachmentsDeps, _userId: string, body: Record<string, unknown>) {
+  const id = str(body, 'attachment_id')!
+  if (!UUID.test(id)) throw new Refusal(400, 'invalid', 'attachment_id must be a uuid')
+  await call(deps.userRpc, 'session_attachment_revoke', { p_id: id, p_as_user_id: str(body, 'as') })
+  return { revoked: true }
 }

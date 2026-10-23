@@ -4,6 +4,9 @@ import { createClient } from 'npm:@supabase/supabase-js@2.110.9'
 import {
   type AttachmentsDeps,
   handleCommit,
+  handleSessionCommit,
+  handleSessionUrls,
+  handleSessionRevoke,
   handlePlace,
   handleForward,
   handleGc,
@@ -147,6 +150,12 @@ Deno.serve(async (request) => {
     switch (route) {
       case 'upload':
         return json(await handleUpload(deps, who.user.id))
+      case 'session-commit':
+        return json({ attachment: await handleSessionCommit(deps, who.user.id, body) })
+      case 'session-revoke':
+        return json(await handleSessionRevoke(deps, who.user.id, body))
+      case 'session-urls':
+        return json(await handleSessionUrls(deps, who.user.id, body))
       case 'commit':
         return json({ message: await handleCommit(deps, who.user.id, body) })
       case 'place':

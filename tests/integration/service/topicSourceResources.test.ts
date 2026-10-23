@@ -86,6 +86,38 @@ afterEach(async () => {
 })
 
 describe('topics use one source resource container', () => {
+  it('topic UUID and public number have identical actor-visible facts and resource denials', async () => {
+    const number = String((await db.query('SELECT public_id FROM chat.chats WHERE id=$1', [topic])).rows[0].public_id)
+    const facts = (caller: string, address: string, actor: string) => rpc(caller, 'SELECT * FROM chat.chat_facts($1,$2)', [address, actor])
+    for (const [caller, actor] of [[reader, reader], [agentOwner, agent]]) {
+      const byId = await facts(caller, topic, actor), byNumber = await facts(caller, number, actor)
+      expect(byId).toHaveLength(1); expect(byNumber).toEqual(byId)
+      expect(byNumber[0]).toMatchObject({ id: topic, kind: 'topic', source_chat_id: source, public_id: Number(number) })
+      for (const result of [byId, byNumber]) {
+        expect(await rpc(caller, 'SELECT * FROM chat.workspace_status_as($1,$2)', [result[0].id, actor])).toEqual([{ total: 0, documents: 0, files: 0 }])
+      }
+      expect((await db.query('SELECT chat.is_chat_member($1,$2) AS participant', [topic, actor])).rows[0].participant).toBe(false)
+    }
+    expect(await facts(outsider, topic, outsider)).toEqual([])
+    expect(await facts(outsider, number, outsider)).toEqual([])
+    // Existing facts visibility includes the caller's source membership, but
+    // resource access still requires the delegated actor's own source seat.
+    const delegatedId = await facts(owner, topic, topicOnlyAgent)
+    expect(delegatedId).toHaveLength(1)
+    expect(await facts(owner, number, topicOnlyAgent)).toEqual(delegatedId)
+    for (const address of [topic, number]) {
+      const result = await facts(owner, address, topicOnlyAgent)
+      expect((await denied(owner, 'SELECT * FROM chat.workspace_status_as($1,$2)', [result[0].id, topicOnlyAgent])).hint).toBe('workspace_not_member')
+      expect((await denied(reader, 'SELECT * FROM chat.chat_facts($1,$2)', [address, agent])).message).toMatch(/Not allowed to act as/)
+    }
+    for (const address of [randomUUID(), '9999999999', '999999999999999999999999999', '1e3']) {
+      expect(await facts(reader, address, reader)).toEqual([])
+    }
+    await rpc(owner, 'SELECT chat.remove_group_member_as($1,$2,$3)', [source, agent, owner])
+    expect(await facts(agentOwner, topic, agent)).toEqual([])
+    expect(await facts(agentOwner, number, agent)).toEqual([])
+  })
+
   it('adding an owned agent to a topic joins the source normally; leaving the topic retains file access', async () => {
     await db.query('DELETE FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [topic, topicOnlyAgent])
     const [doc] = await rpc(reader, 'SELECT * FROM chat.workspace_create_document_as($1,$2,$3)', [source, reader, 'shared.md'])
@@ -226,6 +258,9 @@ describe('topics use one source resource container', () => {
 
   it('a direct-chat topic has the same container rule without depending on groupId', async () => {
     const dm = await room('dm', [reader]), dmTopic = await topicIn(dm)
+    const number = String((await db.query('SELECT public_id FROM chat.chats WHERE id=$1', [dmTopic])).rows[0].public_id)
+    expect(await rpc(reader, 'SELECT * FROM chat.chat_facts($1,$2)', [number, reader]))
+      .toEqual(await rpc(reader, 'SELECT * FROM chat.chat_facts($1,$2)', [dmTopic, reader]))
     const [doc] = await rpc(reader, 'SELECT * FROM chat.workspace_create_document_as($1,$2,$3)', [dmTopic, reader, 'dm.md'])
     expect(doc.chat_id).toBe(dm)
     expect((await rpc(reader, 'SELECT id FROM chat.workspace_list_as($1,$2)', [dmTopic, reader]))[0].id).toBe(doc.id)

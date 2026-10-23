@@ -6,6 +6,8 @@ An agent joining a topic also needs a real source membership. `add_group_agent` 
 
 Chat-addressed workspace operations accept a topic ID and resolve it to the source container. Returned entries carry the source `chat_id`. Item-addressed metadata, signed downloads and collaborative editing require the acting user's actual membership in that container. Delegating to an agent proves who may act as it; the agent must itself be a source member.
 
+`chat_facts` accepts either a chat UUID or its public number as text and returns the same canonical UUID and actor-visible facts. Number lookup does not grant file access: clients continue through the existing resource membership gate using the returned UUID.
+
 ## Upgrade
 
 The `topic_source_resources` release moves existing workspace metadata within its installation transaction. It preserves file/document IDs, user-directory IDs, content, Yjs state, epochs, versions, pinned message references and blob references. Existing source filenames win collisions; incoming files and ordinary directories use the normal filename allocator. Distinct boards keep their own IDs and contents. System attachment directories are consolidated, adopting an existing topic directory when the source has none.

@@ -29,6 +29,40 @@ $$;
 REVOKE ALL ON FUNCTION chat.workspace_require_room_member(text, text) FROM PUBLIC, anon, authenticated;
 
 
+CREATE OR REPLACE FUNCTION chat.chat_facts(p_chat_id text, p_as_user_id text DEFAULT NULL::text) RETURNS TABLE(id text, kind text, source_chat_id text, group_prompt text, public_id integer)
+    LANGUAGE plpgsql STABLE SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+DECLARE
+    v_caller TEXT := (SELECT auth.uid()::text);
+    v_actor TEXT;
+    v_public_id BIGINT := CASE WHEN p_chat_id ~ '^[0-9]{1,10}$' THEN p_chat_id::BIGINT END;
+    v_is_agent BOOLEAN;
+    v_owner TEXT;
+BEGIN
+    v_actor := COALESCE(NULLIF(trim(p_as_user_id), ''), v_caller);
+    SELECT u.type = 'agent', u.owner_user_id INTO v_is_agent, v_owner
+      FROM identity.users u WHERE u.id = v_actor;
+    IF v_actor IS DISTINCT FROM v_caller AND NOT (COALESCE(v_is_agent, false) AND v_owner = v_caller) THEN
+        RAISE EXCEPTION 'Not allowed to act as %', v_actor;
+    END IF;
+
+    RETURN QUERY
+    SELECT c.id, c.kind, c.source_chat_id, c.group_prompt, c.public_id
+      FROM chat.chats c
+     WHERE (c.id = p_chat_id OR c.public_id = v_public_id)
+       AND (
+           chat.is_chat_member(c.id, v_actor)
+           -- 主人看得见的,替他办事的 agent 也读得到(这就是它替换掉的那条裸读的可见域)。
+           OR chat.is_chat_member(c.id, v_caller)
+           -- 可见继承来源:看得见来源线就看得见这条话题存在(spec)。
+           OR (c.kind = 'topic' AND c.source_chat_id IS NOT NULL
+               AND (chat.is_chat_member(c.source_chat_id, v_actor)
+                    OR chat.is_chat_member(c.source_chat_id, v_caller)))
+       );
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION chat.group_add_denial(
     p_chat_id TEXT, p_user_id TEXT, p_actor_user_id TEXT,
     p_take_seat BOOLEAN DEFAULT true, p_owner_consented BOOLEAN DEFAULT false
@@ -905,6 +939,8 @@ GRANT ALL ON FUNCTION chat.workspace_status_as(p_chat_id text, p_as_user_id text
 GRANT ALL ON FUNCTION chat.workspace_replace_file_as(p_item_id text, p_as_user_id text, p_pointer text, p_size_bytes bigint, p_content_type text, p_expected_version integer) TO authenticated;
 GRANT ALL ON FUNCTION chat.create_topic(p_source_chat_id text, p_source_message_id text, p_name text, p_member_user_ids text[], p_as_user_id text) TO service_role;
 GRANT ALL ON FUNCTION chat.create_topic(p_source_chat_id text, p_source_message_id text, p_name text, p_member_user_ids text[], p_as_user_id text) TO authenticated;
+GRANT ALL ON FUNCTION chat.chat_facts(p_chat_id text, p_as_user_id text) TO service_role;
+GRANT ALL ON FUNCTION chat.chat_facts(p_chat_id text, p_as_user_id text) TO authenticated;
 GRANT EXECUTE ON FUNCTION chat.add_group_agent(TEXT,TEXT,TEXT,TEXT,BOOLEAN) TO authenticated,service_role;
 GRANT EXECUTE ON FUNCTION chat.group_add_denial(TEXT,TEXT,TEXT,BOOLEAN,BOOLEAN) TO service_role;
 

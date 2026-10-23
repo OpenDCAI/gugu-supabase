@@ -224,7 +224,7 @@ describe('related membership and external consent', () => {
     expect(await present(outsider)).toBe(false)
   })
   it('drops old RPC signatures rather than keeping compatibility routes', async () => {
-    for (const signature of ['chat.add_group_agent(text,text,text)', 'chat.decide_group_join(text,boolean)',
+    for (const signature of ['chat.add_group_agent(text,text,text)', 'chat.add_group_agent(text,text,text,text)', 'chat.decide_group_join(text,boolean)',
       'chat.request_agent_group_invitation(text,text,text,text)', 'chat.decide_agent_group_invitation(text,boolean)']) {
       expect((await db.query<{ fn: string | null }>('SELECT to_regprocedure($1)::text AS fn', [signature])).rows[0]!.fn).toBeNull()
     }

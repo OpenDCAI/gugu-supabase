@@ -2,8 +2,33 @@
 -- Public RPC shapes and topic participation/read positions do not change.
 -- Install through the release runner: definitions and metadata move commit together.
 SET LOCAL lock_timeout = '15s';
-LOCK TABLE chat.chats IN SHARE MODE;
-LOCK TABLE chat.workspace_items IN ACCESS EXCLUSIVE MODE;
+-- Establish the upgrade boundary before changing definitions or taking a data
+-- snapshot. Policy DDL also locks Supabase-managed tables. Take their strongest
+-- locks first, then drain core writers and row lockers, with no waiting while
+-- holding a partial set. A busy deployment aborts instead of waiting in a cycle.
+-- Keep the policy and metadata change atomic: no intermediate Storage scope.
+DO $locks$
+DECLARE v RECORD;
+BEGIN
+    FOR v IN
+        SELECT n.nspname, c.relname,
+               CASE WHEN n.nspname IN ('auth','storage','realtime')
+                          OR (n.nspname = 'chat' AND c.relname = 'workspace_items')
+                    THEN 'ACCESS EXCLUSIVE' ELSE 'EXCLUSIVE' END AS lock_mode
+          FROM pg_catalog.pg_class c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname IN ('auth','storage','realtime','identity','chat')
+           AND c.relkind IN ('r','p')
+         ORDER BY CASE n.nspname WHEN 'auth' THEN 0 WHEN 'storage' THEN 1
+                    WHEN 'realtime' THEN 2 WHEN 'identity' THEN 3 ELSE 4 END, c.oid
+    LOOP
+        EXECUTE format('LOCK TABLE ONLY %I.%I IN %s MODE NOWAIT', v.nspname, v.relname, v.lock_mode);
+    END LOOP;
+EXCEPTION WHEN lock_not_available THEN
+    RAISE EXCEPTION USING ERRCODE = '55P03', HINT = 'topic_resources_lock_busy_retry',
+        MESSAGE = 'topic resource upgrade locks are busy; retry the complete release after active transactions finish';
+END;
+$locks$;
 
 -- This helper is internal. Callers obtain their actor with workspace_actor_for
 -- (or have already verified the message sender). Do not expose a membership probe.
@@ -36,6 +61,7 @@ CREATE OR REPLACE FUNCTION chat.chat_facts(p_chat_id text, p_as_user_id text DEF
 DECLARE
     v_caller TEXT := (SELECT auth.uid()::text);
     v_actor TEXT;
+    v_chat_id TEXT := p_chat_id;
     v_public_id BIGINT := CASE WHEN p_chat_id ~ '^[0-9]{1,10}$' THEN p_chat_id::BIGINT END;
     v_is_agent BOOLEAN;
     v_owner TEXT;
@@ -47,10 +73,16 @@ BEGIN
         RAISE EXCEPTION 'Not allowed to act as %', v_actor;
     END IF;
 
+    -- Numeric addresses identify public_id only. An opaque numeric text id
+    -- must be addressed through its own public number, never an OR match.
+    IF p_chat_id ~ '^[0-9]+$' THEN
+        SELECT c.id INTO v_chat_id FROM chat.chats c WHERE c.public_id = v_public_id;
+    END IF;
+
     RETURN QUERY
     SELECT c.id, c.kind, c.source_chat_id, c.group_prompt, c.public_id
       FROM chat.chats c
-     WHERE (c.id = p_chat_id OR c.public_id = v_public_id)
+     WHERE c.id = v_chat_id
        AND (
            chat.is_chat_member(c.id, v_actor)
            -- 主人看得见的,替他办事的 agent 也读得到(这就是它替换掉的那条裸读的可见域)。
@@ -360,6 +392,73 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+CREATE OR REPLACE FUNCTION chat.chats_membership_invariants()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = chat, identity, public, pg_catalog
+AS $$
+DECLARE
+    affected_chat_id TEXT := COALESCE(NEW.chat_id, OLD.chat_id);
+    chat_kind TEXT;
+    chat_status TEXT;
+    creator_user_id TEXT;
+    owner_user_id TEXT;
+    owner_count INTEGER;
+    owner_is_human BOOLEAN;
+    member_count_val INTEGER;
+BEGIN
+    SELECT kind, status, chats.creator_user_id
+    INTO chat_kind, chat_status, creator_user_id
+    FROM chat.chats WHERE id = affected_chat_id;
+    -- Reuse the deferred membership invariant for pooled calls already running
+    -- an old function body: they still cannot commit a topic-only agent.
+    IF chat_kind = 'topic' AND EXISTS (
+        SELECT 1 FROM chat.chat_members m
+        JOIN identity.users u ON u.id = m.user_id AND u.type = 'agent'
+        JOIN chat.chats t ON t.id = m.chat_id
+        WHERE m.chat_id = affected_chat_id AND NOT chat.is_chat_member(t.source_chat_id, m.user_id)
+    ) THEN
+        RAISE EXCEPTION USING HINT = 'topic_agent_not_in_source',
+            MESSAGE = 'an agent participating in a topic must be a source member';
+    END IF;
+    IF chat_kind IS NULL OR chat_kind <> 'group' THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+
+    SELECT count(*), min(cm.user_id), bool_and(u.type = 'human')
+    INTO owner_count, owner_user_id, owner_is_human
+    FROM chat.chat_members cm
+    LEFT JOIN identity.users u ON u.id = cm.user_id
+    WHERE cm.chat_id = affected_chat_id AND cm.role = 'owner';
+    SELECT count(*) INTO member_count_val
+    FROM chat.chat_members WHERE chat_id = affected_chat_id;
+
+    IF chat_status <> 'archived' THEN
+        IF owner_count <> 1 OR NOT COALESCE(owner_is_human, false) THEN
+            RAISE EXCEPTION 'non-archived group chat % must have exactly 1 human owner', affected_chat_id;
+        END IF;
+        IF creator_user_id IS DISTINCT FROM owner_user_id THEN
+            RAISE EXCEPTION 'active group chat % creator and owner must match', affected_chat_id;
+        END IF;
+        IF chat_status = 'active' AND member_count_val < 1 THEN
+            RAISE EXCEPTION 'active group chat % must have >= 1 member (have %)', affected_chat_id, member_count_val;
+        END IF;
+    ELSE
+        IF owner_count > 1 OR (owner_count = 1 AND NOT COALESCE(owner_is_human, false)) THEN
+            RAISE EXCEPTION 'archived group chat % cannot have invalid owners', affected_chat_id;
+        END IF;
+        IF (owner_count = 0 AND creator_user_id IS NOT NULL)
+           OR (owner_count = 1 AND creator_user_id IS DISTINCT FROM owner_user_id) THEN
+            RAISE EXCEPTION 'archived group chat % creator and owner must both be absent or match', affected_chat_id;
+        END IF;
+    END IF;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION chat.chats_membership_invariants() FROM PUBLIC, anon, authenticated;
 
 -- Existing topic agents obtain real source seats through the same checked
 -- admission predicate and insertion door. No direct member-table backfill.
@@ -958,17 +1057,17 @@ $$;
 
 
 -- Storage keeps historical keys. Resolve their prefix using the existing,
--- caller-scoped chat facts API, then apply the ordinary source membership test.
+-- caller-visible raw chat row, then apply the ordinary source membership test.
 -- The internal resource helper stays closed to authenticated/anon callers.
 
 
-ALTER POLICY workspace_select_member ON storage.objects USING (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chat_facts((storage.foldername(name))[1]) c)));
+ALTER POLICY workspace_select_member ON storage.objects USING (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(name))[1])));
 
-ALTER POLICY workspace_delete_owner ON storage.objects USING (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chat_facts((storage.foldername(name))[1]) c)) AND NOT chat.workspace_pointer_in_use(name));
+ALTER POLICY workspace_delete_owner ON storage.objects USING (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(name))[1])) AND NOT chat.workspace_pointer_in_use(name));
 
-ALTER POLICY workspace_insert_member ON storage.objects WITH CHECK (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chat_facts((storage.foldername(name))[1]) c)) AND (storage.foldername(name))[2] = (SELECT auth.uid()::text));
+ALTER POLICY workspace_insert_member ON storage.objects WITH CHECK (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(name))[1])) AND (storage.foldername(name))[2] = (SELECT auth.uid()::text));
 
-ALTER POLICY workspace_update_owner ON storage.objects USING (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chat_facts((storage.foldername(name))[1]) c)) AND (storage.foldername(name))[2] = (SELECT auth.uid()::text)) WITH CHECK (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chat_facts((storage.foldername(name))[1]) c)) AND (storage.foldername(name))[2] = (SELECT auth.uid()::text));
+ALTER POLICY workspace_update_owner ON storage.objects USING (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(name))[1])) AND (storage.foldername(name))[2] = (SELECT auth.uid()::text)) WITH CHECK (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(name))[1])) AND (storage.foldername(name))[2] = (SELECT auth.uid()::text));
 
 -- Upgrade only metadata. Hold the item table lock while temporarily removing
 -- the two placement/system-folder guards; retain all foreign keys and byte pins.
@@ -1058,6 +1157,13 @@ ALTER TABLE chat.workspace_items ENABLE TRIGGER workspace_items_guard_delete;
 
 DO $verify$
 BEGIN
+    IF EXISTS (
+        SELECT 1 FROM chat.chats t JOIN chat.chat_members m ON m.chat_id = t.id
+        JOIN identity.users u ON u.id = m.user_id AND u.type = 'agent'
+        WHERE t.kind = 'topic' AND NOT chat.is_chat_member(t.source_chat_id, m.user_id)
+    ) THEN
+        RAISE EXCEPTION 'topic source enrollment left an agent without a source seat';
+    END IF;
     IF EXISTS (SELECT 1 FROM chat.workspace_items w JOIN chat.chats c ON c.id = w.chat_id AND c.kind = 'topic')
        OR EXISTS (SELECT 1 FROM chat.workspace_items w JOIN chat.workspace_items p ON p.id = w.parent_id WHERE w.chat_id <> p.chat_id)
        OR EXISTS (

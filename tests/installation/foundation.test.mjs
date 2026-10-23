@@ -4,6 +4,7 @@ import test from 'node:test'
 import pg from 'pg'
 import { foundationDigest, installFoundation, installReleases, releases } from '../../scripts/foundation.mjs'
 import { topicResourcesFixture } from './topic-resources-fixture.mjs'
+import { installTopicResourcesConcurrently } from './topic-resource-concurrency.mjs'
 
 // Deliberately requires an empty, disposable Supabase PostgreSQL 17 instance.
 // Never resets schemas, migration history, or user data to make a test pass.
@@ -33,7 +34,9 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
         })
         const fixture = await topicResourcesFixture(db)
         await t.test('topic metadata upgrade rolls back without changing rows, functions or guards', async () => {
+          const started = performance.now()
           await query(rolledBack)
+          console.log('topic upgrade quiet metadata transaction ms:', performance.now() - started)
           assert.deepEqual(await fixture.snapshot(), fixture.before)
           assert.equal((await query("SELECT prorettype::regtype::text AS type FROM pg_proc WHERE oid='chat.workspace_require_room_member(text,text)'::regprocedure"))[0].type, 'void')
         })
@@ -46,7 +49,7 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
           assert.equal((await query("SELECT count(*)::int AS n FROM pg_trigger WHERE tgrelid='chat.workspace_items'::regclass AND tgname IN ('workspace_items_place','workspace_items_guard_delete') AND tgenabled='O'"))[0].n, 2)
           await fixture.unpoison()
         })
-        const result = await query(sql)
+        const result = await installTopicResourcesConcurrently(db, sql, (name, run) => t.test(name, run))
         await t.test('topic upgrade preserves IDs, boards, versions, bytes and upload retries', () => fixture.assertMigrated())
         await fixture.cleanup()
         return result

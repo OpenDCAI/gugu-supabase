@@ -19,6 +19,8 @@ import { hasThumbnail, objectHeaders, sniff } from '../../../supabase/functions/
 import {
   type AttachmentsDeps,
   handleCommit,
+  handleSessionCommit,
+  handleSessionUrls,
   handleForward,
   handlePlace,
   handleGc,
@@ -516,5 +518,35 @@ describe('转发', () => {
     const { deps, rpcs } = fakes({ legacy: { row: { object_name: `${USER}/gone.png`, file_name: 'gone.png', content_type: 'image/png' }, bytes: null } })
     await expect(handleForward(deps, USER, forwardBody)).rejects.toMatchObject({ status: 410, code: 'source_gone' })
     expect(rpcs.map((r) => r.fn)).toEqual(['attachment_forward', 'attachment_legacy_source'])
+  })
+})
+
+
+describe('private session attachment routes', () => {
+  const id='33333333-3333-4333-8333-333333333333'
+  it('promotes the original bytes using the existing blob pipeline, without making a chat message',async()=>{
+    const bytes=new Uint8Array([0,255,12,0,128])
+    const {deps,bucket,rpcs}=fakes({object:bytes})
+    const base=deps.userRpc
+    deps.userRpc=async(fn,args)=>fn==='session_attachment_commit'
+      ? {data:[{attachment_id:id,file_name:args.p_file_name,sha256:await sha256Hex(bytes),size_bytes:bytes.length,content_type:'application/octet-stream'}],error:null}
+      : base(fn,args)
+    const answer=await handleSessionCommit(deps,USER,{staging_key:STAGING,attachment_id:id,sender_user_id:'sender',sender_session_id:'s',recipient_user_ids:['receiver'],file_name:'original.bin'})
+    expect(answer).toMatchObject({attachment_id:id,size_bytes:5,sha256:await sha256Hex(bytes)})
+    expect([...bucket.finals.values()]).toEqual([bytes])
+    expect(rpcs.some(row=>row.fn==='file_blob_register')).toBe(true)
+    expect(rpcs.some(row=>row.fn==='attachment_commit')).toBe(false)
+  })
+  it('signs only database-authorized session references, with the current Agent actor',async()=>{
+    const {deps}=fakes()
+    let actor:unknown
+    deps.userRpc=async(fn,args)=>{
+      expect(fn).toBe('session_attachment_urls_as');actor=args.p_as_user_id
+      return {data:args.p_as_user_id==='receiver' ? [{attachment_id:id,file_name:'x.bin',bucket_id:'oss',object_name:'ab/'+ 'ab'.repeat(32),sha256:'ab'.repeat(32),size_bytes:4,content_type:'application/octet-stream'}] : [],error:null}
+    }
+    const answer=await handleSessionUrls(deps,USER,{attachment_ids:[id],as:'receiver'})
+    expect(actor).toBe('receiver')
+    expect(answer.attachments).toMatchObject([{attachment_id:id,sha256:'ab'.repeat(32),size_bytes:4,url:expect.any(String)}])
+    expect(await handleSessionUrls(deps,USER,{attachment_ids:[id],as:'other-agent'})).toEqual({attachments:[]})
   })
 })

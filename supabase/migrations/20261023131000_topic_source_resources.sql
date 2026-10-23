@@ -1148,13 +1148,13 @@ $$;
 -- The internal resource helper stays closed to authenticated/anon callers.
 
 
-ALTER POLICY workspace_select_member ON storage.objects USING (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(storage.objects.name))[1])));
+ALTER POLICY workspace_select_member ON storage.objects USING (storage.objects.bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(storage.objects.name))[1])));
 
-ALTER POLICY workspace_delete_owner ON storage.objects USING (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(storage.objects.name))[1])) AND NOT chat.workspace_pointer_in_use(name));
+ALTER POLICY workspace_delete_owner ON storage.objects USING (storage.objects.bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(storage.objects.name))[1])) AND NOT chat.workspace_pointer_in_use(storage.objects.name));
 
-ALTER POLICY workspace_insert_member ON storage.objects WITH CHECK (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(storage.objects.name))[1])) AND (storage.foldername(name))[2] = (SELECT auth.uid()::text));
+ALTER POLICY workspace_insert_member ON storage.objects WITH CHECK (storage.objects.bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(storage.objects.name))[1])) AND (storage.foldername(storage.objects.name))[2] = (SELECT auth.uid()::text));
 
-ALTER POLICY workspace_update_owner ON storage.objects USING (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(storage.objects.name))[1])) AND (storage.foldername(name))[2] = (SELECT auth.uid()::text)) WITH CHECK (bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(storage.objects.name))[1])) AND (storage.foldername(name))[2] = (SELECT auth.uid()::text));
+ALTER POLICY workspace_update_owner ON storage.objects USING (storage.objects.bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(storage.objects.name))[1])) AND (storage.foldername(storage.objects.name))[2] = (SELECT auth.uid()::text)) WITH CHECK (storage.objects.bucket_id = 'workspace' AND chat.is_member((SELECT COALESCE(c.source_chat_id, c.id) FROM chat.chats c WHERE c.id = (storage.foldername(storage.objects.name))[1])) AND (storage.foldername(storage.objects.name))[2] = (SELECT auth.uid()::text));
 
 -- Upgrade only metadata. Hold the item table lock while temporarily removing
 -- the two placement/system-folder guards; retain all foreign keys and byte pins.

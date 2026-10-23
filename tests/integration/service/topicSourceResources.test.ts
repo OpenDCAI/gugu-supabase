@@ -137,8 +137,16 @@ describe('topics use one source resource container', () => {
     const group = randomUUID()
     expect((await rpc(owner, "SELECT id FROM chat.create_gugu_group($1,'UUID group',$2,'[]'::jsonb)", [group, owner]))[0].id).toBe(group)
     const anchor = (await db.query('SELECT source_message_id FROM chat.chats WHERE id=$1', [topic])).rows[0].source_message_id
-    expect((await denied(owner, "INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES ($1,'group','numeric id',$2)", [number, owner])).code).toBe('23514')
-    expect((await denied(owner, "INSERT INTO chat.chats(id,kind,name,creator_user_id,source_chat_id,source_message_id) VALUES ($1,'topic','numeric id',$2,$3,$4)", [number, owner, source, anchor])).code).toBe('23514')
+    // authenticated INSERT has no sequence USAGE. Supply the public number so
+    // the same direct-write path reaches the UUID constraint rather than failing
+    // at the default sequence; a valid UUID is the positive control.
+    const publicId = (await db.query("SELECT nextval('chat.public_chat_id_seq')::int AS n")).rows[0].n
+    const direct = randomUUID()
+    await rpc(owner, "INSERT INTO chat.chats(id,public_id,kind,name,creator_user_id) VALUES ($1,$2,'group','direct UUID',$3)", [direct, publicId, owner])
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner')", [direct, owner])
+    const nextPublicId = (await db.query("SELECT nextval('chat.public_chat_id_seq')::int AS n")).rows[0].n
+    expect((await denied(owner, "INSERT INTO chat.chats(id,public_id,kind,name,creator_user_id) VALUES ($1,$2,'group','numeric id',$3)", [number, nextPublicId, owner])).code).toBe('23514')
+    expect((await denied(owner, "INSERT INTO chat.chats(id,public_id,kind,name,creator_user_id,source_chat_id,source_message_id) VALUES ($1,$2,'topic','numeric id',$3,$4,$5)", [number, nextPublicId, owner, source, anchor])).code).toBe('23514')
     expect((await db.query('SELECT id FROM chat.chats WHERE id=$1', [number])).rows).toEqual([])
     const byId = await rpc(owner, 'SELECT * FROM chat.chat_facts($1,$2)', [topic, owner])
     const byNumber = await rpc(owner, 'SELECT * FROM chat.chat_facts($1,$2)', [number, owner])

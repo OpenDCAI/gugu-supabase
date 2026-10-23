@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
+import { randomUUID } from 'node:crypto'
 
 // 连接信息只读环境变量(本地起库后用 `pnpm dev:db env` 导出);本仓 vitest 不注入假 Supabase env。
 const envOf = (k: string) => (process.env[k] ?? '').trim()
@@ -43,7 +44,7 @@ const AGENTS = [
   { key: 'c', mode: 'active' },
 ] as const
 const agentId = (k: string) => id(`agent-${k}`)
-const CHAT = id('chat')
+const CHAT = randomUUID()
 const H2 = id('human2')
 
 async function must<T>(p: PromiseLike<unknown>, label: string): Promise<T> {

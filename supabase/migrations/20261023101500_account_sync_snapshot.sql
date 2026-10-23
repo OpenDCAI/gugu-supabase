@@ -52,7 +52,7 @@ BEGIN
                p.content_type, p.sender_user_id, p.client_message_id
           FROM conversations c
           LEFT JOIN LATERAL (
-              SELECT v.id, v.created_at, v.preview, v.seq, v.content_type,
+              SELECT v.id, v.created_at, chat.preview(v) AS preview, v.seq, v.content_type,
                      v.sender_user_id, v.client_message_id
                 FROM chat.messages_view v
                WHERE v.chat_id = c.id AND v.is_whisper = false

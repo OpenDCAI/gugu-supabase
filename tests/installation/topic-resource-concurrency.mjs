@@ -42,6 +42,10 @@ export async function installTopicResourcesConcurrently(db, sql, test) {
   assert.ok(boundary > 0 && commit > boundary)
   const head = sql.slice(0, boundary), body = sql.slice(boundary, commit)
   const migrationPid = (await db.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+  const exclusiveLocks = async () => (await db.query(`SELECT l.relation::regclass::text AS relation FROM pg_locks l
+    JOIN pg_class c ON c.oid=l.relation JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE l.pid=pg_backend_pid() AND l.granted AND l.mode='AccessExclusiveLock'
+      AND n.nspname IN ('auth','storage','realtime','identity','chat') ORDER BY relation`)).rows.map((r) => r.relation)
   async function blocked(pid, pending) {
     let state = 'pending'
     pending.then(() => { state = 'settled' }, () => { state = 'failed' })
@@ -109,7 +113,11 @@ export async function installTopicResourcesConcurrently(db, sql, test) {
         await db.query(`SET deadlock_timeout='${migrationFirst ? '100ms' : '10s'}'`)
         await writer.query(`SET deadlock_timeout='${migrationFirst ? '10s' : '100ms'}'`)
         await db.query(head)
-        if (phase === 'late') await db.query(body)
+        const upfront = await exclusiveLocks()
+        if (phase === 'late') {
+          await db.query(body)
+          assert.deepEqual(await exclusiveLocks(), upfront, 'policy and constraint DDL may not acquire a new strongest lock after the boundary')
+        }
         await writer.query('BEGIN'); await asOwner(writer)
         await writer.query("SET LOCAL lock_timeout='30s'; SET LOCAL statement_timeout='30s'")
         const pending = writer.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content) VALUES ($1,$2,$3,'pooled writer during upgrade')", [randomUUID(), topic, agent])
@@ -118,6 +126,7 @@ export async function installTopicResourcesConcurrently(db, sql, test) {
         console.log('topic upgrade pooled writer waits:', phase, migrationFirst ? 'migration detector first' : 'writer detector first', await blocked(pid, pending))
         if (phase !== 'late') {
           await db.query(body)
+          assert.deepEqual(await exclusiveLocks(), upfront, 'all strongest runtime-table locks were acquired with NOWAIT')
           await db.query('ROLLBACK')
           assert.equal(await outcome, null, 'no writer or migration may be a deadlock victim')
           await writer.query('ROLLBACK')

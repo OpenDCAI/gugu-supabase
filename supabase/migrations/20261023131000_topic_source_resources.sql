@@ -6,6 +6,9 @@ SET LOCAL lock_timeout = '15s';
 -- snapshot. Policy DDL also locks Supabase-managed tables. Take their strongest
 -- locks first, then drain core writers and row lockers, with no waiting while
 -- holding a partial set. A busy deployment aborts instead of waiting in a cycle.
+-- Supabase migration ledgers and vector-only tables without deployment-role
+-- DML grants are not part of these policies or runtime calls. Do not widen their
+-- grants merely to lock them.
 -- Keep the policy and metadata change atomic: no intermediate Storage scope.
 DO $locks$
 DECLARE v RECORD;
@@ -19,6 +22,8 @@ BEGIN
           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
          WHERE n.nspname IN ('auth','storage','realtime','identity','chat')
            AND c.relkind IN ('r','p')
+           AND (n.nspname IN ('chat','identity')
+                OR pg_catalog.has_table_privilege(c.oid, 'UPDATE,DELETE,TRUNCATE'))
          ORDER BY CASE n.nspname WHEN 'auth' THEN 0 WHEN 'storage' THEN 1
                     WHEN 'realtime' THEN 2 WHEN 'identity' THEN 3 ELSE 4 END, c.oid
     LOOP

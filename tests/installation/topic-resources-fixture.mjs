@@ -6,8 +6,8 @@ import * as Y from 'yjs'
 export async function topicResourcesFixture(db) {
   const owner = randomUUID(), reader = randomUUID()
   const legacyAgent = randomUUID()
-  const group = randomUUID(), dm = randomUUID()
-  const topics = Array.from({ length: 6 }, randomUUID)
+  const group = randomUUID(), dm = randomUUID(), ai = randomUUID()
+  const topics = Array.from({ length: 7 }, randomUUID)
   const blob = randomUUID(), oldBlob = randomUUID(), file = randomUUID()
   const staging = `staging/${owner}/${randomUUID()}`
   const pointer = `${topics[0]}/${owner}/old.txt`
@@ -17,12 +17,13 @@ export async function topicResourcesFixture(db) {
   await db.query('BEGIN')
   try {
     await db.query(`INSERT INTO identity.users(id,type,display_name) VALUES ($1,'human','owner'),($2,'human','reader')`, [owner, reader])
-    for (const [chat, kind] of [[group, 'group'], [dm, 'dm']]) {
+    for (const [chat, kind] of [[group, 'group'], [dm, 'dm'], [ai, 'ai']]) {
       await db.query('INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES ($1,$2,$3,$4)', [chat, kind, kind === 'group' ? 'upgrade fixture' : null, owner])
       await db.query(`INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner'),($1,$3,'member')`, [chat, owner, reader])
       const message = randomUUID()
       await db.query(`INSERT INTO chat.messages(id,chat_id,sender_user_id,content) VALUES ($1,$2,$3,'source')`, [message, chat, owner])
-      for (const topic of topics.slice(chat === group ? 0 : 4, chat === group ? 4 : 6)) {
+      const sourceTopics = chat === group ? topics.slice(0, 4) : chat === dm ? topics.slice(4, 6) : topics.slice(6)
+      for (const topic of sourceTopics) {
         await db.query(`INSERT INTO chat.chats(id,kind,name,creator_user_id,source_chat_id,source_message_id)
           VALUES ($1,'topic','upgrade topic',$2,$3,$4)`, [topic, owner, chat, message])
         await db.query(`INSERT INTO chat.chat_members(chat_id,user_id,role,last_read_seq) VALUES ($1,$2,'owner',7)`, [topic, owner])
@@ -54,6 +55,7 @@ export async function topicResourcesFixture(db) {
       [randomUUID(), group, owner, randomUUID(), topics[0]])
     const userFolder = (await db.query(`SELECT id FROM chat.workspace_items WHERE chat_id=$1 AND filename='Notes'`, [topics[0]])).rows[0].id
     const child = await document(topics[0], 'keep.json', '{"nested":true}', userFolder)
+    const aiDocument = await document(topics[6], 'ai.json', '{"same":"ai source"}')
     await db.query(`INSERT INTO storage.objects(bucket_id,name,metadata) VALUES
       ('workspace',$1,'{"size":3,"mimetype":"text/plain"}'),('chat-media',$2,'{"size":3,"mimetype":"text/plain"}'),
       ('chat-media',$3,'{"size":3,"mimetype":"text/plain"}')`, [pointer, legacy, missing])
@@ -77,7 +79,7 @@ export async function topicResourcesFixture(db) {
     await db.query(`INSERT INTO chat.file_blob_uploads(staging_key,uploader,blob_id,item_id,item_version)
       VALUES ($1,$2,$3,$4,3)`, [staging, owner, blob, file])
     await db.query('COMMIT')
-    const chats = [group, dm, ...topics]
+    const chats = [group, dm, ai, ...topics]
     const rows = (sql, args = []) => db.query(sql, args).then((r) => r.rows)
     const snapshot = async () => ({
       items: await rows(`SELECT to_jsonb(w) AS item FROM chat.workspace_items w WHERE chat_id=ANY($1) ORDER BY id`, [chats]),
@@ -112,9 +114,10 @@ export async function topicResourcesFixture(db) {
         assert.equal(moved.version, 3); assert.equal(moved.blob_id, blob)
         assert.notEqual(moved.filename, 'same.txt')
         assert.equal((await rows(`SELECT parent_id FROM chat.workspace_items WHERE id=$1`, [child]))[0].parent_id, userFolder)
+        assert.equal((await rows(`SELECT chat_id FROM chat.workspace_items WHERE id=$1`, [aiDocument]))[0].chat_id, ai)
         assert.equal((await rows(`SELECT filename FROM chat.workspace_items WHERE id=$1`, [userFolder]))[0].filename, 'Notes (2)')
         const adopted = await rows(`SELECT id FROM chat.workspace_items WHERE chat_id=$1 AND system_role='attachments'`, [dm])
-        assert.equal(adopted.length, 1); assert.ok(systems.slice(4).includes(adopted[0].id))
+        assert.equal(adopted.length, 1); assert.ok(systems.slice(4, 6).includes(adopted[0].id))
         await db.query('BEGIN')
         try {
           await db.query('SET LOCAL ROLE authenticated')
@@ -135,7 +138,7 @@ export async function topicResourcesFixture(db) {
         await db.query('BEGIN')
         try {
           await db.query("SELECT set_config('storage.allow_delete_query','true',true)")
-          await db.query('DELETE FROM chat.chats WHERE id=ANY($1)', [[group, dm]])
+          await db.query('DELETE FROM chat.chats WHERE id=ANY($1)', [[group, dm, ai]])
           await db.query('DELETE FROM chat.file_blob_uploads WHERE staging_key=$1', [staging])
           await db.query('DELETE FROM chat.file_blobs WHERE id=ANY($1::uuid[])', [[blob, oldBlob]])
           await db.query('DELETE FROM storage.objects WHERE name=ANY($1)', [[pointer, legacy]])

@@ -957,7 +957,7 @@ CREATE TEMP TABLE topic_resource_system (old_id uuid PRIMARY KEY, target_id uuid
 DO $validate$
 BEGIN
     IF EXISTS (SELECT 1 FROM topic_resource_move m LEFT JOIN chat.chats c ON c.id = m.resource_id
-               WHERE m.depth IS NULL OR c.kind IS NULL OR c.kind NOT IN ('group','dm')) THEN
+               WHERE m.depth IS NULL OR c.kind IS NULL OR c.kind NOT IN ('group','dm','ai')) THEN
         RAISE EXCEPTION 'topic resources have an invalid source or unreachable tree; no resources were moved';
     END IF;
 END;

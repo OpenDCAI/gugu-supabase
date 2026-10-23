@@ -29,6 +29,329 @@ $$;
 REVOKE ALL ON FUNCTION chat.workspace_require_room_member(text, text) FROM PUBLIC, anon, authenticated;
 
 
+CREATE OR REPLACE FUNCTION chat.group_add_denial(
+    p_chat_id TEXT, p_user_id TEXT, p_actor_user_id TEXT,
+    p_take_seat BOOLEAN DEFAULT true, p_owner_consented BOOLEAN DEFAULT false
+)
+RETURNS TEXT LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = '' AS $$
+DECLARE v_chat chat.chats%ROWTYPE; v_target identity.users%ROWTYPE; v_actor identity.users%ROWTYPE;
+    v_role TEXT; v_count INTEGER; v_related BOOLEAN;
+BEGIN
+    IF p_actor_user_id IS NULL THEN RETURN 'not_authenticated'; END IF;
+    SELECT * INTO v_chat FROM chat.chats WHERE id = p_chat_id;
+    IF NOT FOUND OR v_chat.kind NOT IN ('group','topic') THEN RETURN 'not_a_group'; END IF;
+    IF v_chat.status = 'archived' THEN RETURN 'group_archived'; END IF;
+    SELECT * INTO v_target FROM identity.users WHERE id = p_user_id;
+    IF NOT FOUND THEN RETURN 'user_not_found'; END IF;
+    IF chat.is_cloud_agent_user(p_user_id) THEN RETURN 'cloud_agent'; END IF;
+    IF chat.is_chat_member(p_chat_id, p_user_id) THEN RETURN NULL; END IF;
+    -- 项目群只有项目的主人和主人的 agent(gugu-dev#181):设备上报的项目记着它绑的群(identity.device_projects.chat_id)。
+    -- 这是那条记录本身的事实,❌ 从群名、群人数之类去猜哪个群是项目群。已经在群里的人不动(上一行)。
+    IF v_chat.kind = 'group' AND EXISTS (SELECT 1 FROM identity.device_projects dp WHERE dp.chat_id = p_chat_id)
+       AND NOT EXISTS (SELECT 1 FROM identity.device_projects dp WHERE dp.chat_id = p_chat_id
+                       AND dp.user_id::text IN (p_user_id, v_target.owner_user_id)) THEN
+        RETURN 'project_group_owner_only';
+    END IF;
+    SELECT * INTO v_actor FROM identity.users WHERE id = p_actor_user_id;
+    IF NOT FOUND THEN RETURN 'actor_not_member'; END IF;
+    IF v_chat.kind = 'topic' THEN
+        IF NOT chat.is_chat_member(v_chat.source_chat_id, p_actor_user_id) THEN RETURN 'actor_not_member'; END IF;
+        IF NOT chat.is_chat_member(v_chat.source_chat_id, p_user_id) THEN RETURN 'not_in_source_line'; END IF;
+        RETURN NULL;
+    END IF;
+    SELECT role INTO v_role FROM chat.chat_members WHERE chat_id = p_chat_id AND user_id = p_actor_user_id;
+    v_related := chat.group_related(p_actor_user_id, p_user_id);
+    IF v_role IS NULL THEN
+        IF p_user_id = p_actor_user_id AND v_chat.creator_user_id = p_actor_user_id
+           AND NOT EXISTS (SELECT 1 FROM chat.chat_members WHERE chat_id = p_chat_id) THEN
+            v_role := 'owner'; -- the creator's initial seat
+        ELSIF v_actor.type = 'agent' AND v_target.type = 'agent' AND v_related
+           AND chat.is_chat_member(p_chat_id, v_actor.owner_user_id) THEN
+            v_role := 'member'; -- enrollment consent is not the owner's admin role
+        ELSE RETURN 'actor_not_member'; END IF;
+    END IF;
+    IF v_target.type = 'agent' AND NOT v_related AND NOT COALESCE(p_owner_consented,false) THEN
+        RETURN 'agent_not_owned'; END IF;
+    IF v_role NOT IN ('owner','admin') THEN
+        IF v_target.type = 'agent' AND v_chat.agent_join_approval THEN RETURN 'agent_join_requires_manager';
+        ELSIF v_target.type <> 'agent' AND NOT v_related AND NOT v_chat.allow_member_invite THEN
+            RETURN 'member_invite_disabled'; END IF;
+    END IF;
+    IF p_take_seat THEN
+        SELECT count(*) INTO v_count FROM chat.chat_members WHERE chat_id = p_chat_id;
+        IF v_count >= v_chat.max_members THEN RETURN 'member_limit_reached'; END IF;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION chat.add_group_agent(
+    p_chat_id TEXT,
+    p_agent_user_id TEXT,
+    p_message TEXT,
+    p_as_user_id TEXT,
+    p_as_task BOOLEAN DEFAULT false
+)
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE
+    v_actor TEXT := chat.require_group_actor(p_as_user_id);
+    v_denial TEXT;
+    v_request TEXT;
+    v_source TEXT;
+    v_result JSONB;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM identity.users WHERE id = p_agent_user_id AND type = 'agent'
+                   AND owner_user_id = auth.uid()::text) THEN RAISE EXCEPTION 'agent_not_owned'; END IF;
+    SELECT c.source_chat_id INTO v_source FROM chat.chats c WHERE c.id = p_chat_id AND c.kind = 'topic';
+    IF v_source IS NOT NULL AND NOT chat.is_chat_member(v_source, p_agent_user_id) THEN
+        -- The same normal admission, approval and capacity rules apply first.
+        v_result := chat.add_group_agent(v_source, p_agent_user_id, p_message, v_actor, p_as_task);
+        IF v_result->>'status' NOT IN ('joined','already_member') THEN RETURN v_result; END IF;
+    END IF;
+    PERFORM 1 FROM chat.chats WHERE id = p_chat_id FOR UPDATE;
+    v_denial := chat.group_add_denial(p_chat_id, p_agent_user_id, v_actor);
+    IF v_denial = 'agent_join_requires_manager' THEN
+        v_request := chat.queue_agent_join_request(p_chat_id, p_agent_user_id, v_actor, p_message);
+        RETURN jsonb_build_object('status', 'pending_approval', 'request_id', v_request, 'chat_id', p_chat_id);
+    END IF;
+    IF v_denial IS NOT NULL THEN RAISE EXCEPTION '%', v_denial; END IF;
+    IF chat.is_chat_member(p_chat_id, p_agent_user_id) THEN
+        RETURN jsonb_build_object('status', 'already_member', 'chat_id', p_chat_id);
+    END IF;
+    PERFORM chat.insert_group_member(p_chat_id, p_agent_user_id, 'active', NOT p_as_task);
+    RETURN jsonb_build_object('status', 'joined', 'chat_id', p_chat_id);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION chat.create_topic(p_source_chat_id text, p_source_message_id text, p_name text DEFAULT NULL::text, p_member_user_ids text[] DEFAULT NULL::text[], p_as_user_id text DEFAULT NULL::text) RETURNS TABLE(chat_id text, public_id integer, name text, source_chat_id text, source_message_id text, creator_user_id text)
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'chat', 'identity', 'public', 'pg_catalog'
+    AS $$
+#variable_conflict use_column
+DECLARE
+    v_me TEXT := auth.uid()::text;
+    v_actor TEXT;
+    v_actor_is_agent BOOLEAN;
+    v_actor_owner TEXT;
+    v_owner_in_source BOOLEAN;
+    v_actor_name TEXT;
+    v_source_kind TEXT;
+    v_source_hide_history BOOLEAN;
+    v_source_content TEXT;
+    v_source_is_whisper BOOLEAN;
+    v_source_retracted TIMESTAMPTZ;
+    v_source_content_type TEXT;
+    v_name TEXT;
+    v_chat_id TEXT := gen_random_uuid()::text;
+    v_members TEXT[];
+    v_denial TEXT;
+    v_candidate TEXT;
+    v_join JSONB;
+BEGIN
+    IF v_me IS NULL THEN
+        RAISE EXCEPTION 'Not authenticated';
+    END IF;
+
+    v_actor := COALESCE(NULLIF(trim(COALESCE(p_as_user_id, '')), ''), v_me);
+    SELECT u.type = 'agent', u.owner_user_id, u.display_name
+      INTO v_actor_is_agent, v_actor_owner, v_actor_name
+      FROM identity.users u WHERE u.id = v_actor;
+    IF v_actor <> v_me AND NOT (COALESCE(v_actor_is_agent, false) AND v_actor_owner = v_me) THEN
+        RAISE EXCEPTION 'Cannot open a topic as %', v_actor;
+    END IF;
+
+    SELECT c.kind, c.hide_history INTO v_source_kind, v_source_hide_history
+      FROM chat.chats c WHERE c.id = p_source_chat_id;
+    IF v_source_kind IS NULL THEN
+        RAISE EXCEPTION 'Source chat % not found', p_source_chat_id;
+    END IF;
+    IF v_source_kind = 'topic' THEN
+        RAISE EXCEPTION 'A topic cannot grow out of another topic';
+    END IF;
+
+    v_owner_in_source := COALESCE(v_actor_is_agent, false)
+        AND v_actor_owner IS NOT NULL
+        AND chat.is_chat_member(p_source_chat_id, v_actor_owner);
+
+    IF NOT chat.is_chat_member(p_source_chat_id, v_actor) AND NOT v_owner_in_source THEN
+        RAISE EXCEPTION 'Not a member of the source chat';
+    END IF;
+
+    -- Creating a topic with an agent enrolls it through ordinary source
+    -- admission; a pending approval cannot produce a topic-only participant.
+    IF v_owner_in_source AND NOT chat.is_chat_member(p_source_chat_id, v_actor) THEN
+        v_join := chat.add_group_agent(p_source_chat_id, v_actor, NULL, v_actor);
+        IF v_join->>'status' NOT IN ('joined','already_member') THEN
+            RAISE EXCEPTION 'agent_join_requires_manager: join the source before opening this topic';
+        END IF;
+    END IF;
+    FOREACH v_candidate IN ARRAY COALESCE(p_member_user_ids, ARRAY[]::TEXT[]) LOOP
+        IF NOT chat.is_chat_member(p_source_chat_id, v_candidate)
+           AND EXISTS (SELECT 1 FROM identity.users u WHERE u.id = v_candidate AND u.type = 'agent') THEN
+            v_join := chat.add_group_agent(p_source_chat_id, v_candidate, NULL, v_actor);
+            IF v_join->>'status' NOT IN ('joined','already_member') THEN
+                RAISE EXCEPTION 'agent_join_requires_manager: join the source before opening this topic';
+            END IF;
+        END IF;
+    END LOOP;
+
+    SELECT m.content, m.is_whisper, m.retracted_at, m.content_type
+      INTO v_source_content, v_source_is_whisper, v_source_retracted, v_source_content_type
+    FROM chat.messages m
+    WHERE m.id = p_source_message_id
+      AND m.chat_id = p_source_chat_id
+      AND m.deleted_at IS NULL;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Source message % is not a live message of chat %',
+            p_source_message_id, p_source_chat_id;
+    END IF;
+
+    -- 悄悄话开不出话题:话题对来源线全员可见,而它的名字截自来源消息 ⇒ 开一条就是公开那句话。
+    IF COALESCE(v_source_is_whisper, false) THEN
+        RAISE EXCEPTION 'A whisper cannot be the source of a topic';
+    END IF;
+
+    -- 撤回的消息同理:那句话已经被收回,❌ 不许借话题名把它重新贴到所有人眼前。
+    IF v_source_retracted IS NOT NULL THEN
+        RAISE EXCEPTION 'A retracted message cannot be the source of a topic';
+    END IF;
+
+    IF NOT chat.can_read_message(p_source_message_id, v_actor)
+       AND NOT (v_owner_in_source AND chat.can_read_message(p_source_message_id, v_actor_owner)) THEN
+        RAISE EXCEPTION 'Source message % is not readable by %', p_source_message_id, v_actor;
+    END IF;
+
+    v_name := NULLIF(trim(COALESCE(p_name, '')), '');
+    -- 只有正文类消息值得截名:系统消息会开出一条叫「某某 开了话题:…」的话题,附件会开出
+    -- 「[附件] 季度报表.xlsx (2.1 MB)」—— 都不像人起的名字。其余类型退回「话题」,用户自己改。
+    IF v_name IS NULL AND COALESCE(v_source_content_type, 'text') = 'text' THEN
+        v_name := chat.topic_name_from_message(v_source_content);
+    END IF;
+    v_name := COALESCE(v_name, '话题');
+
+    -- @@@5856 hide_history 跟着来源线走。不带它 ⇒ 话题默认 false ⇒ 入列触发器给成员置的时间界是 NULL,
+    -- 于是「被时间界挡住的人在话题里说一句话(说话即参与)就解锁全部历史」。
+    -- 可见继承来源,那道界也得继承。来源线里本来没有界的人不受影响 —— 他们走 can_see_topic_message。
+    INSERT INTO chat.chats (id, kind, name, creator_user_id, source_chat_id, source_message_id, hide_history)
+    VALUES (v_chat_id, 'topic', v_name, v_actor, p_source_chat_id, p_source_message_id,
+            COALESCE(v_source_hide_history, false));
+
+    -- ⚠️ 这道 is_chat_member 与下面 row3 的 `NOT v_owner_in_source OR …` 互补:主人不在来源线时
+    -- row3 不过滤,但这里已经先把他踢掉了。动任一处都要看另一处。
+    SELECT COALESCE(array_agg(DISTINCT candidate.user_id), ARRAY[]::TEXT[])
+    INTO v_members
+    FROM unnest(COALESCE(p_member_user_ids, ARRAY[]::TEXT[])) AS candidate(user_id)
+    WHERE NULLIF(candidate.user_id, '') IS NOT NULL
+      AND candidate.user_id <> v_actor
+      AND chat.is_chat_member(p_source_chat_id, candidate.user_id);
+
+    INSERT INTO chat.chat_members (chat_id, user_id, role)
+    SELECT v_chat_id, v_actor, CASE WHEN v_owner_in_source THEN 'member' ELSE 'owner' END
+    UNION ALL
+    SELECT v_chat_id, v_actor_owner, 'owner'
+     WHERE v_owner_in_source AND v_actor_owner <> v_actor
+    UNION ALL
+    SELECT v_chat_id, member_id, 'member' FROM unnest(v_members) AS member_id
+     WHERE NOT v_owner_in_source OR member_id <> v_actor_owner
+    ON CONFLICT (chat_id, user_id) DO NOTHING;
+
+    INSERT INTO chat.group_agent_states (
+        chat_id, agent_user_id, functional_role, capability_roles, last_action, updated_at
+    )
+    SELECT v_chat_id, u.id, 'member', ARRAY['member']::TEXT[], '已加入话题', now()
+    FROM identity.users u
+    WHERE u.type = 'agent'
+      AND (u.id = v_actor OR u.id = ANY(v_members));
+
+    IF COALESCE(v_actor_is_agent, false) THEN
+        INSERT INTO chat.messages (id, chat_id, sender_user_id, content, content_type, client_message_id)
+        VALUES (
+            gen_random_uuid()::text,
+            p_source_chat_id,
+            v_actor,
+            COALESCE(v_actor_name, 'Agent') || ' 开了话题:' || v_name,
+            'system',
+            'topic-opened:' || v_chat_id
+        )
+        ON CONFLICT (chat_id, client_message_id) WHERE client_message_id IS NOT NULL DO NOTHING;
+    END IF;
+
+    RETURN QUERY
+    SELECT c.id, c.public_id, c.name, c.source_chat_id, c.source_message_id, c.creator_user_id
+    FROM chat.chats c WHERE c.id = v_chat_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION chat.join_topic_participants() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'chat', 'identity', 'public', 'pg_catalog'
+    AS $$
+DECLARE
+    v_source_chat_id TEXT;
+    v_join JSONB;
+BEGIN
+    SELECT c.source_chat_id INTO v_source_chat_id
+    FROM chat.chats c
+    WHERE c.id = NEW.chat_id AND c.kind = 'topic';
+
+    IF v_source_chat_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    -- 说话就是参与
+    IF NEW.sender_user_id IS NOT NULL THEN
+        IF NOT chat.is_chat_member(v_source_chat_id, NEW.sender_user_id)
+           AND EXISTS (SELECT 1 FROM identity.users u WHERE u.id = NEW.sender_user_id AND u.type = 'agent') THEN
+            v_join := chat.add_group_agent(v_source_chat_id, NEW.sender_user_id, NULL, NEW.sender_user_id);
+            IF v_join->>'status' NOT IN ('joined','already_member') THEN
+                RAISE EXCEPTION 'agent_join_requires_manager: join the source before speaking in this topic';
+            END IF;
+        END IF;
+        INSERT INTO chat.chat_members (chat_id, user_id, role, joined_ingest_seq)
+        VALUES (NEW.chat_id, NEW.sender_user_id, 'member', NEW.ingest_seq - 1)
+        ON CONFLICT (chat_id, user_id) DO NOTHING;
+    END IF;
+
+    -- 被 @ 就是被拉进来(只限来源线里已有的人/agent:agent 能拉不能加,见 agent-social)。
+    -- 在这条消息入群(界 = NEW.ingest_seq - 1,门 `>`):拉你进来的这一条,你收得到(#6405)。
+    IF NEW.to_user_ids IS NOT NULL THEN
+        INSERT INTO chat.chat_members (chat_id, user_id, role, joined_ingest_seq)
+        SELECT NEW.chat_id, target.user_id, 'member', NEW.ingest_seq - 1
+        FROM unnest(NEW.to_user_ids) AS target(user_id)
+        WHERE target.user_id <> '*'
+          AND chat.is_chat_member(v_source_chat_id, target.user_id)
+        ON CONFLICT (chat_id, user_id) DO NOTHING;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+-- Existing topic agents obtain real source seats through the same checked
+-- admission predicate and insertion door. No direct member-table backfill.
+CREATE TEMP TABLE topic_source_agent_enrollment ON COMMIT DROP AS
+SELECT DISTINCT t.source_chat_id, m.user_id AS agent_id, u.owner_user_id
+  FROM chat.chats t JOIN chat.chat_members m ON m.chat_id = t.id
+  JOIN identity.users u ON u.id = m.user_id AND u.type = 'agent'
+ WHERE t.kind = 'topic' AND NOT chat.is_chat_member(t.source_chat_id, m.user_id);
+DO $enroll$
+DECLARE v RECORD; v_denial TEXT;
+BEGIN
+    FOR v IN SELECT * FROM topic_source_agent_enrollment ORDER BY source_chat_id, agent_id LOOP
+        PERFORM 1 FROM chat.chats WHERE id = v.source_chat_id FOR UPDATE;
+        v_denial := chat.group_add_denial(v.source_chat_id, v.agent_id, v.owner_user_id);
+        IF v_denial IS NOT NULL THEN
+            RAISE EXCEPTION 'topic source enrollment refused by normal admission: %', v_denial;
+        END IF;
+        PERFORM chat.insert_group_member(v.source_chat_id, v.agent_id);
+    END LOOP;
+    IF EXISTS (SELECT 1 FROM topic_source_agent_enrollment e WHERE NOT chat.is_chat_member(e.source_chat_id, e.agent_id)) THEN
+        RAISE EXCEPTION 'topic source agent enrollment did not retain every source seat';
+    END IF;
+END;
+$enroll$;
+
+
 CREATE OR REPLACE FUNCTION chat.file_place_as(p_staging_key text, p_chat_id text, p_as_user_id text, p_file_name text, p_folder text DEFAULT NULL::text, p_source_message_ids text[] DEFAULT NULL::text[]) RETURNS TABLE(id uuid, chat_id text, kind text, filename text, content_type text, size_bytes bigint, pointer text, source_message_ids text[], created_by text, version integer, created_at timestamp with time zone, updated_at timestamp with time zone, parent_id uuid, system_role text, path text)
     LANGUAGE plpgsql SECURITY DEFINER
     SET search_path TO ''
@@ -571,6 +894,19 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+-- Restore existing public grants after the fail-closed DDL event trigger.
+GRANT ALL ON FUNCTION chat.file_place_as(p_staging_key text, p_chat_id text, p_as_user_id text, p_file_name text, p_folder text, p_source_message_ids text[]) TO authenticated;
+GRANT ALL ON FUNCTION chat.workspace_create_document_as(p_chat_id text, p_as_user_id text, p_title text, p_content text, p_content_type text, p_source_message_ids text[], p_folder text) TO authenticated;
+GRANT ALL ON FUNCTION chat.workspace_create_file_as(p_chat_id text, p_as_user_id text, p_filename text, p_content_type text, p_size_bytes bigint, p_pointer text, p_source_message_ids text[], p_folder text) TO authenticated;
+GRANT ALL ON FUNCTION chat.workspace_list_as(p_chat_id text, p_as_user_id text, p_offset integer, p_limit integer, p_name text, p_kind text, p_folder text, p_exact boolean) TO authenticated;
+GRANT ALL ON FUNCTION chat.workspace_mkdir_as(p_chat_id text, p_as_user_id text, p_path text) TO authenticated;
+GRANT ALL ON FUNCTION chat.workspace_status_as(p_chat_id text, p_as_user_id text) TO authenticated;
+GRANT ALL ON FUNCTION chat.workspace_replace_file_as(p_item_id text, p_as_user_id text, p_pointer text, p_size_bytes bigint, p_content_type text, p_expected_version integer) TO authenticated;
+GRANT ALL ON FUNCTION chat.create_topic(p_source_chat_id text, p_source_message_id text, p_name text, p_member_user_ids text[], p_as_user_id text) TO service_role;
+GRANT ALL ON FUNCTION chat.create_topic(p_source_chat_id text, p_source_message_id text, p_name text, p_member_user_ids text[], p_as_user_id text) TO authenticated;
+GRANT EXECUTE ON FUNCTION chat.add_group_agent(TEXT,TEXT,TEXT,TEXT,BOOLEAN) TO authenticated,service_role;
+GRANT EXECUTE ON FUNCTION chat.group_add_denial(TEXT,TEXT,TEXT,BOOLEAN,BOOLEAN) TO service_role;
 
 -- Participation changes do not revoke source-chat file access.
 CREATE OR REPLACE FUNCTION chat.notify_files_member_removed() RETURNS trigger

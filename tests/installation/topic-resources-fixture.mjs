@@ -5,6 +5,7 @@ import * as Y from 'yjs'
 // Used only before the topic-resource release on the disposable installation DB.
 export async function topicResourcesFixture(db) {
   const owner = randomUUID(), reader = randomUUID()
+  const legacyAgent = randomUUID()
   const group = randomUUID(), dm = randomUUID()
   const topics = Array.from({ length: 6 }, randomUUID)
   const blob = randomUUID(), oldBlob = randomUUID(), file = randomUUID()
@@ -29,6 +30,12 @@ export async function topicResourcesFixture(db) {
         systems.push(rows[0].id)
       }
     }
+    await db.query(`INSERT INTO auth.users(id,aud,role,email,raw_app_meta_data,raw_user_meta_data,created_at,updated_at)
+      VALUES ($1,'authenticated','authenticated',$2,'{"provider":"email"}','{}',now(),now())`, [owner, `${owner}@topic-upgrade.example.test`])
+    await db.query(`INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES ($1,$2,'fixture','fixture','linux')`, ['topic-upgrade-' + owner, owner])
+    await db.query(`INSERT INTO identity.users(id,type,display_name,owner_user_id,device_id)
+      VALUES ($1,'agent','legacy topic agent',$2,$3)`, [legacyAgent, owner, 'topic-upgrade-' + owner])
+    await db.query(`INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'member')`, [topics[0], legacyAgent])
     const rootSystem = (await db.query(`SELECT chat.workspace_system_folder($1,'attachments') AS id`, [group])).rows[0].id
     async function document(chat, name, text, parent = null, state = null) {
       const id = randomUUID()
@@ -87,7 +94,13 @@ export async function topicResourcesFixture(db) {
       before,
       async assertMigrated() {
         const after = await snapshot()
-        for (const key of ['versions', 'blobs', 'messages', 'members', 'uploads', 'storage']) assert.deepEqual(after[key], before[key], key + ' is unchanged')
+        for (const key of ['versions', 'blobs', 'uploads', 'storage']) assert.deepEqual(after[key], before[key], key + ' is unchanged')
+        for (const message of before.messages) assert.deepEqual(after.messages.find((m) => m.id === message.id), message)
+        for (const member of before.members) assert.deepEqual(after.members.find((m) => m.chat_id === member.chat_id && m.user_id === member.user_id), member)
+        const enrolled = after.members.filter((m) => m.chat_id === group && m.user_id === legacyAgent)
+        assert.equal(enrolled.length, 1); assert.equal(enrolled[0].listen_mode, 'active')
+        assert.equal(after.messages.length, before.messages.length + 1, 'normal enrollment emits its join notice')
+        assert.equal(after.messages.filter((m) => m.chat_id === group && m.sender_user_id === null && m.client_message_id?.endsWith(':' + legacyAgent)).length, 1)
         assert.equal((await rows(`SELECT count(*)::int AS n FROM chat.workspace_items WHERE chat_id=ANY($1)`, [topics]))[0].n, 0)
         const boardRows = await rows(`SELECT id,chat_id,filename,inline_text,ystate FROM chat.workspace_items WHERE id=ANY($1::uuid[])`, [boards])
         assert.equal(boardRows.length, 5)
@@ -108,6 +121,9 @@ export async function topicResourcesFixture(db) {
           await db.query(`SELECT set_config('request.jwt.claim.sub',$1,true)`, [owner])
           const retry = await rows('SELECT id,chat_id FROM chat.file_place_as($1,$2,$3,$4)', [staging, topics[0], owner, 'ignored.txt'])
           assert.deepEqual(retry, [{ id: file, chat_id: group }])
+          assert.deepEqual(await rows('SELECT id,chat_id FROM chat.workspace_get_as($1,$2)', [file, legacyAgent]), [{ id: file, chat_id: group }])
+          await rows('SELECT chat.remove_group_member_as($1,$2,$3)', [topics[0], legacyAgent, owner])
+          assert.equal((await rows('SELECT chat.is_chat_member($1,$2) AS member', [group, legacyAgent]))[0].member, true)
         } finally { await db.query('ROLLBACK') }
       },
       async poison() {
@@ -123,6 +139,9 @@ export async function topicResourcesFixture(db) {
           await db.query('DELETE FROM chat.file_blob_uploads WHERE staging_key=$1', [staging])
           await db.query('DELETE FROM chat.file_blobs WHERE id=ANY($1::uuid[])', [[blob, oldBlob]])
           await db.query('DELETE FROM storage.objects WHERE name=ANY($1)', [[pointer, legacy]])
+          await db.query('DELETE FROM identity.users WHERE id=$1', [legacyAgent])
+          await db.query('DELETE FROM identity.gugu_devices WHERE user_id=$1', [owner])
+          await db.query('DELETE FROM auth.users WHERE id=$1', [owner])
           await db.query('DELETE FROM identity.users WHERE id=ANY($1)', [[owner, reader]])
           await db.query('COMMIT')
         } catch (error) { await db.query('ROLLBACK'); throw error }

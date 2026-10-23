@@ -3,7 +3,7 @@ import { Client } from 'pg'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 let db: Client
-let owner: string, reader: string, outsider: string, agentOwner: string, agent: string, topicOnlyAgent: string
+let owner: string, reader: string, outsider: string, agentOwner: string, agent: string, topicOnlyAgent: string, readerAgent: string
 let source: string, topic: string, other: string
 
 async function admin() { await db.query('RESET ROLE') }
@@ -67,10 +67,10 @@ beforeEach(async () => {
   await db.query('BEGIN')
   // Storage API sets this before remove(); RLS still governs the tested actor.
   await db.query("SELECT set_config('storage.allow_delete_query','true',true)")
-  ;[owner, reader, outsider, agentOwner, agent, topicOnlyAgent] = Array.from({ length: 6 }, randomUUID)
+  ;[owner, reader, outsider, agentOwner, agent, topicOnlyAgent, readerAgent] = Array.from({ length: 7 }, randomUUID)
   for (const id of [owner, reader, outsider, agentOwner]) await db.query(`INSERT INTO auth.users(id,aud,role,email,raw_app_meta_data,raw_user_meta_data,created_at,updated_at)
     VALUES ($1,'authenticated','authenticated',$2,'{"provider":"email"}','{}',now(),now())`, [id, `${id}@topic-resource.example.test`])
-  for (const [id, parent] of [[agent, agentOwner], [topicOnlyAgent, owner]]) {
+  for (const [id, parent] of [[agent, agentOwner], [topicOnlyAgent, owner], [readerAgent, reader]]) {
     const device = 'topic-resource-' + parent
     await db.query(`INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES ($1,$2,'fixture','fixture','linux')`, [device, parent])
     await db.query(`INSERT INTO identity.users(id,type,display_name,owner_user_id,device_id) VALUES ($1,'agent','resource agent',$2,$3)`, [id, parent, device])
@@ -86,6 +86,41 @@ afterEach(async () => {
 })
 
 describe('topics use one source resource container', () => {
+  it('adding an owned agent to a topic joins the source normally; leaving the topic retains file access', async () => {
+    await db.query('DELETE FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [topic, topicOnlyAgent])
+    const [doc] = await rpc(reader, 'SELECT * FROM chat.workspace_create_document_as($1,$2,$3)', [source, reader, 'shared.md'])
+    const [joined] = await rpc(owner, 'SELECT chat.add_group_agent($1,$2,NULL,$3) AS result', [topic, topicOnlyAgent, owner])
+    expect(joined.result.status).toBe('joined')
+    expect((await db.query('SELECT chat.is_chat_member($1,$3) AS source,chat.is_chat_member($2,$3) AS topic', [source, topic, topicOnlyAgent])).rows[0]).toEqual({ source: true, topic: true })
+    expect((await rpc(owner, 'SELECT id FROM chat.workspace_get_as($1,$2)', [doc.id, topicOnlyAgent]))[0].id).toBe(doc.id)
+    await rpc(owner, 'SELECT chat.remove_group_member_as($1,$2,$3)', [topic, topicOnlyAgent, owner])
+    expect((await db.query('SELECT chat.is_chat_member($1,$3) AS source,chat.is_chat_member($2,$3) AS topic', [source, topic, topicOnlyAgent])).rows[0]).toEqual({ source: true, topic: false })
+    expect((await rpc(owner, 'SELECT id FROM chat.workspace_get_as($1,$2)', [doc.id, topicOnlyAgent]))[0].id).toBe(doc.id)
+  })
+
+  it('topic agent admission preserves source approval and capacity gates', async () => {
+    await db.query('UPDATE chat.chats SET agent_join_approval=true WHERE id=$1', [source])
+    const [pending] = await rpc(reader, 'SELECT chat.add_group_agent($1,$2,NULL,$3) AS result', [topic, readerAgent, reader])
+    expect(pending.result).toMatchObject({ status: 'pending_approval', chat_id: source })
+    expect((await db.query('SELECT chat.is_chat_member($1,$3) AS source,chat.is_chat_member($2,$3) AS topic', [source, topic, readerAgent])).rows[0]).toEqual({ source: false, topic: false })
+    await rpc(owner, 'SELECT chat.decide_group_join($1,true,$2)', [pending.result.request_id, owner])
+    await rpc(reader, 'SELECT chat.add_group_agent($1,$2,NULL,$3)', [topic, readerAgent, reader])
+    expect((await db.query('SELECT chat.is_chat_member($1,$3) AS source,chat.is_chat_member($2,$3) AS topic', [source, topic, readerAgent])).rows[0]).toEqual({ source: true, topic: true })
+    await db.query('DELETE FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [topic, topicOnlyAgent])
+    await db.query('UPDATE chat.chats SET max_members=(SELECT count(*) FROM chat.chat_members WHERE chat_id=$1),agent_join_approval=false WHERE id=$1', [source])
+    expect((await denied(owner, 'SELECT chat.add_group_agent($1,$2,NULL,$3)', [topic, topicOnlyAgent, owner])).message).toBe('member_limit_reached')
+    expect((await db.query('SELECT chat.is_chat_member($1,$2) AS member', [source, topicOnlyAgent])).rows[0].member).toBe(false)
+  })
+
+  it('an agent opening or speaking in a topic obtains its real source seat', async () => {
+    const anchor = (await db.query('SELECT source_message_id FROM chat.chats WHERE id=$1', [topic])).rows[0].source_message_id
+    const [opened] = await rpc(owner, 'SELECT * FROM chat.create_topic($1,$2,$3,NULL,$4)', [source, anchor, 'agent opens', topicOnlyAgent])
+    expect(opened.source_chat_id).toBe(source)
+    expect((await db.query('SELECT chat.is_chat_member($1,$2) AS member', [source, topicOnlyAgent])).rows[0].member).toBe(true)
+    await rpc(reader, `INSERT INTO chat.messages(id,chat_id,sender_user_id,content) VALUES ($1,$2,$3,'agent joins by speaking')`, [randomUUID(), topic, readerAgent])
+    expect((await db.query('SELECT chat.is_chat_member($1,$3) AS source,chat.is_chat_member($2,$3) AS topic', [source, topic, readerAgent])).rows[0]).toEqual({ source: true, topic: true })
+  })
+
   it('nonparticipants list/create folders and documents in the source without becoming participants', async () => {
     const [folder] = await rpc(reader, 'SELECT * FROM chat.workspace_mkdir_as($1,$2,$3)', [topic, reader, 'Notes'])
     const [doc] = await rpc(reader, 'SELECT * FROM chat.workspace_create_document_as($1,$2,$3,$4,p_folder=>$5)', [topic, reader, 'plan.md', 'source content', folder.id])

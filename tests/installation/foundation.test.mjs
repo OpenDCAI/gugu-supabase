@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
 import { foundationDigest, installFoundation, installReleases, releases } from '../../scripts/foundation.mjs'
+import { topicResourcesFixture } from './topic-resources-fixture.mjs'
 
 // Deliberately requires an empty, disposable Supabase PostgreSQL 17 instance.
 // Never resets schemas, migration history, or user data to make a test pass.
@@ -22,7 +23,34 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     const versions = releases.map((release) => release.version)
     const userEventsRelease = releases.find((release) => release.version.endsWith('_human_user_events'))
     assert.ok(userEventsRelease, 'human user-events is an incremental release')
+    const topicRelease = releases.find((release) => release.version.endsWith('_topic_source_resources'))
+    assert.ok(topicRelease)
     const releaseQuery = async (sql) => {
+      if (sql.includes(topicRelease.sql)) {
+        const rolledBack = sql.replace(/COMMIT;\s*$/, 'ROLLBACK;')
+        await t.test('topic resources install on an empty community database', async () => {
+          await query(rolledBack)
+        })
+        const fixture = await topicResourcesFixture(db)
+        await t.test('topic metadata upgrade rolls back without changing rows, functions or guards', async () => {
+          await query(rolledBack)
+          assert.deepEqual(await fixture.snapshot(), fixture.before)
+          assert.equal((await query("SELECT prorettype::regtype::text AS type FROM pg_proc WHERE oid='chat.workspace_require_room_member(text,text)'::regprocedure"))[0].type, 'void')
+        })
+        await t.test('an unexpected referenced system folder aborts the whole release', async () => {
+          await fixture.poison()
+          const poisoned = await fixture.snapshot()
+          await assert.rejects(query(sql), /system folder has content or references/)
+          await query('ROLLBACK')
+          assert.deepEqual(await fixture.snapshot(), poisoned)
+          assert.equal((await query("SELECT count(*)::int AS n FROM pg_trigger WHERE tgrelid='chat.workspace_items'::regclass AND tgname IN ('workspace_items_place','workspace_items_guard_delete') AND tgenabled='O'"))[0].n, 2)
+          await fixture.unpoison()
+        })
+        const result = await query(sql)
+        await t.test('topic upgrade preserves IDs, boards, versions, bytes and upload retries', () => fixture.assertMigrated())
+        await fixture.cleanup()
+        return result
+      }
       if (!sql.includes(userEventsRelease.sql)) return query(sql)
       // First exercise the release on the clean community schema and roll it
       // back. Then install it with an independent producer present. Both paths

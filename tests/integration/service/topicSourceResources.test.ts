@@ -128,6 +128,29 @@ describe('topics use one source resource container', () => {
     expect(await facts(agentOwner, number, agent)).toEqual([])
   })
 
+  it('upstream message readers inherit source visibility while participation and read state stay on the topic', async () => {
+    const message = randomUUID()
+    await rpc(owner, "INSERT INTO chat.messages(id,chat_id,sender_user_id,content) VALUES ($1,$2,$3,'source partition visibility')", [message, topic, owner])
+    const [doc] = await rpc(owner, 'SELECT * FROM chat.workspace_create_document_as($1,$2,$3)', [topic, owner, 'shared visibility.md'])
+    for (const [caller, actor] of [[reader, reader], [agentOwner, agent]]) {
+      const participation = () => db.query('SELECT last_read_seq,is_marked_unread FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [topic, actor])
+      expect((await participation()).rows).toEqual([])
+      const history = await rpc(caller, 'SELECT id FROM chat.message_history_as($1,$2)', [topic, actor])
+      const search = await rpc(caller, 'SELECT id FROM chat.message_search_as($1,$2,$3)', [topic, 'source partition', actor])
+      expect(history).toContainEqual({ id: message }); expect(search).toEqual([{ id: message }])
+      const topics = await rpc(caller, 'SELECT chat_id,is_participant,message_count FROM chat.list_topics_of_chat($1,$2)', [source, actor])
+      expect(topics.find((entry) => entry.chat_id === topic)).toMatchObject({ is_participant: false, message_count: '1' })
+      const [activity] = await rpc(caller, "SELECT chat.activity_metadata_as($1,now()-interval '1 hour',now()+interval '1 hour',$2) AS result", [actor, topic])
+      expect(activity.result.events).toContainEqual(expect.objectContaining({ chat_id: topic, message_id: message }))
+      // The unscoped activity feed follows subscriptions. A targeted read sees
+      // the source partition without creating a new subscription or read cursor.
+      const [feed] = await rpc(caller, "SELECT chat.activity_metadata_as($1,now()-interval '1 hour',now()+interval '1 hour') AS result", [actor])
+      expect(feed.result.events.some((event: { message_id: string }) => event.message_id === message)).toBe(false)
+      expect((await rpc(caller, 'SELECT id,chat_id FROM chat.workspace_get_as($1,$2)', [doc.id, actor]))[0]).toEqual({ id: doc.id, chat_id: source })
+      expect((await participation()).rows).toEqual([])
+    }
+  })
+
   it('normal creation and direct group/topic inserts require UUID ids, so public numbers cannot collide', async () => {
     const number = String((await db.query('SELECT public_id FROM chat.chats WHERE id=$1', [topic])).rows[0].public_id)
     for (const invalid of [number, 'not-a-uuid', randomUUID().replaceAll('-', ''), null]) {

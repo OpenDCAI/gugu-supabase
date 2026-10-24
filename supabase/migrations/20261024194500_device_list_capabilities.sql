@@ -24,3 +24,5 @@ AS $$
 $$;
 REVOKE ALL ON FUNCTION identity.device_list_capabilities(identity.gugu_devices) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION identity.device_list_capabilities(identity.gugu_devices) TO authenticated;
+
+NOTIFY pgrst, 'reload schema';

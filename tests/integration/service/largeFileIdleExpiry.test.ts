@@ -68,6 +68,15 @@ beforeEach(async()=>{
 })
 afterEach(async()=>{await db.query('ROLLBACK')})
 describe('non-project idle expiry, not quota eviction',()=>{
+  it('discovers idle files on the original scheduler tick even with no due GC entries',async()=>{
+    const file=await upload();await age(file.stored)
+    await db.query("UPDATE chat.file_blob_gc SET status='pending',next_attempt_at=now()+interval '1 day'")
+    // Missing secrets prove the real tick queued work without scheduling a network call.
+    await db.query("DELETE FROM vault.secrets WHERE name IN ('attachments_gc_url','attachments_gc_key')")
+    expect((await reject('SELECT chat.file_blob_gc_kick()')).message).toMatch(/blobs are due.*Vault has no attachments_gc_url/)
+    expect((await state(file.stored)).expired_at).toBeNull() // A refused statement rolls back atomically.
+    expect(await expire()).toBe(1)
+  })
   it('displaying metadata never reserves a download or renews activity, while a real download still does',async()=>{
     const file=await upload();await age(file.stored)
     for(const actor of [owner,member]) {

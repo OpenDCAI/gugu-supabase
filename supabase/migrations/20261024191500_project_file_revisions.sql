@@ -121,7 +121,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path='' AS $$
 $$;
 
 -- One metadata entry point for local, managed, message-pinned and private task references. No bytes or keys.
-CREATE FUNCTION chat.file_resolve_as(p_ref jsonb,p_as text) RETURNS jsonb
+CREATE OR REPLACE FUNCTION chat.file_resolve_as(p_ref jsonb,p_as text) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
 DECLARE actor text:=chat.workspace_actor_for(p_as); msg text; w chat.workspace_items%ROWTYPE;
     d chat.file_device_revisions%ROWTYPE; p chat.file_project_policies%ROWTYPE; c record; n integer; hint text; ref jsonb:=p_ref;

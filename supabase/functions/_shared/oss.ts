@@ -39,7 +39,7 @@ export interface CdnConfig {
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 
 /** The database keeps logical keys; each environment maps them to its own physical directory. */
-function objectKey(config: { objectPrefix?: string }, key: string): string {
+export function objectKey(config: { objectPrefix?: string }, key: string): string {
   const prefix = config.objectPrefix ?? ''
   if (!prefix) return key
   if (!/^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)*$/.test(prefix)) throw new Error('Invalid attachment object prefix')

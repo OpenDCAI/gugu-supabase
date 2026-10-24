@@ -58,11 +58,12 @@ const options = {
 const args = process.argv.slice(2)
 const run = (filters) => execFileSync(path.join(root, 'node_modules/.bin/vitest'), ['run', '--project', 'integration', ...filters], options)
 if (args.length === 0) {
-  // These suites change installation-wide quota configuration; isolate them from object-writing fixtures.
-  run(['--maxWorkers=1','tests/integration/service/fileTransferBudget.test.ts','tests/integration/service/largeFileIdleExpiry.test.ts','tests/integration/service/fileTransferConcurrency.test.ts','tests/integration/service/topicSourceResources.test.ts','tests/integration/service/projectFileRevisions.test.ts'])
+  // Quota configuration and next-idle-pass GC assertions share the global quota lock.
+  // Keep their suites isolated; the GC race suite still runs its own concurrent transactions.
+  run(['--maxWorkers=1','tests/integration/service/fileTransferBudget.test.ts','tests/integration/service/largeFileIdleExpiry.test.ts','tests/integration/service/fileTransferConcurrency.test.ts','tests/integration/service/topicSourceResources.test.ts','tests/integration/service/projectFileRevisions.test.ts','tests/integration/service/fileBlobs.test.ts','tests/integration/service/messageFileRefs.test.ts','tests/integration/service/messageFileRefsConcurrency.test.ts'])
   // Fault injection installs member-table DDL; finish it before concurrent fixtures hold that table.
   run(['--maxWorkers=1', 'tests/integration/service/groupAdminAs.test.ts'])
-  run(['--maxWorkers=4', '--exclude', '**/groupAdminAs.test.ts','--exclude','**/fileTransferBudget.test.ts','--exclude','**/largeFileIdleExpiry.test.ts','--exclude','**/fileTransferConcurrency.test.ts','--exclude','**/topicSourceResources.test.ts','--exclude','**/projectFileRevisions.test.ts'])
+  run(['--maxWorkers=4', '--exclude', '**/groupAdminAs.test.ts','--exclude','**/fileTransferBudget.test.ts','--exclude','**/largeFileIdleExpiry.test.ts','--exclude','**/fileTransferConcurrency.test.ts','--exclude','**/topicSourceResources.test.ts','--exclude','**/projectFileRevisions.test.ts','--exclude','**/fileBlobs.test.ts','--exclude','**/messageFileRefs.test.ts','--exclude','**/messageFileRefsConcurrency.test.ts'])
 } else {
   run(['--maxWorkers=4', ...args])
 }

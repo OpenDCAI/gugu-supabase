@@ -28,14 +28,19 @@ ALTER TABLE chat.file_temporary_transfers ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON chat.file_temporary_transfers FROM PUBLIC,anon,authenticated;
 GRANT ALL ON chat.file_temporary_transfers TO service_role;
 
--- A function-level GUC frame restores both claims on return or error. API roles cannot impersonate through this helper.
+-- Match the existing delegated-call helper: restore both claims on return or error. API roles cannot impersonate here.
 CREATE FUNCTION chat.file_resolve_for(p_ref jsonb,p_actor text,p_account text) RETURNS jsonb
-LANGUAGE plpgsql SECURITY DEFINER SET search_path='' SET "request.jwt.claims"='' SET "request.jwt.claim.sub"='' AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+DECLARE claims text:=current_setting('request.jwt.claims',true); sub text:=current_setting('request.jwt.claim.sub',true); r jsonb;
 BEGIN
     PERFORM set_config('request.jwt.claims',jsonb_build_object('sub',p_account,'role','authenticated')::text,true);
     PERFORM set_config('request.jwt.claim.sub',p_account,true);
-    IF NOT chat.is_acting_as(p_actor) THEN RETURN jsonb_build_object('status','gone'); END IF;
-    RETURN chat.file_resolve_as(p_ref,p_actor);
+    r:=CASE WHEN chat.is_acting_as(p_actor) THEN chat.file_resolve_as(p_ref,p_actor) ELSE jsonb_build_object('status','gone') END;
+    PERFORM set_config('request.jwt.claims',COALESCE(claims,''),true),set_config('request.jwt.claim.sub',COALESCE(sub,''),true);
+    RETURN r;
+EXCEPTION WHEN OTHERS THEN
+    PERFORM set_config('request.jwt.claims',COALESCE(claims,''),true),set_config('request.jwt.claim.sub',COALESCE(sub,''),true);
+    RAISE;
 END $$;
 CREATE FUNCTION chat.file_temporary_current(p_transfer chat.file_temporary_transfers) RETURNS boolean
 LANGUAGE sql SECURITY DEFINER SET search_path='' AS $$

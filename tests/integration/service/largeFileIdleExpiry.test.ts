@@ -33,7 +33,7 @@ async function upload(bytes=60,sha=randomUUID().replaceAll('-','').repeat(2),tar
   await db.query('SELECT * FROM chat.attachment_commit($1,$2,$3,$4,$5)',[permit.staging_key,message,target,owner,'fixture.bin'])
   await service()
   const stored=(await db.query('SELECT id FROM chat.file_transfer_storage WHERE blob_id=$1',[blob.blob_id])).rows[0].id
-  return {key:permit.staging_key,blob:blob.blob_id as string,stored:stored as string,message,sha}
+  return {key:permit.staging_key,blob:blob.blob_id as string,stored:stored as string,message,sha,created:blob.created as boolean}
 }
 async function age(stored:string,days=31,last:number|null=null,target=group) {
   await service()
@@ -204,9 +204,22 @@ describe('non-project idle expiry, not quota eviction',()=>{
     await service();expect((await state(file.stored)).state).toBe(remove?'gone':'ready')
     const replacement=await upload(60,file.sha)
     expect(replacement.blob).toBe(file.blob)
+    expect(replacement.created).toBe(remove) // Collected identity invokes the existing post-copy race check.
     expect((await download(file.message)).status).toBe('ready')
     expect((await download(replacement.message)).status).toBe('ready')
     await service();expect((await state(file.stored)).expired_at).toBeNull()
+  })
+  it('a fresh same-SHA upload restores only its own group, not another expired group',async()=>{
+    const file=await upload(),target=randomUUID()
+    await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','other expired scope',$2)",[target,owner])
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner')",[target,owner])
+    await user();const second=randomUUID()
+    await db.query('SELECT * FROM chat.attachment_forward($1,$2,$3,$4)',[file.message,second,target,owner])
+    await age(file.stored);await age(file.stored,31,null,target)
+    expect(await expire()).toBe(2)
+    await upload(60,file.sha)
+    expect((await download(file.message)).status).toBe('ready')
+    expect((await download(second,owner)).status).toBe('expired')
   })
   it('does not restore an old SHA when different bytes are reuploaded',async()=>{
     const file=await upload();await age(file.stored);await expire()

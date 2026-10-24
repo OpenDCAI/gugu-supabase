@@ -1,6 +1,6 @@
 # Project files: local metadata and encrypted on-demand transfer
 
-Implementation is being developed in separate commits. This first group adds metadata and authorization only; it does not yet activate temporary transfer or replace client reads.
+Backend mechanisms are developed in separate commits. Client resolution and its product acceptance remain separate work; database and source tests do not prove desktop or Android behavior.
 
 | Runtime group | Approved behavior | Added / removed lines |
 | --- | --- | --- |
@@ -25,6 +25,10 @@ Encrypted temporary reads bypass CDN. `ali-oss@6.23.0` (MIT) supplies its offici
 
 If provider capabilities cannot be verified, acceptance fails closed and does not expose an upload form. A previously reserved allowance remains held until trusted terminal evidence permits closure. An expired permit plus HEAD 404 still does not prove that a previously accepted upload cannot finish late. Temporary uploads write their final random position directly: operators must not apply ordinary staging-prefix cleanup to active generations. Physical cleanup belongs to the original blob collector; an unverified abandoned upload must not receive an automatic financial refund.
 
-The final backend group connects expiry, revocation and temporary-only LRU to the original blob garbage collector. Permanent files must never enter that LRU. No second worker, quota ledger or restore RPC is introduced.
+The retention group connects expiry, revocation and temporary-only LRU to the original blob garbage collector. Both its scheduled tick and manual HTTP collection discover retired generations. Fresh authorized reads renew retention, with an absolute 30-day ceiling; metadata views and retries do not. Read-once completion retires the key without refunding download bytes. Changes to a file version, source visibility, project binding, membership or transfer policy invalidate keys immediately and queue physical collection on the next bounded pass.
+
+`temporary_group_bytes` is a required deployment parameter, with the same group overrides as the existing storage quota. It counts confirmed temporary inventory and held temporary upload allowances; permanent storage has its independent existing group budget. When either group budget lacks room, only ready temporary generations are LRU candidates. Retirement never releases capacity. Acceptance retries after the original collector confirms physical deletion; active capabilities can defer collection and keep acceptance refused. Permanent files never enter this LRU.
+
+An unverified placeholder is registered in the existing blob table when the upload permit is issued, without claiming verified size or adding physical inventory. Source deletion can therefore enqueue the exact object even before commit. The original collector protects an upload until its permit expires, including when the source row has already disappeared. Commit updates only the same live placeholder after streamed verification, never a blob already being collected. Cleanup of an abandoned upload does not itself refund its allowance: trusted terminal evidence is still required. No second worker, quota ledger, persistence table or restore RPC is introduced.
 
 The client implementation will have one resolver before any cloud metadata lookup: local loopback, the reader's already-open owner SSH link, then encrypted temporary cloud transfer. Expired cards and ordinary re-upload belong to the separate permanent-file expiry change, not this resolver change.

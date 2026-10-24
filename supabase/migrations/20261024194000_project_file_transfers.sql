@@ -110,7 +110,7 @@ BEGIN
 END $$;
 CREATE FUNCTION chat.file_temporary_accept(p_id uuid,p_size bigint) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
-DECLARE t chat.file_temporary_transfers%ROWTYPE; v chat.file_transfer_reservations%ROWTYPE; host text:=auth.uid()::text;
+DECLARE t chat.file_temporary_transfers%ROWTYPE; v chat.file_transfer_reservations%ROWTYPE; host text:=auth.uid()::text; b uuid;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtextextended('gugu:file-transfer:quota',0));
     PERFORM chat.file_temporary_host_for(p_id,host);
@@ -118,11 +118,18 @@ BEGIN
     IF t.state NOT IN ('requested','uploading') OR p_size IS NULL OR p_size<1 OR p_size>chat.file_transfer_parameter(chat.file_transfer_settings(),'file_max_bytes') THEN
         RAISE EXCEPTION 'Invalid temporary upload' USING HINT='file_transfer_too_large';
     END IF;
+    IF NOT EXISTS(SELECT 1 FROM chat.file_transfer_reservations WHERE id=t.id) AND chat.file_temporary_usage(t.chat_id)+p_size>
+        chat.file_transfer_parameter(chat.file_transfer_settings('group',t.chat_id),'temporary_group_bytes') THEN
+        RAISE EXCEPTION 'Temporary storage quota is exhausted' USING HINT='file_transfer_group_storage_full';
+    END IF;
     v:=chat.file_transfer_reserve(t.id,'upload',host,t.chat_id,p_size,t.object_name);
+    IF t.blob_id IS NULL THEN
+        INSERT INTO chat.file_blobs(bucket_id,object_name,content_type,created_by) VALUES('temporary',t.object_name,'application/octet-stream',host) RETURNING id INTO b;
+    END IF;
     INSERT INTO chat.file_transfer_uploads(staging_key,reservation_id,account_id,chat_id,actor_id,max_bytes)
     VALUES(t.object_name,t.id,host,t.chat_id,host,p_size) ON CONFLICT DO NOTHING;
     UPDATE chat.file_transfer_reservations SET state='issued' WHERE id=v.id;
-    UPDATE chat.file_temporary_transfers SET state='uploading',ciphertext_bytes=p_size WHERE id=t.id;
+    UPDATE chat.file_temporary_transfers SET state='uploading',ciphertext_bytes=p_size,blob_id=COALESCE(blob_id,b) WHERE id=t.id;
     RETURN jsonb_build_object('transfer_id',t.id,'staging_key',t.object_name,'max_bytes',p_size,'signed_at',v.created_at,'expires_at',v.expires_at);
 END $$;
 CREATE FUNCTION chat.file_temporary_commit(p_id uuid,p_host text,p_sha text,p_size bigint,p_key text) RETURNS void
@@ -140,8 +147,8 @@ BEGIN
         IF (t.ciphertext_sha256,t.data_key) IS DISTINCT FROM (p_sha,p_key) THEN RAISE EXCEPTION 'Committed generation is immutable' USING HINT='file_transfer_conflict'; END IF;
         RETURN;
     END IF;
-    INSERT INTO chat.file_blobs(bucket_id,object_name,sha256,size_bytes,content_type,created_by)
-    VALUES('temporary',t.object_name,p_sha,p_size,'application/octet-stream',p_host) RETURNING id INTO b;
+    UPDATE chat.file_blobs SET sha256=p_sha,size_bytes=p_size WHERE id=t.blob_id AND bucket_id='temporary' AND object_name=t.object_name AND state='live' RETURNING id INTO b;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Temporary upload is being collected' USING HINT='file_transfer_conflict'; END IF;
     -- The same transaction replaces the upload hold with physical inventory, before reference admission.
     UPDATE chat.file_transfer_reservations SET actual_bytes=p_size WHERE id=t.id;
     PERFORM chat.file_transfer_track(b,t.chat_id,p_host);

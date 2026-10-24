@@ -90,7 +90,7 @@ describe('non-project idle expiry, not quota eviction',()=>{
     expect(await expire()).toBe(0)
     await db.query("UPDATE chat.file_transfer_limits SET settings=settings||'{\"large_file_idle_seconds\":0}'")
     expect((await reject('SELECT chat.file_transfer_expire()')).message).toBe('Invalid large file idle interval')
-    for(const n of [0,501]) expect((await reject('SELECT chat.file_transfer_expire($1)',[n])).message).toBe('Invalid expiry batch size')
+    for(const n of [null,0,501]) expect((await reject('SELECT chat.file_transfer_expire($1)',[n])).message).toBe('Invalid expiry batch size')
   })
   it('batches expiration without skipping survivors and never evicts permanent files under quota pressure',async()=>{
     const files=[await upload(),await upload(),await upload()]
@@ -107,7 +107,7 @@ describe('non-project idle expiry, not quota eviction',()=>{
   it('excludes project-bound groups using the authoritative project registry',async()=>{
     const file=await upload();await age(file.stored)
     const device=randomUUID()
-    await db.query('INSERT INTO identity.gugu_devices(device_id,user_id,device_name) VALUES($1,$2,$3)',[device,owner,'fixture'])
+    await db.query('INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,$3,'fixture','linux')',[device,owner,'fixture'])
     await db.query("INSERT INTO identity.device_projects(device_id,user_id,local_project_id,name,root_path,created_at,chat_id) VALUES($1,$2,'root','fixture','/fixture',now(),$3)",[device,owner,group])
     expect(await expire()).toBe(0)
     expect((await state(file.stored)).expired_at).toBeNull()
@@ -126,6 +126,28 @@ describe('non-project idle expiry, not quota eviction',()=>{
     await db.query('SELECT chat.file_transfer_observe($1,$2,1,now())',['provider:fixture',id])
     expect((await state(file.stored)).last_download_at).toEqual(before)
     expect(await expire()).toBe(0)
+  })
+  it('never expires a currently issued capability, then permits expiry after its validity window',async()=>{
+    const file=await upload(),id=randomUUID()
+    expect((await download(file.message,member,id)).status).toBe('ready')
+    await age(file.stored)
+    expect(await expire()).toBe(0)
+    await db.query("UPDATE chat.file_transfer_reservations SET expires_at=now()-interval '1 second' WHERE id=$1",[id])
+    expect(await expire()).toBe(1)
+  })
+  it('retains an active private task handoff when a group reference to the same SHA expires',async()=>{
+    const file=await upload(),sender=randomUUID(),receiver=randomUUID(),device=randomUUID()
+    await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,'fixture','fixture','linux')",[device,owner])
+    for(const agent of [sender,receiver]) await db.query("INSERT INTO identity.users(id,type,display_name,owner_user_id,device_id) VALUES($1,'agent','fixture',$2,$3)",[agent,owner,device])
+    const key='staging/'+owner+'/'+randomUUID(),attachment=randomUUID()
+    await db.query('SELECT * FROM chat.file_blob_register($1,$2,$3,60,$4)',[owner,key,file.sha,'application/octet-stream'])
+    await user();await db.query('SELECT * FROM chat.session_attachment_commit($1,$2,$3,$4,$5,$6)',[key,attachment,sender,'fixture',[receiver],'private.bin'])
+    await age(file.stored);expect(await expire()).toBe(1)
+    expect(await collect(file.blob)).toBeUndefined()
+    await user();expect((await db.query('SELECT * FROM chat.session_attachment_urls_as($1,$2)',[[attachment],receiver])).rows).toHaveLength(1)
+    await db.query('SELECT chat.session_attachment_revoke($1,$2)',[attachment,sender])
+    await service();await db.query('SELECT chat.file_blob_enqueue($1)',[file.blob]);await db.query('UPDATE chat.file_blob_gc SET next_attempt_at=now() WHERE blob_id=$1',[file.blob])
+    expect(await collect(file.blob)).toMatchObject({blob_id:file.blob})
   })
   it('refuses expired sources before signing or forwarding, without charging a download',async()=>{
     const file=await upload();await age(file.stored);expect(await expire()).toBe(1)
@@ -192,6 +214,23 @@ describe('non-project idle expiry, not quota eviction',()=>{
     expect(replacement.blob).not.toBe(file.blob)
     expect((await download(file.message)).status).toBe('expired')
     expect((await download(replacement.message)).status).toBe('ready')
+  })
+  it('preserves the intended grants after replacing functions under the installation DDL guard',async()=>{
+    const rules=[
+      ['chat.file_transfer_download_as(jsonb,text,uuid)',true],
+      ['chat.attachment_place_forward(text,text,text,text,boolean)',true],
+      ['chat.file_managed_upload_registered(text,text)',false],
+      ['chat.file_blob_register(text,text,text,bigint,text,integer,integer)',false],
+      ['chat.file_blob_gc_claim(integer,integer)',false],
+      ['chat.file_blob_gc_finish(uuid,uuid)',false],
+      ['chat.file_blob_in_use(uuid)',false],
+      ['chat.file_blob_take(uuid)',false],
+      ['chat.file_transfer_expire(integer)',false],
+    ] as const
+    for(const [fn,allowed] of rules) {
+      const r=(await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS anon,has_function_privilege('authenticated',$1,'EXECUTE') AS client",[fn])).rows[0]
+      expect(r,fn).toEqual({anon:false,client:allowed})
+    }
   })
   it('restricts expiry and private timestamps to service and administrator usage to the actual group admin',async()=>{
     const file=await upload();await user(member)

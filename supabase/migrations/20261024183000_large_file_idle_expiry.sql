@@ -17,7 +17,7 @@ CREATE FUNCTION chat.file_transfer_expire(p_limit integer DEFAULT 500) RETURNS i
 LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
 DECLARE s jsonb; threshold_bytes bigint; idle_seconds bigint; r record; n integer:=0;
 BEGIN
-    IF p_limit NOT BETWEEN 1 AND 500 THEN RAISE EXCEPTION 'Invalid expiry batch size'; END IF;
+    IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 500 THEN RAISE EXCEPTION 'Invalid expiry batch size'; END IF;
     PERFORM pg_advisory_xact_lock(hashtextextended('gugu:file-transfer:quota',0));
     SELECT settings INTO s FROM chat.file_transfer_limits WHERE scope='global' AND scope_id='*';
     -- Absent deployment policy preserves files; it never invents a deletion policy.
@@ -126,7 +126,7 @@ BEGIN
         ('chat.file_blob_gc_claim(integer,integer)',
          $old$UPDATE chat.file_blobs b SET state = 'deleting' WHERE b.id = r.blob_id;$old$,
          $new$UPDATE chat.file_blobs b SET state = 'deleting' WHERE b.id = r.blob_id;
-        UPDATE chat.file_transfer_storage SET state='deleting' WHERE blob_id=r.blob_id;$new$),
+        UPDATE chat.file_transfer_storage o SET state='deleting' WHERE o.blob_id=r.blob_id;$new$),
         ('chat.file_blob_gc_finish(uuid,uuid)',
          $old$PERFORM 1 FROM chat.file_blob_gc g$old$,
          $new$PERFORM pg_advisory_xact_lock(hashtextextended('gugu:file-transfer:quota',0));
@@ -170,3 +170,10 @@ REVOKE ALL ON FUNCTION chat.file_transfer_reference_expired(uuid,text),chat.file
     chat.file_transfer_group_usage(text,text) FROM PUBLIC,anon,authenticated;
 GRANT EXECUTE ON FUNCTION chat.file_transfer_expire(integer) TO service_role;
 GRANT EXECUTE ON FUNCTION chat.file_transfer_group_usage(text,text) TO authenticated;
+
+-- The installation DDL guard closes replaced functions too; restore only their existing API grants.
+GRANT EXECUTE ON FUNCTION chat.file_transfer_download_as(jsonb,text,uuid),
+    chat.attachment_place_forward(text,text,text,text,boolean) TO authenticated;
+GRANT EXECUTE ON FUNCTION chat.file_managed_upload_registered(text,text),
+    chat.file_blob_register(text,text,text,bigint,text,integer,integer),
+    chat.file_blob_gc_claim(integer,integer),chat.file_blob_gc_finish(uuid,uuid) TO service_role;

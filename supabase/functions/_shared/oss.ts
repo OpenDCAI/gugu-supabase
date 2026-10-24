@@ -31,6 +31,10 @@ export interface CdnConfig {
   objectPrefix?: string
   domain: string
   authKey: string
+  /** Must equal the validity period configured at the CDN edge. */
+  authTtlSeconds?: number
+  /** Fixed per-request edge limit, with no client-controlled URL override. */
+  requestLimitBitsPerSecond?: number
 }
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 
@@ -183,8 +187,9 @@ export async function ossRequest(cfg: OssConfig, fetchFn: FetchLike, req: {
   headers?: Record<string, string>
   body?: BodyInit
   internal?: boolean
+  query?: Record<string, string>
 }): Promise<Response> {
-  const signed = await ossSign(cfg, { method: req.method, key: req.key, headers: req.headers })
+  const signed = await ossSign(cfg, { method: req.method, key: req.key, headers: req.headers, query: req.query })
   const endpoint = req.internal ? cfg.endpointInternal : cfg.endpointPublic
   const url = `https://${cfg.bucket}.${endpoint}/${uriEncode(objectKey(cfg, req.key), true)}${signed.query ? '?' + signed.query : ''}`
   return fetchFn(url, { method: req.method, headers: signed.headers, body: req.body })
@@ -259,16 +264,20 @@ export interface CdnUrl {
 }
 
 /** 一个对象的 CDN 签名链接;签发时间用服务器时钟(CDN 也认将来的时间戳,所以这里的钟要准 —— 依赖 NTP)。 */
-export function cdnSignedUrl(cdn: CdnConfig, objectName: string, opts: { image: boolean; now?: Date; rand?: string }): CdnUrl {
+export function cdnSignedUrl(cdn: CdnConfig, objectName: string, opts: { image: boolean; now?: Date; rand?: string; expiresSeconds?: number }): CdnUrl {
   const now = opts.now ?? new Date()
-  const ts = Math.floor(now.getTime() / 1000)
+  const edgeTtl=cdn.authTtlSeconds??CDN_SIGN_TTL_SECONDS
+  const lifetime=opts.expiresSeconds??edgeTtl
+  if (!Number.isSafeInteger(edgeTtl)||!Number.isSafeInteger(lifetime)||lifetime<1||lifetime>edgeTtl) throw new Error('Invalid CDN signature lifetime')
+  // Type A expires at timestamp + the edge-configured TTL, not at a JSON expires_at field.
+  const ts = Math.floor(now.getTime() / 1000)+lifetime-edgeTtl
   const rand = opts.rand ?? crypto.randomUUID().replace(/-/g, '')
   const path = `/${objectKey(cdn, objectName)}`
   const url = `https://${cdn.domain}${uriEncode(path, true)}?auth_key=${cdnAuthKey(path, cdn.authKey, { ts, rand })}`
   return {
     url,
     thumbUrl: opts.image ? `${url}&x-oss-process=${THUMB_PROCESS}` : null,
-    expiresAt: new Date((ts + CDN_SIGN_TTL_SECONDS) * 1000).toISOString(),
+    expiresAt: new Date((ts + edgeTtl) * 1000).toISOString(),
   }
 }
 

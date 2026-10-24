@@ -352,23 +352,36 @@ describe('桶:没人指向的对象', () => {
     expect(await inUse(next)).toBe(false)
   })
 
-  it('删除策略:成员能删别人传的、没人指向的对象;仍被指向的别人删不掉;上传者照旧能删自己的', async () => {
+  it('preserves reference/membership predicates while physical Storage reads and deletes require the managed service', async () => {
+    await database.query("SELECT set_config('storage.allow_delete_query','true',true)")
     const group = await newGroup(owner, [member])
     const file = await binary(group, owner)
     const stray = await object(group, owner, 'stray.png')
     const policy = async (who: string, name: string) => {
       await asUser(who)
+      // Evaluate the historical predicate with this actor's claims independently of the new restrictive gate.
+      // Actual authenticated Storage access is asserted separately below; this is not an allowed DELETE.
+      await asService()
       const { rows } = await database.query<{ allowed: boolean }>(
         `SELECT (bucket_id = 'workspace'
                  AND chat.is_member((storage.foldername(name))[1])
                  AND ((storage.foldername(name))[2] = auth.uid()::TEXT OR NOT chat.workspace_pointer_in_use(name))) AS allowed
-           FROM storage.objects WHERE name = $1`, [name])
+           FROM storage.objects WHERE name = $1 AND chat.is_member((storage.foldername(name))[1])`, [name])
       return rows[0]?.allowed ?? null
     }
     expect(await policy(member, stray)).toBe(true)
     expect(await policy(member, file.pointer)).toBe(false)
     expect(await policy(owner, file.pointer)).toBe(true)
     expect(await policy(outsider, stray)).toBe(null)
+    for (const who of [owner,member,outsider]) {
+      await asUser(who)
+      expect((await database.query('SELECT name FROM storage.objects WHERE name=ANY($1)',[[stray,file.pointer]])).rows).toEqual([])
+      expect((await database.query('DELETE FROM storage.objects WHERE name=ANY($1) RETURNING name',[[stray,file.pointer]])).rows).toEqual([])
+    }
+    await asUser(member)
+    expect((await database.query('SELECT id FROM chat.workspace_get_as($1,$2)',[file.id,member])).rows).toEqual([{id:file.id}])
+    await asUser(outsider)
+    expect(await fails('SELECT id FROM chat.workspace_get_as($1,$2)',[file.id,outsider])).toMatch(/workspace item not found/)
     // 策略本身就是这一句:库里的定义与上面判的式子相同
     await asService()
     const { rows } = await database.query<{ qual: string }>(

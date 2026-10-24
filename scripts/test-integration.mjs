@@ -58,9 +58,11 @@ const options = {
 const args = process.argv.slice(2)
 const run = (filters) => execFileSync(path.join(root, 'node_modules/.bin/vitest'), ['run', '--project', 'integration', ...filters], options)
 if (args.length === 0) {
+  // These suites change installation-wide quota configuration; isolate them from object-writing fixtures.
+  run(['--maxWorkers=1','tests/integration/service/fileTransferBudget.test.ts','tests/integration/service/fileTransferConcurrency.test.ts','tests/integration/service/topicSourceResources.test.ts'])
   // Fault injection installs member-table DDL; finish it before concurrent fixtures hold that table.
   run(['--maxWorkers=1', 'tests/integration/service/groupAdminAs.test.ts'])
-  run(['--maxWorkers=4', '--exclude', '**/groupAdminAs.test.ts'])
+  run(['--maxWorkers=4', '--exclude', '**/groupAdminAs.test.ts','--exclude','**/fileTransferBudget.test.ts','--exclude','**/fileTransferConcurrency.test.ts','--exclude','**/topicSourceResources.test.ts'])
 } else {
   run(['--maxWorkers=4', ...args])
 }

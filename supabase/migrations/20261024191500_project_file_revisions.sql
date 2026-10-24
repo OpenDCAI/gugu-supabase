@@ -116,6 +116,8 @@ BEGIN
         RAISE EXCEPTION 'Remote project files are read-only' USING HINT='file_transfer_read_only';
     END IF;
     IF TG_OP='UPDATE' AND auth.uid() IS NOT NULL AND EXISTS(SELECT 1 FROM chat.file_device_revisions WHERE item_id=OLD.id)
+       AND NOT (NEW.blob_id IS NOT NULL AND NEW.version=OLD.version+1 AND NEW.chat_id=OLD.chat_id AND NEW.kind='file'
+           AND EXISTS(SELECT 1 FROM chat.file_project_policies WHERE chat_id=OLD.chat_id AND proactive_upload))
        AND NOT EXISTS(SELECT 1 FROM chat.file_device_revisions d WHERE d.item_id=NEW.id AND d.version=NEW.version
            AND (d.file_name,d.content_type,d.size_bytes)=(NEW.filename,NEW.content_type,NEW.size_bytes)
            AND NEW.blob_id IS NULL AND NEW.chat_id=OLD.chat_id AND NEW.kind='file') THEN

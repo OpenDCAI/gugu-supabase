@@ -28,7 +28,8 @@ BEGIN
     cfg:=chat.file_transfer_settings();
     FOR t IN SELECT * FROM chat.file_temporary_transfers WHERE state<>'retired' AND
         (NOT chat.file_temporary_current(file_temporary_transfers) OR state='ready' AND (serve_until<=now() OR created_at<=now()-interval '30 days')
-         OR state IN ('requested','uploading') AND created_at<=now()-make_interval(secs=>chat.file_transfer_parameter(cfg,'upload_permit_seconds')::integer))
+         OR state='requested' AND created_at<=now()-make_interval(secs=>chat.file_transfer_parameter(cfg,'upload_permit_seconds')::integer)
+         OR state='uploading' AND NOT EXISTS(SELECT 1 FROM chat.file_transfer_reservations v WHERE v.id=file_temporary_transfers.id AND v.state='issued' AND v.expires_at>now()))
         ORDER BY created_at LIMIT p_limit FOR UPDATE SKIP LOCKED
     LOOP
         UPDATE chat.file_temporary_transfers SET state='retired',data_key=NULL WHERE id=t.id;
@@ -62,9 +63,8 @@ END $$;
 DO $gc$ DECLARE definition text; fence text:='SELECT EXISTS'; BEGIN
     SELECT pg_get_functiondef('chat.file_blob_in_use(uuid)'::regprocedure) INTO definition;
     IF position(fence IN definition)=0 THEN RAISE EXCEPTION 'Missing blob retention predecessor'; END IF;
-    EXECUTE replace(definition,fence,$body$SELECT EXISTS(SELECT 1 FROM chat.file_temporary_transfers t WHERE t.blob_id=p_blob_id AND chat.file_temporary_current(t)
-        AND (t.state='ready' AND t.serve_until>now() AND t.created_at>now()-interval '30 days'
-            OR t.state='uploading' AND t.created_at>now()-make_interval(secs=>chat.file_transfer_parameter(chat.file_transfer_settings(),'upload_permit_seconds')::integer)))
+    EXECUTE replace(definition,fence,$body$SELECT EXISTS(SELECT 1 FROM chat.file_temporary_transfers t WHERE t.blob_id=p_blob_id AND t.state='ready'
+        AND t.serve_until>now() AND t.created_at>now()-interval '30 days' AND chat.file_temporary_current(t))
         OR EXISTS(SELECT 1 FROM chat.file_blobs b JOIN chat.file_transfer_reservations v ON v.subject=b.object_name
             WHERE b.id=p_blob_id AND b.bucket_id='temporary' AND v.kind='upload' AND v.state IN ('reserved','issued') AND v.expires_at>now())
         OR EXISTS$body$);

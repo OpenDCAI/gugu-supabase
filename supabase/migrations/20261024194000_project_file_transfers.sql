@@ -59,7 +59,8 @@ BEGIN
         RAISE EXCEPTION 'Transfer is not owned by this host' USING HINT='file_transfer_denied';
     END IF;
     IF NOT chat.file_temporary_current(t)
-       OR t.state<>'ready' AND t.created_at<=now()-make_interval(secs=>chat.file_transfer_parameter(chat.file_transfer_settings(),'upload_permit_seconds')::integer) THEN
+       OR t.state='requested' AND t.created_at<=now()-make_interval(secs=>chat.file_transfer_parameter(chat.file_transfer_settings(),'upload_permit_seconds')::integer)
+       OR t.state='uploading' AND NOT EXISTS(SELECT 1 FROM chat.file_transfer_reservations v WHERE v.id=t.id AND v.state='issued' AND v.expires_at>now()) THEN
         RAISE EXCEPTION 'Transfer is no longer authorized' USING HINT='file_transfer_denied';
     END IF;
     RETURN to_jsonb(t)-'data_key';
@@ -85,7 +86,8 @@ BEGIN
         IF p->>'retention'<>'read-once' THEN
             SELECT generation.* INTO t FROM chat.file_temporary_transfers generation WHERE item_id=(r->>'item_id')::uuid AND version=(r->>'version')::integer
                 AND retention<>'read-once' AND (state='ready' AND serve_until>now() AND created_at>now()-interval '30 days'
-                    OR state IN ('requested','uploading') AND created_at>now()-make_interval(secs=>chat.file_transfer_parameter(cfg,'upload_permit_seconds')::integer))
+                    OR state='requested' AND created_at>now()-make_interval(secs=>chat.file_transfer_parameter(cfg,'upload_permit_seconds')::integer)
+                    OR state='uploading' AND EXISTS(SELECT 1 FROM chat.file_transfer_reservations v WHERE v.id=generation.id AND v.state='issued' AND v.expires_at>now()))
                 AND chat.file_temporary_current(generation)
                 ORDER BY created_at DESC LIMIT 1;
         END IF;

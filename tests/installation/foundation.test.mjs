@@ -159,6 +159,21 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     } finally {
       await db.query('ROLLBACK')
     }
+    await t.test('project metadata tables are closed and only intended read/publish APIs are granted', async () => {
+      for (const table of ['file_project_policies','file_device_revisions']) {
+        assert.equal((await query(`SELECT relrowsecurity AS enabled FROM pg_class WHERE oid='chat.${table}'::regclass`))[0].enabled, true)
+        for (const role of ['anon','authenticated']) {
+          for (const privilege of ['SELECT','INSERT','UPDATE','DELETE']) {
+            assert.equal((await db.query('SELECT has_table_privilege($1,$2,$3) AS allowed', [role,'chat.'+table,privilege])).rows[0].allowed, false)
+          }
+        }
+      }
+      for (const signature of ['file_project_policy_as(text,text,text,boolean,boolean,text)','file_project_policy_for(text,text)',
+        'file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid)','file_resolve_as(jsonb,text)']) {
+        assert.equal((await db.query("SELECT has_function_privilege('authenticated',$1,'EXECUTE') AS allowed", ['chat.'+signature])).rows[0].allowed, true)
+        assert.equal((await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS allowed", ['chat.'+signature])).rows[0].allowed, false)
+      }
+    })
     await db.query('BEGIN')
     try {
       await db.query('CREATE FUNCTION public.foundation_acl_probe() RETURNS integer LANGUAGE sql AS $$SELECT 1$$')

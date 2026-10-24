@@ -14,6 +14,10 @@ export function fileRef(value:unknown):Record<string,unknown> {
   throw new Refusal(400,'invalid','Expected an exact item/version, attachment or message reference')
 }
 
+export async function handleFileResolve(deps:AttachmentsDeps,user:string,body:Record<string,unknown>) {
+  return call(deps.userRpc,'file_resolve_as',{p_ref:fileRef(body.ref),p_as:typeof body.as==='string'?body.as:user})
+}
+
 export async function handleFileDownload(deps:AttachmentsDeps,user:string,body:Record<string,unknown>) {
   if (typeof body.request_id!=='string'||!UUID.test(body.request_id)) throw new Refusal(400,'invalid','request_id must be a uuid')
   const row=await call(deps.userRpc,'file_transfer_download_as',{

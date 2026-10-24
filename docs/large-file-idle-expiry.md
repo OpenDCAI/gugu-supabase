@@ -1,5 +1,7 @@
 # Idle expiry of large non-project files
 
+Status display uses the read-only `file_resolve_as` entry point (`attachments/file-resolve`). It reuses the original actor, message and file ACL and returns `ready`, `expired` or `gone`. It never signs a URL, reserves a download, changes `last_download_at`, or refreshes retention. Signing belongs to an actual byte request. Project-file resolution extends this same entry point instead of adding another resolver.
+
 This release follows the transfer budget boundary and reuses its storage inventory, reference attribution and atomic quota lock. It does not implement project-local resolution, temporary transfers, public-media migration or client UI. Permanent files are never quota or LRU eviction candidates.
 
 ## Deployment policy
@@ -24,7 +26,7 @@ Authenticated `file_transfer_group_usage(chat, actor)` requires the actual sourc
 
 ## Verification and rule ownership
 
-Runtime changes are confined to one additive release and the existing GC scheduler call. The migration guards each in-place extension against the exact preceding function text; an unexpected predecessor aborts the release. Previously published releases remain unchanged. Repeated installation uses the existing immutable release ledger.
+Runtime changes are confined to additive releases and the existing GC scheduler call. The migration guards each in-place extension against the exact preceding function text; an unexpected predecessor aborts the release. Previously published releases remain unchanged. Repeated installation uses the existing immutable release ledger.
 
 | Code | Approved rule | Protection |
 | --- | --- | --- |

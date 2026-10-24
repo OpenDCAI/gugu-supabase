@@ -17,7 +17,7 @@ import {
 
 import { ossObjectStorage, supabaseObjectStorage } from '../_shared/attachment-object-storage.ts'
 import { type AttachmentStorageConfig, attachmentStorageConfig, StorageConfigError } from '../_shared/attachment-storage-config.ts'
-import { handleUsageImport,handleStorageInventory } from '../_shared/file-transfer-core.ts'
+import { handleUsageImport,handleStorageInventory,handleFileResolve } from '../_shared/file-transfer-core.ts'
 import { handleProjectFiles } from '../_shared/project-file-transfer-core.ts'
 import { ossDirectSigner } from '../_shared/oss-direct-url.ts'
 
@@ -160,6 +160,8 @@ Deno.serve(async (request) => {
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
     if(route.startsWith('file-')) return json(await handleProjectFiles(deps,who.user.id,route,body))
     switch (route) {
+      case 'file-resolve':
+        return json(await handleFileResolve(deps,who.user.id,body))
       case 'upload':
         return json(await handleUpload(deps, who.user.id,body))
       case 'session-commit':

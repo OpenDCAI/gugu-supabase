@@ -44,6 +44,52 @@ let dmDoc: string
 const machines: Machine[] = []
 const pages: Page[] = []
 
+describe('current resource container authorization', () => {
+  it('reauthorizes open connections after a metadata move and preserves the same live document', async () => {
+    const oldRoom = await fx.group(u.a, [u.b, u.c])
+    const newRoom = await fx.group(u.a, [u.c])
+    const item = await fx.file(oldRoom, u.a, 'moved.md', 'text/markdown', 'seed\n')
+    const removed = page(track(machine(svc.url, await issuer.mint(u.b))), item)
+    const kept = page(track(machine(svc.url, await issuer.mint(u.c))), item)
+    await Promise.all([removed.synced, kept.synced])
+    removed.doc.getText('content').insert(0, 'before:')
+    expect(await waitFor(async () => (await fx.row(item)).inline_text?.startsWith('before:') === true)).toBeGreaterThanOrEqual(0)
+    await fx.admin.query('UPDATE chat.workspace_items SET chat_id=$1 WHERE id=$2', [newRoom, item])
+    await fx.admin.query("SELECT pg_notify('files_member_removed','')")
+    expect(await waitFor(() => removed.events.closed?.reason === 'removed-from-group')).toBeGreaterThanOrEqual(0)
+    expect(await waitFor(() => [...svc.service.hocuspocus.documents.values()].some((d) =>
+      [...d.getConnections()].some((c) => c.context?.actorId === u.c && c.context?.itemId === item && c.context?.chatId === newRoom)))).toBeGreaterThanOrEqual(0)
+    expect((await getFile(svc.url, await issuer.mint(u.b), item)).status).toBe(404)
+    expect((await getFile(svc.url, await issuer.mint(u.c), item)).status).toBe(200)
+    // Removal from the old container must not kill a connection now authorized
+    // by the new one; a real edit must still reach the same persisted document.
+    await fx.remove(oldRoom, u.c)
+    kept.doc.getText('content').insert(0, 'after:')
+    expect(await waitFor(async () => (await fx.row(item)).inline_text?.startsWith('after:before:') === true)).toBeGreaterThanOrEqual(0)
+    expect((await fx.row(item)).epoch).toBe(0)
+    expect(kept.events.closed).toBeNull()
+  })
+
+  it('leaving a topic does not revoke source access; leaving the source does', async () => {
+    const root = await fx.group(u.a, [u.b])
+    const topicId = crypto.randomUUID(), anchor = crypto.randomUUID()
+    await fx.admin.query(`INSERT INTO chat.messages(id,chat_id,sender_user_id,content) VALUES ($1,$2,$3,'anchor')`, [anchor, root, u.a])
+    await fx.admin.query(`INSERT INTO chat.chats(id,kind,name,creator_user_id,source_chat_id,source_message_id)
+      VALUES ($1,'topic','participation fixture',$2,$3,$4)`, [topicId, u.a, root, anchor])
+    await fx.admin.query(`INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner'),($1,$3,'member')`, [topicId, u.a, u.b])
+    const item = await fx.file(root, u.a, 'shared.md', 'text/markdown', 'seed\n')
+    const p = page(track(machine(svc.url, await issuer.mint(u.b))), item)
+    await p.synced
+    await fx.remove(topicId, u.b)
+    p.doc.getText('content').insert(0, 'still:')
+    expect(await waitFor(async () => (await fx.row(item)).inline_text?.startsWith('still:') === true)).toBeGreaterThanOrEqual(0)
+    expect((await getFile(svc.url, await issuer.mint(u.b), item)).status).toBe(200)
+    await fx.remove(root, u.b)
+    expect(await waitFor(() => p.events.closed?.reason === 'removed-from-group')).toBeGreaterThanOrEqual(0)
+    expect((await getFile(svc.url, await issuer.mint(u.b), item)).status).toBe(404)
+  })
+})
+
 function track(m: Machine) {
   machines.push(m)
   return m

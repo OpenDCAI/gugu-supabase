@@ -39,7 +39,7 @@ const BYSTANDER = '64010000-0000-4000-8000-000000000002'
 const WATCHER = 'agent-watcher-it-6401'
 const SPEAKER = 'agent-speaker-it-6401'
 const DEVICE = 'dev-it-6401'
-const GROUP = 'group-it-6401'
+const GROUP = '64010000-0000-4000-8000-000000000003'
 
 let database: DatabaseClient
 

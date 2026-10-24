@@ -247,7 +247,7 @@ function fakes(opts: {
     serviceRpc: async (fn, args) => {
       order.push('service:' + fn)
       if (fn==='file_managed_upload_for') {controls.push({as:'service',fn,args});return {data:{max_bytes:MAX_ATTACHMENT_BYTES},error:null}}
-      if (fn==='file_managed_upload_registered'||fn==='file_transfer_object_gone') {controls.push({as:'service',fn,args});return {data:null,error:null}}
+      if (fn==='file_managed_upload_registered'||fn==='file_transfer_expire') {controls.push({as:'service',fn,args});return {data:null,error:null}}
       if (fn==='file_transfer_settings') {controls.push({as:'service',fn,args});return {data:{download_link_bits_per_second:819200},error:null}}
       rpcs.push({ as: 'service', fn, args })
       if (fn === 'file_blob_register') {
@@ -554,8 +554,11 @@ describe('直传表单、签名链接、回收', () => {
       { blob_id: 'b1', claim_token: 't1', bucket_id: 'oss', object_name: 'ab/x', content_type: 'image/png' },
       { blob_id: 'b2', claim_token: 't2', bucket_id: 'workspace', object_name: 'c/u/old', content_type: 'application/x' },
     ]
-    const { deps, calls, rpcs, removed } = fakes({ claimed })
+    const { deps, calls, rpcs, removed, controls, order } = fakes({ claimed })
     expect(await handleGc(deps)).toEqual({ claimed: 2, deleted: 2, failed: 0 })
+    expect(controls.filter(r => r.fn === 'file_transfer_expire')).toEqual([{as:'service',fn:'file_transfer_expire',args:{p_limit:500}}])
+    expect(order.indexOf('service:file_transfer_expire')).toBeLessThan(order.indexOf('service:file_blob_gc_claim'))
+    expect(order).not.toContain('service:file_transfer_object_gone')
     expect(calls.map((c) => `${c.method} ${c.url.replace(/\?.*$/, '')}`)).toEqual([
       'DELETE https://gugu-files-test.oss-cn-wulanchabu.aliyuncs.com/ab/x',
       'POST https://cdn.aliyuncs.com/',
@@ -563,6 +566,7 @@ describe('直传表单、签名链接、回收', () => {
     expect(decodeURIComponent(calls[1]!.url)).toContain('ObjectType=IgnoreParams')
     expect(removed).toEqual(['workspace/c/u/old'])
     expect(rpcs.filter((r) => r.fn === 'file_blob_gc_finish').map((r) => r.args.p_blob_id)).toEqual(['b1', 'b2'])
+
 
     const broken = fakes({ claimed })
     broken.deps.storageRemove = async () => { throw new Error('storage 500') }

@@ -385,6 +385,7 @@ interface Claimed {
 }
 
 export async function handleGc(deps: AttachmentsDeps) {
+  await call(deps.serviceRpc, 'file_transfer_expire', { p_limit: 500 })
   const claimed = ((await call(deps.serviceRpc, 'file_blob_gc_claim', { p_limit: 50, p_stale_seconds: 600 })) ?? []) as Claimed[]
   let deleted = 0
   let failed = 0
@@ -399,7 +400,6 @@ export async function handleGc(deps: AttachmentsDeps) {
         await deps.storageRemove(job.bucket_id, job.object_name)
       }
       await call(deps.serviceRpc, 'file_blob_gc_finish', { p_blob_id: job.blob_id, p_claim_token: job.claim_token })
-      await call(deps.serviceRpc,'file_transfer_object_gone',{p_bucket:job.bucket_id,p_name:job.object_name})
       deleted++
     } catch (error) {
       failed++

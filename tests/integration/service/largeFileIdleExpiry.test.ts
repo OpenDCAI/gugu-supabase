@@ -68,6 +68,26 @@ beforeEach(async()=>{
 })
 afterEach(async()=>{await db.query('ROLLBACK')})
 describe('non-project idle expiry, not quota eviction',()=>{
+  it('displaying metadata never reserves a download or renews activity, while a real download still does',async()=>{
+    const file=await upload();await age(file.stored)
+    for(const actor of [owner,member]) {
+      await user(actor)
+      const r=(await db.query('SELECT chat.file_resolve_as($1,$2) AS r',[{message_id:file.message},actor])).rows[0].r
+      expect(r).toMatchObject({status:'ready',source:'managed-object',sha256:file.sha})
+      for(const field of ['url','download_id','signed_at','expires_at']) expect(r[field]).toBeUndefined()
+    }
+    await service()
+    expect((await state(file.stored)).last_download_at).toBeNull()
+    expect((await db.query("SELECT id FROM chat.file_transfer_reservations WHERE kind='download' AND chat_id=$1",[group])).rows).toEqual([])
+    expect(await expire()).toBe(1)
+    await user(member)
+    expect((await db.query('SELECT chat.file_resolve_as($1,$2) AS r',[{message_id:file.message},member])).rows[0].r.status).toBe('expired')
+    await user(outsider)
+    expect((await db.query('SELECT chat.file_resolve_as($1,$2) AS r',[{message_id:file.message},outsider])).rows[0].r).toEqual({status:'gone'})
+    await service();const readable=await upload()
+    expect((await download(readable.message)).status).toBe('ready')
+    await service();expect((await state(readable.stored)).last_download_at).not.toBeNull()
+  })
   it('uses strict configured size and inclusive idle boundary, preserving small and recently read files',async()=>{
     const large=await upload(51),small=await upload(50),recent=await upload(100),young=await upload(100)
     await age(large.stored,30);await age(small.stored);await age(recent.stored,40,1);await age(young.stored,29)

@@ -17,7 +17,7 @@ import {
 
 import { ossObjectStorage, supabaseObjectStorage } from '../_shared/attachment-object-storage.ts'
 import { type AttachmentStorageConfig, attachmentStorageConfig, StorageConfigError } from '../_shared/attachment-storage-config.ts'
-import { handleUsageImport,handleStorageInventory } from '../_shared/file-transfer-core.ts'
+import { handleUsageImport,handleStorageInventory,handleFileResolve } from '../_shared/file-transfer-core.ts'
 
 const env = (key: string): string => Deno.env.get(key)?.trim() ?? ''
 
@@ -157,6 +157,8 @@ Deno.serve(async (request) => {
     if (whoError || !who?.user?.id) return json({ error: 'denied', message: 'sign in first' }, 401)
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
     switch (route) {
+      case 'file-resolve':
+        return json(await handleFileResolve(deps,who.user.id,body))
       case 'upload':
         return json(await handleUpload(deps, who.user.id,body))
       case 'session-commit':

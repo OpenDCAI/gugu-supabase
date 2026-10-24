@@ -1,6 +1,6 @@
 import { describe,expect,it } from 'vitest'
 import { inspectFileStream } from '../../../supabase/functions/_shared/file-inspection'
-import { fileRef } from '../../../supabase/functions/_shared/file-transfer-core'
+import { fileRef,handleFileResolve } from '../../../supabase/functions/_shared/file-transfer-core'
 import { cdnSignedUrl } from '../../../supabase/functions/_shared/oss'
 
 describe('streamed file inspection',()=>{
@@ -22,6 +22,13 @@ describe('streamed file inspection',()=>{
   })
 })
 describe('download input and signed throttles',()=>{
+  it('metadata display calls only the read-only RPC and never invokes a provider or signing RPC',async()=>{
+    const calls:string[]=[]
+    const deps=new Proxy({userRpc:async(fn:string)=>{calls.push(fn);return {data:{status:'expired'},error:null}}},
+      {get(target,key){if(key==='userRpc')return target.userRpc;throw Error('Metadata touched '+String(key))}})
+    expect(await handleFileResolve(deps as Parameters<typeof handleFileResolve>[0],'reader',{ref:{message_id:'message'}})).toEqual({status:'expired'})
+    expect(calls).toEqual(['file_resolve_as'])
+  })
   it('uses the CDN edge expiry equation rather than only shortening response metadata',()=>{
     const now=new Date('2026-10-24T00:00:00Z')
     for (const edgeTtl of [60,1800,7200]) {

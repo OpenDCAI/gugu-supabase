@@ -256,6 +256,20 @@ describe('temporary generations reuse managed budgets and private key issuance',
     expect(Number((await db.query("SELECT chat.file_transfer_usage('upload','group',$1) AS n",[group])).rows[0].n)).toBe(128)
     expect((await db.query('SELECT bucket_id,size_bytes FROM chat.file_blobs WHERE id=(SELECT blob_id FROM chat.file_temporary_transfers WHERE id=$1)',[id])).rows[0]).toEqual({bucket_id:'temporary',size_bytes:'128'})
   })
+  it('lets only the host publish a managed next version through the existing upload path when cloud upload is enabled',async()=>{
+    await user();await db.query(POLICY,[group,device,'root',true,true,'7d'])
+    const permit=(await db.query('SELECT chat.file_managed_upload_as($1,$2,$3,128) AS r',[randomUUID(),group,owner])).rows[0].r
+    await service();await db.query('SELECT * FROM chat.file_blob_register($1,$2,$3,128,$4)',[owner,permit.staging_key,cipherSha,type])
+    await db.query('SELECT chat.file_managed_upload_registered($1,$2)',[permit.staging_key,owner])
+    await user();await db.query(POLICY,[group,device,'root',false,true,'7d'])
+    expect((await fails('SELECT * FROM chat.file_replace_as($1,$2,$3,1)',[permit.staging_key,item,owner])).hint).toBe('file_transfer_read_only')
+    await db.query(POLICY,[group,device,'root',true,true,'7d'])
+    await db.query('SELECT * FROM chat.file_replace_as($1,$2,$3,1)',[permit.staging_key,item,owner])
+    expect(await resolve()).toMatchObject({status:'ready',source:'managed-object',version:2,sha256:cipherSha})
+    expect(await resolve({item_id:item,version:1})).toMatchObject({source:'local',sha256:sha})
+    await user(member)
+    expect((await fails('SELECT * FROM chat.workspace_move_as($1,$2,NULL,$3)',[item,member,'changed.bin'])).hint).toBe('file_transfer_read_only')
+  })
   it('stops acceptance at the existing storage budget and retains an abandoned unverified upload allowance',async()=>{
     const {transfer_id:id}=await request();await service()
     await db.query("UPDATE chat.file_transfer_limits SET settings=settings||'{\"storage_group_bytes\":127}'")

@@ -247,7 +247,7 @@ function fakes(opts: {
     serviceRpc: async (fn, args) => {
       order.push('service:' + fn)
       if (fn==='file_managed_upload_for') {controls.push({as:'service',fn,args});return {data:{max_bytes:MAX_ATTACHMENT_BYTES},error:null}}
-      if (fn==='file_managed_upload_registered'||fn==='file_transfer_expire') {controls.push({as:'service',fn,args});return {data:null,error:null}}
+      if (fn==='file_managed_upload_registered'||fn==='file_transfer_expire'||fn==='file_temporary_expire') {controls.push({as:'service',fn,args});return {data:null,error:null}}
       if (fn==='file_transfer_settings') {controls.push({as:'service',fn,args});return {data:{download_link_bits_per_second:819200},error:null}}
       rpcs.push({ as: 'service', fn, args })
       if (fn === 'file_blob_register') {
@@ -556,6 +556,8 @@ describe('直传表单、签名链接、回收', () => {
     ]
     const { deps, calls, rpcs, removed, controls, order } = fakes({ claimed })
     expect(await handleGc(deps)).toEqual({ claimed: 2, deleted: 2, failed: 0 })
+    expect(controls.filter(r => r.fn === 'file_temporary_expire')).toEqual([{as:'service',fn:'file_temporary_expire',args:{p_limit:500}}])
+    expect(order.indexOf('service:file_temporary_expire')).toBeLessThan(order.indexOf('service:file_transfer_expire'))
     expect(controls.filter(r => r.fn === 'file_transfer_expire')).toEqual([{as:'service',fn:'file_transfer_expire',args:{p_limit:500}}])
     expect(order.indexOf('service:file_transfer_expire')).toBeLessThan(order.indexOf('service:file_blob_gc_claim'))
     expect(order).not.toContain('service:file_transfer_object_gone')
@@ -572,6 +574,13 @@ describe('直传表单、签名链接、回收', () => {
     broken.deps.storageRemove = async () => { throw new Error('storage 500') }
     expect(await handleGc(broken.deps)).toEqual({ claimed: 2, deleted: 1, failed: 1 })
     expect(broken.rpcs.filter((r) => r.fn === 'file_blob_gc_fail').map((r) => r.args)).toEqual([{ p_blob_id: 'b2', p_claim_token: 't2', p_error: 'Error: storage 500' }])
+  })
+  it('gc removes temporary ciphertext at the same private provider without invoking CDN or weakening claim confirmation',async()=>{
+    const {deps,calls,rpcs,removed}=fakes({claimed:[{blob_id:'temporary',claim_token:'token',bucket_id:'temporary',object_name:'temporary/group/file/generation',content_type:'application/octet-stream'}]})
+    expect(await handleGc(deps)).toEqual({claimed:1,deleted:1,failed:0})
+    expect(calls.map(c=>`${c.method} ${c.url.replace(/\?.*$/,'')}`)).toEqual(['DELETE https://gugu-files-test.oss-cn-wulanchabu.aliyuncs.com/temporary/group/file/generation'])
+    expect(removed).toEqual([])
+    expect(rpcs.filter(r=>r.fn==='file_blob_gc_finish').map(r=>r.args)).toEqual([{p_blob_id:'temporary',p_claim_token:'token'}])
   })
 })
 

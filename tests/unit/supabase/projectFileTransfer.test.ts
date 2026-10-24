@@ -35,6 +35,21 @@ describe('temporary file HTTP protocol',()=>{
     expect(f.serviceRpc).toHaveBeenLastCalledWith('file_temporary_commit',{p_id:transfer,p_host:host,p_sha:sha,p_size:128,p_key:key})
     expect(f.userRpc).not.toHaveBeenCalled();expect(f.deps.log).not.toHaveBeenCalled()
   })
+  it('confirms temporary eviction through the existing collector before asking the original quota core for a new upload',async()=>{
+    const f=fixture(),order:string[]=[]
+    f.serviceRpc.mockImplementation(async(fn)=>{
+      order.push(fn)
+      return {data:fn==='file_temporary_expire'?(order.length===1?1:0):fn==='file_blob_gc_claim'
+        ?[{blob_id:'old',claim_token:'claim',bucket_id:'temporary',object_name:'temporary/old',content_type:'application/octet-stream'}]:null,error:null}
+    })
+    const accept=f.userRpc.getMockImplementation()!
+    f.userRpc.mockImplementation(async(fn,args)=>{order.push(fn);return accept(fn,args)})
+    expect(await handleProjectFiles(f.deps,host,'file-accept',{transfer_id:transfer,ciphertext_bytes:128})).toMatchObject({max_bytes:128})
+    expect(f.serviceRpc).toHaveBeenCalledWith('file_temporary_expire',{p_limit:500,p_request:transfer,p_host:host,p_needed:128})
+    expect(f.objects.remove).toHaveBeenCalledWith('temporary/old')
+    expect(f.objects.invalidate).not.toHaveBeenCalled()
+    expect(order.indexOf('file_blob_gc_finish')).toBeLessThan(order.indexOf('file_temporary_accept'))
+  })
   it('refuses modified ciphertext and malformed key material before publication',async()=>{
     const f=fixture(),body={transfer_id:transfer,ciphertext_bytes:128,ciphertext_sha256:sha,key}
     f.objects.inspect.mockResolvedValueOnce({bytes:new Uint8Array(),sizeBytes:127,sha256:sha,etag:'etag'})

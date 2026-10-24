@@ -180,7 +180,7 @@ describe('temporary generations reuse managed budgets and private key issuance',
   const COMMIT='SELECT chat.file_temporary_commit($1,$2,$3,$4,$5)'
   const cfg={inventory_ready:true,storage_global_bytes:10000,storage_account_bytes:10000,storage_group_bytes:10000,
     download_global_bytes:10000,download_account_bytes:10000,download_group_bytes:10000,
-    upload_permit_seconds:120,sign_window_seconds:60,sign_account_count:100,sign_group_count:100,file_max_bytes:1000,download_link_bits_per_second:819200}
+    upload_permit_seconds:120,sign_window_seconds:60,sign_account_count:100,sign_group_count:100,file_max_bytes:1000,download_link_bits_per_second:819200,temporary_group_bytes:10000}
   beforeEach(async()=>{
     await publish();await service()
     const baseline=Number((await db.query("SELECT chat.file_transfer_usage('upload','global','*') AS n")).rows[0].n)
@@ -206,6 +206,18 @@ describe('temporary generations reuse managed budgets and private key issuance',
   async function getKey(id:string,account=member) {
     await service()
     return (await db.query('SELECT chat.file_temporary_key_for($1,$2) AS key',[id,account])).rows[0].key
+  }
+  async function expireTemporary(id:string|null=null,needed=0) {
+    await service()
+    return (await db.query('SELECT chat.file_temporary_expire(500,$1,$2,$3) AS n',[id,id?owner:null,needed])).rows[0].n
+  }
+  async function generation(id:string) {
+    await service()
+    return (await db.query('SELECT * FROM chat.file_temporary_transfers WHERE id=$1',[id])).rows[0]
+  }
+  async function claim(blob:string) {
+    await service()
+    return (await db.query('SELECT * FROM chat.file_blob_gc_claim(50,600)')).rows.find(row=>row.blob_id===blob)
   }
   it('requires a real readable reference and enforces disabled project upload policy before issuing normal permits',async()=>{
     await user(outsider)
@@ -303,6 +315,85 @@ describe('temporary generations reuse managed budgets and private key issuance',
     await service()
     expect((await db.query('SELECT state,bytes FROM chat.file_transfer_reservations WHERE id=$1',[id])).rows[0]).toEqual({state:'issued',bytes:'128'})
     expect((await fails('SELECT chat.file_temporary_key_for($1,$2)',[id,member])).hint).toBe('file_transfer_denied')
+  })
+  it('renews retained data only on a fresh read, never a retry or metadata display, and caps retention at thirty days',async()=>{
+    const transfer=await ready(),id=randomUUID();await service()
+    await db.query("UPDATE chat.file_temporary_transfers SET created_at=now()-interval '29 days',serve_until=now()+interval '1 hour' WHERE id=$1",[transfer])
+    const before=(await generation(transfer)).serve_until
+    expect((await resolve()).status).toBe('ready')
+    expect((await generation(transfer)).serve_until).toEqual(before)
+    expect((await download(id)).status).toBe('ready')
+    const renewed=await generation(transfer)
+    expect(renewed.serve_until.getTime()-renewed.created_at.getTime()).toBe(30*86400000)
+    await service();await db.query("UPDATE chat.file_temporary_transfers SET serve_until=now()+interval '1 hour' WHERE id=$1",[transfer])
+    await download(id)
+    expect((await generation(transfer)).serve_until).toEqual(before)
+  })
+  it.each(['expiry','removal','unbinding','new-version','policy'])('retires keys and queues the original blob collector after %s',async(reason)=>{
+    const transfer=await ready(),before=await generation(transfer)
+    if(reason==='expiry') await db.query("UPDATE chat.file_temporary_transfers SET serve_until=now()-interval '1 second' WHERE id=$1",[transfer])
+    if(reason==='removal') await db.query('DELETE FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2',[group,member])
+    if(reason==='unbinding') await db.query('UPDATE identity.device_projects SET chat_id=NULL WHERE device_id=$1',[device])
+    if(reason==='new-version') { await user();await publish({8:1,4:'ef'.repeat(32)}) }
+    if(reason==='policy') { await user();await db.query(POLICY,[group,device,'root',false,false,'7d']) }
+    expect(await expireTemporary()).toBe(1)
+    expect(await generation(transfer)).toMatchObject({state:'retired',data_key:null})
+    expect((await db.query('SELECT blob_id FROM chat.file_blob_gc WHERE blob_id=$1',[before.blob_id])).rows).toHaveLength(1)
+    // A still-live upload capability protects against a late upload even after revocation.
+    expect(await claim(before.blob_id)).toBeUndefined()
+    await db.query("UPDATE chat.file_transfer_reservations SET expires_at=now()-interval '1 second' WHERE id=$1",[transfer])
+    await db.query('SELECT chat.file_blob_enqueue($1)',[before.blob_id]);await db.query('UPDATE chat.file_blob_gc SET next_attempt_at=now() WHERE blob_id=$1',[before.blob_id])
+    const job=await claim(before.blob_id)
+    expect(job).toMatchObject({blob_id:before.blob_id,bucket_id:'temporary'})
+    const held=Number((await db.query("SELECT chat.file_transfer_usage('upload','group',$1) AS n",[group])).rows[0].n)
+    expect(held).toBe(128)
+    await db.query('SELECT chat.file_blob_gc_finish($1,$2)',[before.blob_id,job.claim_token])
+    expect(Number((await db.query("SELECT chat.file_transfer_usage('upload','group',$1) AS n",[group])).rows[0].n)).toBe(0)
+  })
+  it('keeps an uncommitted object discoverable after source deletion and holds its allowance after confirmed cleanup',async()=>{
+    const {transfer_id:id}=await request();await accept(id)
+    const pending=await generation(id)
+    expect(pending.blob_id).toBeTruthy()
+    await db.query('DELETE FROM chat.chats WHERE id=$1',[group])
+    expect((await db.query('SELECT blob_id FROM chat.file_blob_gc WHERE blob_id=$1',[pending.blob_id])).rows).toHaveLength(1)
+    expect(await claim(pending.blob_id)).toBeUndefined()
+    await db.query("UPDATE chat.file_transfer_reservations SET expires_at=now()-interval '1 second' WHERE id=$1",[id])
+    await db.query('SELECT chat.file_blob_enqueue($1)',[pending.blob_id]);await db.query('UPDATE chat.file_blob_gc SET next_attempt_at=now() WHERE blob_id=$1',[pending.blob_id])
+    const job=await claim(pending.blob_id)
+    expect(job).toMatchObject({blob_id:pending.blob_id})
+    await db.query('SELECT chat.file_blob_gc_finish($1,$2)',[pending.blob_id,job.claim_token])
+    expect((await db.query('SELECT state,bytes,actual_bytes FROM chat.file_transfer_reservations WHERE id=$1',[id])).rows[0]).toEqual({state:'issued',bytes:'128',actual_bytes:'0'})
+  })
+  it('LRU retires only temporary objects, preserves permanent files, and releases capacity only after GC confirmation',async()=>{
+    const old=await ready(),oldRow=await generation(old),permanentSha='ef'.repeat(32)
+    const permanent=(await db.query("INSERT INTO chat.file_blobs(bucket_id,object_name,sha256,size_bytes,content_type,created_by) VALUES('oss',$1,$2,64,$3,$4) RETURNING id",['ef/'+permanentSha,permanentSha,type,owner])).rows[0].id
+    await db.query('SELECT chat.file_transfer_track($1,$2,$3)',[permanent,group,owner])
+    await db.query("UPDATE chat.file_transfer_limits SET settings=settings||'{\"temporary_group_bytes\":128,\"storage_group_bytes\":192}'")
+    item=randomUUID();await user();await publish()
+    const {transfer_id:next}=await request()
+    expect(await expireTemporary(next,128)).toBe(1)
+    expect(await generation(old)).toMatchObject({state:'retired',data_key:null})
+    expect((await db.query('SELECT state FROM chat.file_blobs WHERE id=$1',[permanent])).rows[0].state).toBe('live')
+    expect((await db.query('SELECT blob_id FROM chat.file_blob_gc WHERE blob_id=$1',[permanent])).rows).toEqual([])
+    await user();expect((await fails('SELECT chat.file_temporary_accept($1,128)',[next])).hint).toBe('file_transfer_group_storage_full')
+    await service();await db.query("UPDATE chat.file_transfer_reservations SET expires_at=now()-interval '1 second' WHERE id=$1",[old])
+    const job=await claim(oldRow.blob_id)
+    expect(job).toMatchObject({blob_id:oldRow.blob_id})
+    expect(Number((await db.query('SELECT chat.file_temporary_usage($1) AS n',[group])).rows[0].n)).toBe(128)
+    await db.query('SELECT chat.file_blob_gc_finish($1,$2)',[oldRow.blob_id,job.claim_token])
+    expect((await accept(next)).max_bytes).toBe(128)
+    await service();expect((await db.query('SELECT state FROM chat.file_blobs WHERE id=$1',[permanent])).rows[0].state).toBe('live')
+  })
+  it('keeps maintenance service-only and validates temporary caps and batch sizes before destructive changes',async()=>{
+    const {transfer_id:id}=await request()
+    await user()
+    expect((await fails('SELECT chat.file_temporary_expire()')).code).toBe('42501')
+    await service()
+    for(const n of [null,0,501]) expect((await fails('SELECT chat.file_temporary_expire($1)',[n])).message).toBe('Invalid temporary expiry batch size')
+    expect((await fails('SELECT chat.file_temporary_expire(500,$1,$2,128)',[id,outsider])).hint).toBe('file_transfer_denied')
+    await db.query("UPDATE chat.file_transfer_limits SET settings=settings||'{\"temporary_group_bytes\":127}'")
+    expect((await fails('SELECT chat.file_temporary_expire(500,$1,$2,128)',[id,owner])).hint).toBe('file_transfer_too_large')
+    expect((await generation(id)).state).toBe('requested')
   })
   it('refuses a last-byte download overdraft before binding key context',async()=>{
     await ready();await service();await db.query("UPDATE chat.file_transfer_limits SET settings=settings||'{\"download_account_bytes\":127}'")

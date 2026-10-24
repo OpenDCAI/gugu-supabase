@@ -4,8 +4,11 @@ Backend mechanisms are developed in separate commits. Client resolution and its 
 
 | Runtime group | Approved behavior | Added / removed lines |
 | --- | --- | --- |
-| Policy, local revisions, metadata resolver and write guard | Project files default to local storage; a bound host publishes immutable versions; remote access is read-only | 179 / 0 |
-| Temporary requests, scoped host accept/commit, original download issuance and private key return | Upload only for a real authorized read; ciphertext stays on a private origin; shared storage/download budgets apply before permits | 324 / 8 |
+| Policy, local revisions, metadata resolver and write guard | Project files default to local storage; a bound host publishes immutable versions; remote access is read-only | 198 / 0 |
+| Temporary requests, scoped host accept/commit, original download issuance and private key return | Upload only for a real authorized read; ciphertext stays on a private origin; shared storage/download budgets apply before permits | 337 / 8 |
+| Temporary retention and existing collector integration | Expiry and revocation clear keys; LRU applies only to temporary inventory; physical confirmation precedes capacity release | 81 / 2 |
+
+These runtime totals are relative to the permanent-file expiry base: 616 added, 10 removed, net 606. Tests, documentation and the generated Deno lock are reported separately. Existing version snapshots gain a constrained local-revision pointer, preserving exactly one body provider per version; no placeholder cloud blob stands in for a local file. Enabling proactive cloud upload permits the host's next version through the existing managed upload path, while remote mutations remain refused. Historical pinned local versions retain their original provider.
 
 `file_project_policy_as` requires the actual project binding, device ownership and group administrator membership. Proactive upload defaults to false; temporary transfer and its retention are separate explicit settings. An unbound or removed project cannot resolve a local revision even if an obsolete policy survives. Absolute roots are not included in the file resolver response.
 
@@ -32,3 +35,5 @@ The retention group connects expiry, revocation and temporary-only LRU to the or
 An unverified placeholder is registered in the existing blob table when the upload permit is issued, without claiming verified size or adding physical inventory. Source deletion can therefore enqueue the exact object even before commit. The original collector protects an upload until its permit expires, including when the source row has already disappeared. Commit updates only the same live placeholder after streamed verification, never a blob already being collected. Cleanup of an abandoned upload does not itself refund its allowance: trusted terminal evidence is still required. No second worker, quota ledger, persistence table or restore RPC is introduced.
 
 The client implementation will have one resolver before any cloud metadata lookup: local loopback, the reader's already-open owner SSH link, then encrypted temporary cloud transfer. Expired cards and ordinary re-upload belong to the separate permanent-file expiry change, not this resolver change.
+
+The full contract runner isolates quota policy and next-idle-pass GC assertions from unrelated object-writing suites. The original GC concurrency suite still uses real concurrent database transactions, with every original assertion preserved. This separation does not replace or remove concurrency coverage: collection legitimately skips a busy global quota lock, so another suite's incidental writer cannot stand in for the test's intended idle pass.

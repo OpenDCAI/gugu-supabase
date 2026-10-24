@@ -5,7 +5,7 @@ import {
 import { type AttachmentObjectStorage, ObjectStorageError } from './object-storage.ts'
 import { inspectFileStream } from './file-inspection.ts'
 
-export function ossObjectStorage(config: { oss: OssConfig; cdn: CdnConfig; fetch: FetchLike }): AttachmentObjectStorage {
+export function ossObjectStorage(config: { oss: OssConfig; cdn: CdnConfig; fetch: FetchLike; directSign?:AttachmentObjectStorage['sign'] }): AttachmentObjectStorage {
   const { oss, cdn, fetch } = config
   const store: AttachmentObjectStorage = {
     uploadBounds: async (requestedBytes,requestedSeconds) => {
@@ -38,6 +38,10 @@ export function ossObjectStorage(config: { oss: OssConfig; cdn: CdnConfig; fetch
     exists: (key) => ossExists(oss, fetch, key),
     remove: (key) => ossDelete(oss, fetch, key),
     sign: async (key, image, now, permit) => {
+      if(permit?.direct) {
+        if(!config.directSign) throw new ObjectStorageError(503,'not_configured','Origin signing is not configured')
+        return config.directSign(key,false,now,permit)
+      }
       if (permit && (cdn.authTtlSeconds===undefined || cdn.requestLimitBitsPerSecond!==permit.trafficBits)) {
         throw new ObjectStorageError(503,'not_configured','CDN authentication TTL and fixed per-request throttle must match deployment settings')
       }

@@ -18,6 +18,8 @@ import {
 import { ossObjectStorage, supabaseObjectStorage } from '../_shared/attachment-object-storage.ts'
 import { type AttachmentStorageConfig, attachmentStorageConfig, StorageConfigError } from '../_shared/attachment-storage-config.ts'
 import { handleUsageImport,handleStorageInventory } from '../_shared/file-transfer-core.ts'
+import { handleProjectFiles } from '../_shared/project-file-transfer-core.ts'
+import { ossDirectSigner } from '../_shared/oss-direct-url.ts'
 
 const env = (key: string): string => Deno.env.get(key)?.trim() ?? ''
 
@@ -73,7 +75,7 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
   }
   return {
     objects: storage.kind === 'oss'
-      ? ossObjectStorage({ oss: storage.oss, cdn: storage.cdn, fetch: (input, init) => fetch(input, init) })
+      ? ossObjectStorage({ oss: storage.oss, cdn: storage.cdn, directSign:ossDirectSigner(storage.oss),fetch: (input, init) => fetch(input, init) })
       : supabaseObjectStorage({
         url, serviceKey: env('SUPABASE_SERVICE_ROLE_KEY'), bucket: storage.bucket,
         fetch: (input, init) => fetch(input, init),
@@ -156,6 +158,7 @@ Deno.serve(async (request) => {
     const { data: who, error: whoError } = await asUser.auth.getUser()
     if (whoError || !who?.user?.id) return json({ error: 'denied', message: 'sign in first' }, 401)
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    if(route.startsWith('file-')) return json(await handleProjectFiles(deps,who.user.id,route,body))
     switch (route) {
       case 'upload':
         return json(await handleUpload(deps, who.user.id,body))

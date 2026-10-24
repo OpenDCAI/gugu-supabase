@@ -173,3 +173,141 @@ describe('project local metadata, exact references and read-only host ownership'
     expect((await db.query("SELECT has_function_privilege('authenticated','chat.file_device_read_only()','EXECUTE') AS ok")).rows[0].ok).toBe(false)
   })
 })
+
+describe('temporary generations reuse managed budgets and private key issuance',()=>{
+  const cipherSha='cd'.repeat(32),key=Buffer.alloc(32,7).toString('base64')
+  const DOWNLOAD='SELECT chat.file_transfer_download_as($1,$2,$3) AS r'
+  const COMMIT='SELECT chat.file_temporary_commit($1,$2,$3,$4,$5)'
+  const cfg={inventory_ready:true,storage_global_bytes:10000,storage_account_bytes:10000,storage_group_bytes:10000,
+    download_global_bytes:10000,download_account_bytes:10000,download_group_bytes:10000,
+    upload_permit_seconds:120,sign_window_seconds:60,sign_account_count:100,sign_group_count:100,file_max_bytes:1000,download_link_bits_per_second:819200}
+  beforeEach(async()=>{
+    await publish();await service()
+    const baseline=Number((await db.query("SELECT chat.file_transfer_usage('upload','global','*') AS n")).rows[0].n)
+    await db.query("INSERT INTO chat.file_transfer_limits(scope,scope_id,settings) VALUES('global','*',$1) ON CONFLICT(scope,scope_id) DO UPDATE SET settings=EXCLUDED.settings",[{...cfg,storage_global_bytes:baseline+cfg.storage_global_bytes}])
+  })
+  async function request(id=randomUUID(),ref:unknown={item_id:item}) {
+    await user(member)
+    return (await db.query('SELECT chat.file_temporary_request($1,$2,$3) AS r',[ref,member,id])).rows[0].r
+  }
+  async function accept(id:string,size=128) {
+    await user()
+    return (await db.query('SELECT chat.file_temporary_accept($1,$2) AS r',[id,size])).rows[0].r
+  }
+  async function ready() {
+    const t=await request();await accept(t.transfer_id);await service()
+    await db.query(COMMIT,[t.transfer_id,owner,cipherSha,128,key])
+    return t.transfer_id as string
+  }
+  async function download(id=randomUUID(),ref:unknown={item_id:item}) {
+    await user(member)
+    return (await db.query(DOWNLOAD,[ref,member,id])).rows[0].r
+  }
+  async function getKey(id:string,account=member) {
+    await service()
+    return (await db.query('SELECT chat.file_temporary_key_for($1,$2) AS key',[id,account])).rows[0].key
+  }
+  it('requires a real readable reference and enforces disabled project upload policy before issuing normal permits',async()=>{
+    await user(outsider)
+    expect((await db.query('SELECT chat.file_temporary_request($1,$2,$3) AS r',[{item_id:item},outsider,randomUUID()])).rows[0].r).toEqual({status:'gone'})
+    await user()
+    expect((await fails('SELECT chat.file_managed_upload_as($1,$2,$3,128)',[randomUUID(),group,owner])).hint).toBe('file_transfer_denied')
+    await db.query(POLICY,[group,device,'root',true,true,'7d'])
+    expect((await db.query('SELECT chat.file_managed_upload_as($1,$2,$3,128) AS r',[randomUUID(),group,owner])).rows[0].r.max_bytes).toBe(128)
+    expect((await request()).transfer_status).toBe('requested')
+  })
+  it('deduplicates retained generations but preserves request identity, device ownership and pending metadata secrecy',async()=>{
+    const id=randomUUID(),first=await request(id),again=await request()
+    expect(again.transfer_id).toBe(first.transfer_id)
+    await user()
+    expect((await fails('SELECT chat.file_temporary_request($1,$2,$3)',[{item_id:item},owner,id])).hint).toBe('file_transfer_conflict')
+    const pending=(await db.query('SELECT * FROM chat.file_temporary_pending($1)',[device])).rows.map(row=>Object.values(row)[0])
+    expect(pending).toHaveLength(1)
+    expect(pending[0]).toMatchObject({id,relative_path:'data/file.bin',sha256:sha})
+    expect(pending[0].data_key).toBeUndefined()
+    await user(member)
+    expect((await fails('SELECT chat.file_temporary_accept($1,128)',[id])).hint).toBe('file_transfer_denied')
+    expect((await fails('SELECT * FROM chat.file_temporary_pending($1)',[device])).hint).toBe('file_transfer_denied')
+  })
+  it('reserves the exact ciphertext length once, admits the last storage byte, and cannot enlarge or reuse the permit for a new lifetime',async()=>{
+    const {transfer_id:id}=await request();await service()
+    await db.query("UPDATE chat.file_transfer_limits SET settings=settings||'{\"storage_group_bytes\":128,\"storage_account_bytes\":128}'")
+    const first=await accept(id)
+    expect(await accept(id)).toEqual(first)
+    expect((await fails('SELECT chat.file_temporary_accept($1,129)',[id])).hint).toBe('file_transfer_conflict')
+    await service();await db.query(COMMIT,[id,owner,cipherSha,128,key])
+    expect(Number((await db.query("SELECT chat.file_transfer_usage('upload','group',$1) AS n",[group])).rows[0].n)).toBe(128)
+    expect((await db.query('SELECT bucket_id,size_bytes FROM chat.file_blobs WHERE id=(SELECT blob_id FROM chat.file_temporary_transfers WHERE id=$1)',[id])).rows[0]).toEqual({bucket_id:'temporary',size_bytes:'128'})
+  })
+  it('stops acceptance at the existing storage budget and retains an abandoned unverified upload allowance',async()=>{
+    const {transfer_id:id}=await request();await service()
+    await db.query("UPDATE chat.file_transfer_limits SET settings=settings||'{\"storage_group_bytes\":127}'")
+    await user()
+    expect((await fails('SELECT chat.file_temporary_accept($1,128)',[id])).hint).toBe('file_transfer_group_storage_full')
+    await service();expect((await db.query('SELECT id FROM chat.file_transfer_reservations WHERE id=$1',[id])).rows).toEqual([])
+    await db.query("UPDATE chat.file_transfer_limits SET settings=settings||'{\"storage_group_bytes\":128}'")
+    await accept(id);await service()
+    await db.query("UPDATE chat.file_transfer_reservations SET expires_at=now()-interval '1 day' WHERE id=$1",[id])
+    expect(Number((await db.query("SELECT chat.file_transfer_usage('upload','group',$1) AS n",[group])).rows[0].n)).toBe(128)
+  })
+  it('registers only an immutable service commitment; size, SHA and key changes cannot overwrite a ready generation',async()=>{
+    const {transfer_id:id}=await request();await accept(id);await service()
+    expect((await fails(COMMIT,[id,owner,cipherSha,127,key])).hint).toBe('file_transfer_conflict')
+    expect((await fails(COMMIT,[id,owner,cipherSha,128,'invalid'])).hint).toBe('file_transfer_conflict')
+    await db.query(COMMIT,[id,owner,cipherSha,128,key]);await db.query(COMMIT,[id,owner,cipherSha,128,key])
+    expect((await fails(COMMIT,[id,owner,sha,128,key])).hint).toBe('file_transfer_conflict')
+    expect((await fails(COMMIT,[id,owner,cipherSha,128,Buffer.alloc(32,8).toString('base64')])).hint).toBe('file_transfer_conflict')
+    await user()
+    expect((await fails(COMMIT,[id,owner,cipherSha,128,key])).code).toBe('42501')
+  })
+  it('uses the same download reservation and service-only key route, restoring impersonation context after success or refusal',async()=>{
+    const transfer=await ready(),id=randomUUID(),row=await download(id)
+    expect(row).toMatchObject({status:'ready',bucket_id:'temporary',transfer_id:transfer,plain_size_bytes:123,size_bytes:128,ciphertext_sha256:cipherSha})
+    expect(row.data_key).toBeUndefined()
+    await service()
+    const claims=(await db.query("SELECT current_setting('request.jwt.claims') AS claims")).rows[0].claims
+    expect(await getKey(id)).toBe(key)
+    expect((await db.query("SELECT current_setting('request.jwt.claims') AS claims")).rows[0].claims).toBe(claims)
+    expect((await fails('SELECT chat.file_temporary_key_for($1,$2)',[id,owner])).hint).toBe('file_transfer_denied')
+    expect((await db.query("SELECT current_setting('request.jwt.claims') AS claims")).rows[0].claims).toBe(claims)
+    await user(member)
+    expect((await fails('SELECT chat.file_temporary_key_for($1,$2)',[id,member])).code).toBe('42501')
+    expect(await download(id)).toEqual(row)
+  })
+  it('rechecks the exact message ACL when taking a key and never lets a replacement reference reuse a download identity',async()=>{
+    await service();const envelope=(await db.query('SELECT chat.workspace_version_envelope($1,1) AS e',[item])).rows[0].e
+    await user();const message=randomUUID()
+    await db.query(`SELECT * FROM chat.send_message_idempotent($1,$2,$3,'{}',$4,'attachment',NULL,NULL,false,false,NULL,$5,1)`,[message,group,owner,envelope,item])
+    const {transfer_id:id}=await request(randomUUID(),{message_id:message});await accept(id);await service();await db.query(COMMIT,[id,owner,cipherSha,128,key])
+    const downloadId=randomUUID();await download(downloadId,{message_id:message})
+    await user(member)
+    expect((await fails(DOWNLOAD,[{item_id:item},member,downloadId])).hint).toBe('file_transfer_conflict')
+    await service();await db.query('UPDATE chat.messages SET retracted_at=now() WHERE id=$1',[message])
+    expect((await fails('SELECT chat.file_temporary_key_for($1,$2)',[downloadId,member])).hint).toBe('file_transfer_denied')
+  })
+  it('denies new signing and keys after removal, unbinding, a new version or policy closure, without refunding issued bytes',async()=>{
+    const transfer=await ready(),id=randomUUID();await download(id);await service()
+    await db.query('DELETE FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2',[group,member])
+    expect((await fails('SELECT chat.file_temporary_key_for($1,$2)',[id,member])).hint).toBe('file_transfer_denied')
+    expect(await download()).toEqual({status:'gone'})
+    await service();expect((await db.query('SELECT state,bytes FROM chat.file_transfer_reservations WHERE id=$1',[id])).rows[0]).toEqual({state:'issued',bytes:'128'})
+    await user();await publish({8:1,4:'ef'.repeat(32)})
+    expect((await fails('SELECT chat.file_temporary_accept($1,128)',[transfer])).hint).toBe('file_transfer_denied')
+  })
+  it('makes read-once generations private to one download and treats completion as retention only',async()=>{
+    await user();await db.query(POLICY,[group,device,'root',false,true,'read-once'])
+    await ready();const id=randomUUID(),row=await download(id)
+    expect(row.status).toBe('ready');expect((await download()).status).toBe('pending')
+    expect(await getKey(id)).toBe(key)
+    await user(member);await db.query('SELECT chat.file_temporary_read_complete($1,$2)',[id,member])
+    await service()
+    expect((await db.query('SELECT state,bytes FROM chat.file_transfer_reservations WHERE id=$1',[id])).rows[0]).toEqual({state:'issued',bytes:'128'})
+    expect((await fails('SELECT chat.file_temporary_key_for($1,$2)',[id,member])).hint).toBe('file_transfer_denied')
+  })
+  it('refuses a last-byte download overdraft before binding key context',async()=>{
+    await ready();await service();await db.query("UPDATE chat.file_transfer_limits SET settings=settings||'{\"download_account_bytes\":127}'")
+    const id=randomUUID();await user(member)
+    expect((await fails(DOWNLOAD,[{item_id:item},member,id])).hint).toBe('file_transfer_account_download_full')
+    await service();expect((await db.query('SELECT id FROM chat.file_transfer_reservations WHERE id=$1',[id])).rows).toEqual([])
+  })
+})

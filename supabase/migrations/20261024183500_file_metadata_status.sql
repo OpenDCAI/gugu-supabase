@@ -28,3 +28,10 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION chat.file_resolve_as(jsonb,text) FROM PUBLIC,anon,authenticated;
 GRANT EXECUTE ON FUNCTION chat.file_resolve_as(jsonb,text) TO authenticated;
+
+-- The existing minute tick must discover expired files even when its GC queue is empty.
+DO $tick$ DECLARE definition text; fence text:='IF NOT EXISTS (SELECT 1 FROM chat.file_blob_gc g WHERE g.status IN'; BEGIN
+    SELECT pg_get_functiondef('chat.file_blob_gc_kick()'::regprocedure) INTO definition;
+    IF position(fence IN definition)=0 THEN RAISE EXCEPTION 'Missing GC scheduler fence'; END IF;
+    EXECUTE replace(definition,fence,'PERFORM chat.file_transfer_expire(500);'||chr(10)||'    '||fence);
+END $tick$;

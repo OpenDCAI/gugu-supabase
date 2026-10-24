@@ -107,7 +107,7 @@ describe('non-project idle expiry, not quota eviction',()=>{
   it('excludes project-bound groups using the authoritative project registry',async()=>{
     const file=await upload();await age(file.stored)
     const device=randomUUID()
-    await db.query('INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,$3,'fixture','linux')',[device,owner,'fixture'])
+    await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,$3,'fixture','linux')",[device,owner,'fixture'])
     await db.query("INSERT INTO identity.device_projects(device_id,user_id,local_project_id,name,root_path,created_at,chat_id) VALUES($1,$2,'root','fixture','/fixture',now(),$3)",[device,owner,group])
     expect(await expire()).toBe(0)
     expect((await state(file.stored)).expired_at).toBeNull()

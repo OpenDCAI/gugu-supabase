@@ -94,6 +94,11 @@ describe('project local metadata, exact references and read-only host ownership'
     expect(await resolve({item_id:item})).toMatchObject({version:2,file_name:'new.bin',sha256:'cd'.repeat(32),size_bytes:456})
     expect(await resolve({item_id:item,version:1})).toMatchObject({version:1,file_name:'file.bin',sha256:sha,size_bytes:123})
     expect(await resolve({item_id:item,version:3})).toEqual({status:'gone'})
+    await service()
+    expect((await db.query('SELECT n,device_version,blob_id,inline_text FROM chat.workspace_item_versions WHERE item_id=$1',[item])).rows)
+      .toEqual([{n:1,device_version:1,blob_id:null,inline_text:null}])
+    expect((await fails("INSERT INTO chat.workspace_item_versions(item_id,n,content_type) VALUES($1,99,$2)",[item,type])).code).toBe('23514')
+    expect((await fails("INSERT INTO chat.workspace_item_versions(item_id,n,device_version,content_type) VALUES($1,99,98,$2)",[item,type])).code).toBe('23514')
   })
   it('preserves the real message pin and refuses retracted or hidden messages even when an item is readable',async()=>{
     await publish()

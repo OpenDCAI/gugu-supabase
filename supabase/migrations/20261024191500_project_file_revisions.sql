@@ -27,6 +27,22 @@ ALTER TABLE chat.file_device_revisions ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON chat.file_project_policies,chat.file_device_revisions FROM PUBLIC,anon,authenticated;
 GRANT ALL ON chat.file_project_policies,chat.file_device_revisions TO service_role;
 
+-- Keep the existing version list and message pinning, with one valid body provider per snapshot.
+ALTER TABLE chat.workspace_item_versions ADD COLUMN device_version integer;
+ALTER TABLE chat.workspace_item_versions ADD FOREIGN KEY(item_id,device_version) REFERENCES chat.file_device_revisions(item_id,version) ON DELETE CASCADE;
+ALTER TABLE chat.workspace_item_versions DROP CONSTRAINT workspace_item_versions_one_body;
+ALTER TABLE chat.workspace_item_versions ADD CONSTRAINT workspace_item_versions_one_body CHECK(
+    num_nonnulls(inline_text,blob_id,device_version)=1 AND (device_version IS NULL OR device_version=n));
+CREATE FUNCTION chat.file_device_snapshot() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+BEGIN
+    IF NEW.blob_id IS NULL AND NEW.inline_text IS NULL THEN
+        SELECT version INTO NEW.device_version FROM chat.file_device_revisions WHERE item_id=NEW.item_id AND version=NEW.n;
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER file_device_snapshot BEFORE INSERT ON chat.workspace_item_versions FOR EACH ROW EXECUTE FUNCTION chat.file_device_snapshot();
+
 CREATE FUNCTION chat.file_project_policy_as(p_chat text,p_device text,p_project text,p_upload boolean,p_temporary boolean,p_retention text)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
 DECLARE g text:=chat.workspace_require_room_member(p_chat,auth.uid()::text); p chat.file_project_policies%ROWTYPE;
@@ -90,7 +106,8 @@ END $$;
 CREATE FUNCTION chat.file_device_read_only() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
 BEGIN
-    IF auth.uid() IS NOT NULL AND EXISTS(SELECT 1 FROM chat.file_device_revisions WHERE item_id=OLD.id)
+    IF auth.uid() IS NOT NULL AND EXISTS(SELECT 1 FROM chat.chats WHERE id=OLD.chat_id)
+       AND EXISTS(SELECT 1 FROM chat.file_device_revisions WHERE item_id=OLD.id)
        AND NOT EXISTS(SELECT 1 FROM chat.file_project_policies p JOIN identity.device_projects dp
            ON dp.device_id=p.host_device_id AND dp.local_project_id=p.host_project_id AND dp.chat_id=p.chat_id
            JOIN identity.gugu_devices d ON d.device_id=dp.device_id
@@ -172,8 +189,8 @@ BEGIN
               AND r.expired_at IS NOT NULL) THEN 'expired' ELSE 'ready' END);
 END $$;
 REVOKE ALL ON FUNCTION chat.file_project_policy_as(text,text,text,boolean,boolean,text),chat.file_project_policy_for(text,text),
-    chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid),chat.file_device_read_only(),
+    chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid),chat.file_device_read_only(),chat.file_device_snapshot(),
     chat.workspace_version_envelope(uuid,integer),chat.file_resolve_as(jsonb,text) FROM PUBLIC,anon,authenticated;
 GRANT EXECUTE ON FUNCTION chat.file_project_policy_as(text,text,text,boolean,boolean,text),chat.file_project_policy_for(text,text),
     chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid),chat.file_resolve_as(jsonb,text) TO authenticated;
-GRANT EXECUTE ON FUNCTION chat.workspace_version_envelope(uuid,integer),chat.file_device_read_only() TO service_role;
+GRANT EXECUTE ON FUNCTION chat.workspace_version_envelope(uuid,integer),chat.file_device_read_only(),chat.file_device_snapshot() TO service_role;

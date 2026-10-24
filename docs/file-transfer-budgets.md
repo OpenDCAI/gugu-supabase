@@ -75,7 +75,11 @@ An expired upload policy plus HEAD 404 is insufficient to prove an accepted uplo
 
 ## Operational rollout and validation
 
-Roll out the incremental release, service and compatible client together. Do not mutate the foundation or an installed migration ledger. A missing deployment setting, inventory or provider capability must fail visibly. Pause first if rolling back; do not restore an unbudgeted signer while live issued capabilities or held storage remain unaccounted for.
+Ship the client-only request preparation first: every upload sends size, actor, explicit chat/null and a request UUID through the same existing helper. The previous HTTP entry accepts these additive fields without a schema or RPC upgrade. Verify both release channels before enabling this enforcing service. Publishing a new client does not prove every installed client upgraded: inactive old clients remain unobservable and will fail after the explicit protocol cutover. The affected path includes managed chat/file, placement/replacement, delegated sends, private task handoff and mobile Agent uploads; unrelated direct media uploads are separate.
+
+Keep the enforcing release staged until compatible clients, trusted inventory, quota configuration, readable bucket versioning and enforced edge request limits are ready. Record the cutover time, supported minimum versions and observed old-protocol activity. A legacy empty-body request counter must be measured at the existing service boundary before claiming an active cohort has migrated; HTTP 400 totals alone do not identify a protocol or count devices. No client heartbeat or second transport path is needed. There is no bounded failure window for clients that never update.
+
+Do not mutate the foundation or an installed migration ledger. Missing configuration or provider capability must fail visibly. Pause first if rolling back; do not restore an unbudgeted signer while live issued capabilities or held storage remain unaccounted for.
 
 Prove real concurrent last-byte admission for all three download scopes and upload storage; identical retries charge once. Prove full storage refuses before a provider permit, unauthorized/repeated commits cannot publish bytes, one account's exhaustion leaves another account usable with shared headroom, and wrong/duplicate provider events cannot refund or partially apply. Existing protection changes are listed in [the test migration audit](file-transfer-test-migration.md).
 

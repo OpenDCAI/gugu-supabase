@@ -3,7 +3,7 @@ import pg from 'pg'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 const url=process.env.GUGU_INTEGRATION_DATABASE_URL??''
-let db:pg.Client, owner:string, member:string, outsider:string, group:string, device:string, otherDevice:string, item:string
+let db:pg.Client, owner:string, member:string, outsider:string, hiddenReader:string, group:string, device:string, otherDevice:string, item:string
 const sha='ab'.repeat(32), type='application/octet-stream'
 const POLICY='SELECT chat.file_project_policy_as($1,$2,$3,$4,$5,$6) AS r'
 const PUBLISH='SELECT chat.file_device_publish($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) AS r'
@@ -32,12 +32,12 @@ beforeAll(async()=>{
 afterAll(async()=>{await db?.end()})
 beforeEach(async()=>{
   await db.query('BEGIN')
-  ;[owner,member,outsider,group,device,otherDevice,item]=Array.from({length:7},randomUUID)
-  for(const id of [owner,member,outsider]) await db.query(`INSERT INTO auth.users(id,aud,role,email,raw_app_meta_data,raw_user_meta_data,created_at,updated_at)
+  ;[owner,member,outsider,hiddenReader,group,device,otherDevice,item]=Array.from({length:8},randomUUID)
+  for(const id of [owner,member,outsider,hiddenReader]) await db.query(`INSERT INTO auth.users(id,aud,role,email,raw_app_meta_data,raw_user_meta_data,created_at,updated_at)
     VALUES($1,'authenticated','authenticated',$2,'{"provider":"email"}','{}',now(),now())`,[id,id+'@project-files.invalid'])
   await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','project revision',$2)",[group,owner])
   // Membership predates binding: existing project members retain their normal read scope.
-  await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner'),($1,$3,'member')",[group,owner,member])
+  await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner'),($1,$3,'member'),($1,$4,'member')",[group,owner,member,hiddenReader])
   for(const [id,account] of [[device,owner],[otherDevice,member]]) await db.query(`INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform)
     VALUES($1,$2,'fixture','fixture','linux')`,[id,account])
   await db.query(`INSERT INTO identity.device_projects(device_id,user_id,local_project_id,name,root_path,created_at,chat_id)
@@ -114,7 +114,7 @@ describe('project local metadata, exact references and read-only host ownership'
     expect(await resolve({message_id:id})).toEqual({status:'gone'})
     await user()
     const hidden=randomUUID()
-    await db.query('INSERT INTO chat.messages(id,chat_id,sender_user_id,content,is_whisper,to_user_ids) VALUES($1,$2,$3,$4,true,$5)',[hidden,group,owner,'private', [owner]])
+    await db.query('INSERT INTO chat.messages(id,chat_id,sender_user_id,content,is_whisper,to_user_ids) VALUES($1,$2,$3,$4,true,$5)',[hidden,group,owner,'private', [hiddenReader]])
     expect(await resolve({message_id:hidden})).toEqual({status:'gone'})
     expect(await resolve({item_id:item})).toMatchObject({status:'ready'})
   })

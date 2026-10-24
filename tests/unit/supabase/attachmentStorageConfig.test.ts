@@ -57,7 +57,7 @@ describe('attachment storage configuration', () => {
   })
 
   it('reads attachments already stored on OSS through CDN links', async () => {
-    const config = attachmentStorageConfig(from(OSS))
+    const config = attachmentStorageConfig(from({...OSS,CDN_AUTH_TTL_SECONDS:'1800',CDN_REQUEST_LIMIT_BITS_PER_SECOND:'819200'}))
     if (config.kind !== 'oss') throw new Error('expected OSS')
     const row = {
       item_id: null, version: null, message_id: 'm1', current_version: null, chat_id: 'c1', file_name: 'a.png',
@@ -65,9 +65,20 @@ describe('attachment storage configuration', () => {
     }
     const deps = {
       objects: ossObjectStorage({ oss: config.oss, cdn: config.cdn, fetch: async () => new Response(null, { status: 500 }) }),
-      userRpc: async (fn: string) => ({ data: fn === 'file_urls_as' ? [row] : null, error: null }),
+      userRpc: async (fn: string, args: Record<string, unknown>) => {
+        expect(fn).toBe('file_transfer_download_as')
+        expect(args.p_ref).toEqual({ message_id: 'm1' })
+        expect(args.p_as).toBe('u1')
+        return { data: { ...row, status: 'ready', download_id: args.p_id, transfer_id: null,
+          signed_at: '2026-10-21T00:00:00Z', expires_at: '2026-10-21T00:01:00Z' }, error: null }
+      },
+      serviceRpc: async (fn: string) => {
+        expect(fn).toBe('file_transfer_settings')
+        return { data: { download_link_bits_per_second: 819200 }, error: null }
+      },
       storageSignedUrl: async () => { throw new Error('OSS rows must not be signed by Supabase Storage') },
       now: () => new Date('2026-10-21T00:00:00Z'),
+      uuid: () => '11111111-1111-4111-8111-111111111111',
     } as unknown as AttachmentsDeps
     const { urls } = await handleUrls(deps, 'u1', { refs: [{ message_id: 'm1' }] })
     expect(urls).toHaveLength(1)

@@ -17,6 +17,7 @@ import {
 
 import { ossObjectStorage, supabaseObjectStorage } from '../_shared/attachment-object-storage.ts'
 import { type AttachmentStorageConfig, attachmentStorageConfig, StorageConfigError } from '../_shared/attachment-storage-config.ts'
+import { handleUsageImport,handleStorageInventory } from '../_shared/file-transfer-core.ts'
 
 const env = (key: string): string => Deno.env.get(key)?.trim() ?? ''
 
@@ -61,6 +62,15 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
     auth: { persistSession: false, autoRefreshToken: false },
   })
   const asService = createClient(url, env('SUPABASE_SERVICE_ROLE_KEY'), { db: { schema: 'chat' }, auth: { persistSession: false } })
+  const signStorage=async(bucket:string,object:string,seconds:number,trafficBits?:number)=>{
+    // Storage signing has no native per-connection throttle. Self-hosters configure it at their uncached gateway.
+    if(seconds!==60||!trafficBits||Number(env('SUPABASE_STORAGE_REQUEST_LIMIT_BITS_PER_SECOND'))!==trafficBits) {
+      throw new Refusal(503,'not_configured','An uncached, rate-limited Storage gateway must be configured before download signing')
+    }
+    const {data,error}=await asService.storage.from(bucket).createSignedUrl(object,seconds)
+    if(error||!data?.signedUrl) throw new Error('Could not sign a managed Storage download')
+    return publicStorageUrl(data.signedUrl,url)
+  }
   return {
     objects: storage.kind === 'oss'
       ? ossObjectStorage({ oss: storage.oss, cdn: storage.cdn, fetch: (input, init) => fetch(input, init) })
@@ -72,11 +82,7 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
           if (error || !data?.signedUrl) throw new Error('could not sign attachment upload')
           return publicStorageUrl(data.signedUrl, url)
         },
-        signDownload: async (key, seconds) => {
-          const { data, error } = await asService.storage.from(storage.bucket).createSignedUrl(key, seconds)
-          if (error || !data?.signedUrl) throw new Error('could not sign attachment download')
-          return publicStorageUrl(data.signedUrl, url)
-        },
+        signDownload: (key,seconds,traffic)=>signStorage(storage.bucket,key,seconds,traffic),
       }),
     fetch: (input, init) => fetch(input, init),
     userRpc: async (fn, args) => {
@@ -87,11 +93,7 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
       const { data, error } = await asService.rpc(fn, args)
       return { data, error: error ? { message: error.message, hint: error.hint, code: error.code } : null }
     },
-    storageSignedUrl: async (bucket, object, seconds) => {
-      const { data, error } = await asService.storage.from(bucket).createSignedUrl(object, seconds)
-      if (error || !data?.signedUrl) throw new Refusal(500, 'failed', `could not sign ${bucket}/${object}: ${error?.message ?? 'no url'}`)
-      return publicStorageUrl(data.signedUrl, url)
-    },
+    storageSignedUrl:signStorage,
     storageRemove: async (bucket, object) => {
       const { error } = await asService.storage.from(bucket).remove([object])
       if (error) throw new Error(`could not remove ${bucket}/${object}: ${error.message}`)
@@ -122,6 +124,13 @@ Deno.serve(async (request) => {
   const authorization = request.headers.get('Authorization') ?? ''
   try {
     const deps = depsFor(authorization, storage)
+    if (route === 'usage-import'||route==='storage-inventory') {
+      if (!sameSecret(authorization.replace(/^Bearer\s+/i,''),env('SUPABASE_SERVICE_ROLE_KEY'))) {
+        return json({error:'denied',message:'Usage ingestion is restricted to the service'},401)
+      }
+      const body=await request.json()
+      return json(await (route==='usage-import'?handleUsageImport(deps.serviceRpc,body):handleStorageInventory(deps.serviceRpc,body)))
+    }
     if (route === 'gc') {
       if (!sameSecret(authorization.replace(/^Bearer\s+/i, ''), env('SUPABASE_SERVICE_ROLE_KEY'))) {
         return json({ error: 'denied', message: 'gc is the server\'s own job' }, 401)
@@ -149,7 +158,7 @@ Deno.serve(async (request) => {
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
     switch (route) {
       case 'upload':
-        return json(await handleUpload(deps, who.user.id))
+        return json(await handleUpload(deps, who.user.id,body))
       case 'session-commit':
         return json({ attachment: await handleSessionCommit(deps, who.user.id, body) })
       case 'session-revoke':
@@ -169,7 +178,7 @@ Deno.serve(async (request) => {
     }
   } catch (error) {
     if (error instanceof Refusal) return json({ error: error.code, message: error.message }, error.status)
-    log('failed', { route, error: String(error) })
+    log('failed', { route, error_type:error instanceof Error?error.name:'unknown' })
     return json({ error: 'failed', message: 'attachments failed; try again' }, 500)
   }
 })

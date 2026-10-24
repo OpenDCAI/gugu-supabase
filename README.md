@@ -35,6 +35,8 @@ The topic-resource release requires coordinated file-service and client updates;
 
 Attachment upload, commit and signed download use your own Supabase Storage.
 
+Managed transfers require explicit storage/download budgets, trusted inventory and compatible provider limits; see [file transfer budgets and operations](docs/file-transfer-budgets.md). Upload requests must supply their declared size, actor and group scope. Missing configuration refuses issuance, and short bearer URLs are not a hard total-byte cap.
+
 Collaborative file editing needs the long-running Node service in `services/files`; Supabase Cloud does not run it for you. It uses a dedicated `gugu_files` database role, the project's JWKS and an HTTPS/WebSocket endpoint; see `services/files/src/config.mjs` and `docs/files-service.md`.
 
 ## Local verification

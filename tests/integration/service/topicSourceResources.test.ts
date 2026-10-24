@@ -271,16 +271,37 @@ describe('topics use one source resource container', () => {
     await db.query('ROLLBACK TO SAVEPOINT placement')
   })
 
-  it('legacy Storage keys keep their bytes address but use source membership for read/write/delete', async () => {
+  it('legacy keys keep their address; managed reads/uploads use source membership and direct Storage access is denied', async () => {
     const pointer = `${topic}/${owner}/${randomUUID()}.txt`
     await db.query(`INSERT INTO storage.objects(bucket_id,name) VALUES ('workspace',$1)`, [pointer])
     const [file] = await rpc(owner, 'SELECT * FROM chat.workspace_create_file_as($1,$2,$3,$4,$5,$6)', [topic, owner, 'old.txt', 'text/plain', 3, pointer])
     expect(file).toMatchObject({ chat_id: source, pointer })
-    expect(await rpc(reader, `SELECT name FROM storage.objects WHERE bucket_id='workspace' AND name=$1`, [pointer])).toEqual([{ name: pointer }])
+    // The old positive membership case moves to the common signing authorization, never a public byte route.
+    const ref={item_id:file.id,version:1}
+    expect((await rpc(reader,'SELECT * FROM chat.file_urls_as($1,$2)',[JSON.stringify([ref]),reader]))[0]).toMatchObject({chat_id:source,bucket_id:'workspace',object_name:pointer})
+    expect(await rpc(outsider,'SELECT * FROM chat.file_urls_as($1,$2)',[JSON.stringify([ref]),outsider])).toEqual([])
+    const occupied=Number((await db.query("SELECT chat.file_transfer_usage('upload','global','*') AS n")).rows[0].n)
+    await db.query("INSERT INTO chat.file_transfer_limits(scope,scope_id,settings) VALUES('global','*',$1)", [{
+      inventory_ready:true,storage_global_bytes:occupied+1000,storage_account_bytes:1000,storage_group_bytes:1000,
+      download_global_bytes:1000,download_account_bytes:1000,download_group_bytes:1000,
+      file_max_bytes:100,upload_permit_seconds:120,read_lease_seconds:120,
+      sign_window_seconds:60,sign_account_count:100,sign_group_count:100,
+    }])
+    const download=randomUUID()
+    expect((await rpc(reader,'SELECT chat.file_transfer_download_as($1,$2,$3) AS r',[ref,reader,download]))[0].r)
+      .toMatchObject({status:'ready',chat_id:source,object_name:pointer,download_id:download})
+    expect((await db.query('SELECT chat_id FROM chat.file_transfer_reservations WHERE id=$1',[download])).rows).toEqual([{chat_id:source}])
+    expect(await rpc(reader, `SELECT name FROM storage.objects WHERE bucket_id='workspace' AND name=$1`, [pointer])).toEqual([])
     expect(await rpc(outsider, `SELECT name FROM storage.objects WHERE bucket_id='workspace' AND name=$1`, [pointer])).toEqual([])
     const fresh = `${topic}/${reader}/${randomUUID()}.txt`
-    expect((await rpc(reader, `INSERT INTO storage.objects(bucket_id,name) VALUES ('workspace',$1) RETURNING name`, [fresh]))[0].name).toBe(fresh)
-    expect((await rpc(reader, `DELETE FROM storage.objects WHERE bucket_id='workspace' AND name=$1 RETURNING name`, [fresh]))[0].name).toBe(fresh)
+    const upload=(await rpc(reader,'SELECT chat.file_managed_upload_as($1,$2,$3,3) AS r',[randomUUID(),topic,reader]))[0].r
+    await rpc(reader,'SELECT chat.file_managed_upload_scope($1,$2,$3)',[upload.staging_key,reader,topic])
+    expect((await db.query('SELECT chat_id FROM chat.file_transfer_uploads WHERE staging_key=$1',[upload.staging_key])).rows).toEqual([{chat_id:source}])
+    expect((await denied(outsider,'SELECT chat.file_managed_upload_as($1,$2,$3,3)',[randomUUID(),topic,outsider])).hint).toBe('workspace_not_member')
+    expect((await denied(reader,`INSERT INTO storage.objects(bucket_id,name) VALUES ('workspace',$1)`,[fresh])).message).toMatch(/row-level security/)
+    await db.query("INSERT INTO storage.objects(bucket_id,name) VALUES('workspace',$1)",[fresh])
+    expect(await rpc(reader, `DELETE FROM storage.objects WHERE bucket_id='workspace' AND name=$1 RETURNING name`, [fresh])).toEqual([])
+    expect((await db.query("SELECT name FROM storage.objects WHERE bucket_id='workspace' AND name=$1",[fresh])).rows).toEqual([{name:fresh}])
     expect(await rpc(owner, `DELETE FROM storage.objects WHERE bucket_id='workspace' AND name=$1 RETURNING name`, [pointer])).toEqual([])
     expect((await denied(outsider, `INSERT INTO storage.objects(bucket_id,name) VALUES ('workspace',$1)`, [`${topic}/${outsider}/denied.txt`])).message).toMatch(/row-level security/)
   })

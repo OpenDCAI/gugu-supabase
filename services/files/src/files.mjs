@@ -328,18 +328,7 @@ export function createFileService(config, { log, pool: givenPool }) {
     })
   }
 
-  // ── 踢人 ────────────────────────────────────────────────────────────────────
-  function kickMember(/** @type {string} */ chatId, /** @type {string} */ userId) {
-    for (const doc of hp().documents.values()) {
-      for (const conn of doc.getConnections()) {
-        if (conn.context?.chatId === chatId && conn.context?.actorId === userId) {
-          conn.close({ code: 4403, reason: 'removed-from-group' })
-          stats.kicks.removed++
-          log.info('kicked removed member', { chatId, userId, doc: doc.name })
-        }
-      }
-    }
-  }
+  // ── 撤销文件访问 ─────────────────────────────────────────────────────────────
   function markDeleted(/** @type {string} */ itemId) {
     for (const [name, info] of docs) {
       if (info.itemId !== itemId) continue
@@ -369,30 +358,41 @@ export function createFileService(config, { log, pool: givenPool }) {
       const alive = new Set(rows.map((r) => r.id))
       for (const id of ids) if (!alive.has(id)) markDeleted(id)
     }
-    const pairs = []
+    const connections = []
     for (const doc of hp().documents.values()) {
       for (const conn of doc.getConnections()) {
-        if (conn.context?.chatId && conn.context?.actorId) pairs.push([conn.context.chatId, conn.context.actorId])
+        const c = conn.context
+        if (c?.itemId && c?.userId && c?.actorId) connections.push({ conn, itemId: c.itemId, userId: c.userId, actorId: c.actorId })
       }
     }
-    if (!pairs.length) return
+    if (!connections.length) return
+    // The item's container may have changed since authentication. Reuse the
+    // database's current item + delegated-actor authorization in one batch;
+    // cached chat membership must neither preserve nor revoke access on its own.
     const { rows } = await pool.query(
-      `SELECT m.chat_id, m.user_id FROM chat.chat_members m
-         JOIN unnest($1::text[], $2::text[]) AS p(chat_id, user_id) ON p.chat_id = m.chat_id AND p.user_id = m.user_id`,
-      [pairs.map((p) => p[0]), pairs.map((p) => p[1])],
+      `SELECT p.item_id::text, p.user_id, p.actor_id, g.chat_id
+         FROM unnest($1::uuid[], $2::text[], $3::text[]) AS p(item_id, user_id, actor_id)
+         CROSS JOIN LATERAL chat.files_authorize(p.item_id, p.user_id, p.actor_id) g`,
+      [connections.map((c) => c.itemId), connections.map((c) => c.userId), connections.map((c) => c.actorId)],
     )
-    const key = (/** @type {string} */ chatId, /** @type {string} */ userId) => `${chatId}\u0000${userId}`
-    const still = new Set(rows.map((r) => key(r.chat_id, r.user_id)))
-    const connected = new Map(pairs.map(([chatId, userId]) => [key(chatId, userId), [chatId, userId]]))
-    for (const [k, [chatId, userId]] of connected) if (!still.has(k)) kickMember(chatId, userId)
+    const key = (/** @type {string} */ itemId, /** @type {string} */ userId, /** @type {string} */ actorId) => `${itemId}\u0000${userId}\u0000${actorId}`
+    const allowed = new Map(rows.map((r) => [key(r.item_id, r.user_id, r.actor_id), r.chat_id]))
+    for (const { conn, itemId, userId, actorId } of connections) {
+      const chatId = allowed.get(key(itemId, userId, actorId))
+      if (chatId) conn.context.chatId = chatId
+      else {
+        conn.close({ code: 4403, reason: 'removed-from-group' })
+        stats.kicks.removed++
+        log.info('revoked file access', { itemId, actorId })
+      }
+    }
   }
 
   // ── LISTEN ──────────────────────────────────────────────────────────────────
   const listener = { client: /** @type {pg.Client | null} */ (null), up: false, stopped: false, timer: /** @type {NodeJS.Timeout | null} */ (null) }
   function onNotification(/** @type {pg.Notification} */ { channel, payload = '' }) {
     if (channel === 'files_member_removed') {
-      const at = payload.lastIndexOf(':')
-      if (at > 0) kickMember(payload.slice(0, at), payload.slice(at + 1))
+      recheckAll().catch((error) => log.error('member removal recheck failed', errorFields(error)))
     } else if (channel === 'files_item_deleted') {
       if (isUuid(payload)) markDeleted(payload.toLowerCase())
     } else if (channel === 'files_item_marked') {

@@ -39,7 +39,7 @@ const DATABASE_URL = (
 const OWNER = '62640000-0000-4000-8000-000000000001'
 const AGENT = 'agent-it-6264'
 const DEVICE = 'dev-it-6264'
-const GROUP = 'group-it-6264'
+const GROUP = '62640000-0000-4000-8000-000000000003'
 
 let database: DatabaseClient
 

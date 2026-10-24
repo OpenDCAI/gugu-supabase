@@ -29,6 +29,8 @@ Re-running only accepts an installation with matching versions and digests; an u
 - New API functions are closed to clients by default and granted explicitly in the release that adds them.
 - `identity.machine_limits_for(uuid)` is the installation policy hook; the community edition uses installation-level settings. Device ownership, group membership, message and file permissions are all enforced by the database.
 
+The topic-resource release requires coordinated file-service and client updates; see [topic resource containers and upgrade behavior](docs/topic-resources.md).
+
 ## File service
 
 Attachment upload, commit and signed download use your own Supabase Storage.

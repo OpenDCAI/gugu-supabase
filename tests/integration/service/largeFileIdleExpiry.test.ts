@@ -240,6 +240,7 @@ describe('non-project idle expiry, not quota eviction',()=>{
       ['chat.file_blob_take(uuid)',false],
       ['chat.file_transfer_expire(integer)',false],
     ] as const
+    expect((await db.query("SELECT to_regprocedure('chat.file_transfer_object_gone(text,text)') AS obsolete")).rows[0].obsolete).toBeNull()
     for(const [fn,allowed] of rules) {
       const r=(await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS anon,has_function_privilege('authenticated',$1,'EXECUTE') AS client",[fn])).rows[0]
       expect(r,fn).toEqual({anon:false,client:allowed})

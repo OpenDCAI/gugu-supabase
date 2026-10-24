@@ -69,7 +69,7 @@ If logs are late or incomplete, keep outstanding reservations and pause issuance
 
 Uploads reserve twice the enforceable maximum while immutable staging and the final object coexist. Successful registration charges the actual final bytes and retains the remaining staging hold. Reusing an issued upload UUID cannot move actor/group/maximum or mint a fresh lifetime. Committing is idempotent and cannot create a second registration.
 
-The existing blob GC remains the single final-object deletion path. It confirms physical deletion before recording `file_transfer_object_gone`. Do not release an in-progress deletion's capacity.
+The existing blob GC remains the single final-object deletion path. It confirms physical deletion before releasing inventory capacity. The idle-expiry extension records that change atomically inside `file_blob_gc_finish`. Do not release an in-progress deletion's capacity.
 
 An expired upload policy plus HEAD 404 is insufficient to prove an accepted upload cannot finish late. Do not automatically close staging on that evidence. Use trusted provider terminal-operation evidence, confirm physical absence, then call service-only `chat.file_managed_upload_closed(staging_key, evidence_reference)`. The reference is a short nonsecret audit identifier, not a URL or signature. The same operation releases abandoned never-registered reservations. If terminal finality cannot be established, retain the allowance and investigate; do not manufacture a refund. OSS lifecycle cleanup can remove old staging physically, but its asynchronous execution is not itself a receipt for a specific upload.
 

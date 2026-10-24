@@ -18,7 +18,7 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
 DECLARE s jsonb; threshold_bytes bigint; idle_seconds bigint; r record; n integer:=0;
 BEGIN
     IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 500 THEN RAISE EXCEPTION 'Invalid expiry batch size'; END IF;
-    PERFORM pg_advisory_xact_lock(hashtextextended('gugu:file-transfer:quota',0));
+    IF NOT pg_try_advisory_xact_lock(hashtextextended('gugu:file-transfer:quota',0)) THEN RETURN 0; END IF;
     SELECT settings INTO s FROM chat.file_transfer_limits WHERE scope='global' AND scope_id='*';
     -- Absent deployment policy preserves files; it never invents a deletion policy.
     IF NOT COALESCE(s ?& ARRAY['large_file_bytes','large_file_idle_seconds'],false) THEN RETURN 0; END IF;
@@ -121,7 +121,7 @@ BEGIN
     -- ◇ 转成悄悄话:指同一份字节,不进目标的文件夹。$new$),
         ('chat.file_blob_gc_claim(integer,integer)',
          $old$IF p_limit < 1 OR p_limit > 500 OR p_stale_seconds < 30 THEN$old$,
-         $new$PERFORM pg_advisory_xact_lock(hashtextextended('gugu:file-transfer:quota',0));
+         $new$IF NOT pg_try_advisory_xact_lock(hashtextextended('gugu:file-transfer:quota',0)) THEN RETURN; END IF;
     IF p_limit < 1 OR p_limit > 500 OR p_stale_seconds < 30 THEN$new$),
         ('chat.file_blob_gc_claim(integer,integer)',
          $old$UPDATE chat.file_blobs b SET state = 'deleting' WHERE b.id = r.blob_id;$old$,
@@ -177,3 +177,6 @@ GRANT EXECUTE ON FUNCTION chat.file_transfer_download_as(jsonb,text,uuid),
 GRANT EXECUTE ON FUNCTION chat.file_managed_upload_registered(text,text),
     chat.file_blob_register(text,text,text,bigint,text,integer,integer),
     chat.file_blob_gc_claim(integer,integer),chat.file_blob_gc_finish(uuid,uuid) TO service_role;
+
+-- Completion now owns this update atomically; remove the superseded service-only second step.
+DROP FUNCTION chat.file_transfer_object_gone(text,text);

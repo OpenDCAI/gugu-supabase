@@ -281,6 +281,16 @@ describe('temporary generations reuse managed budgets and private key issuance',
     await db.query("UPDATE chat.file_transfer_reservations SET expires_at=now()-interval '1 day' WHERE id=$1",[id])
     expect(Number((await db.query("SELECT chat.file_transfer_usage('upload','group',$1) AS n",[group])).rows[0].n)).toBe(128)
   })
+  it('uses the actual issued upload deadline after host acceptance, including a delayed acceptance',async()=>{
+    const {transfer_id:id}=await request();await service()
+    await db.query("UPDATE chat.file_temporary_transfers SET created_at=now()-interval '119 seconds' WHERE id=$1",[id])
+    const permit=await accept(id)
+    expect(Date.parse(permit.expires_at)-Date.parse(permit.signed_at)).toBe(120000)
+    await service();await db.query("UPDATE chat.file_temporary_transfers SET created_at=now()-interval '5 minutes' WHERE id=$1",[id])
+    expect(await expireTemporary()).toBe(0)
+    await db.query(COMMIT,[id,owner,cipherSha,128,key])
+    expect((await generation(id)).state).toBe('ready')
+  })
   it('registers only an immutable service commitment; size, SHA and key changes cannot overwrite a ready generation',async()=>{
     const {transfer_id:id}=await request();await accept(id);await service()
     expect((await fails(COMMIT,[id,owner,cipherSha,127,key])).hint).toBe('file_transfer_conflict')

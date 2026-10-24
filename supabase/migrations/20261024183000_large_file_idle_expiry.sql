@@ -101,7 +101,7 @@ BEGIN
     UPDATE chat.file_transfer_uploads SET blob_id=b.id WHERE staging_key=p_key;$new$),
         ('chat.file_blob_register(text,text,text,bigint,text,integer,integer)',
          $old$PERFORM chat.file_blob_take(v_blob.id);$old$,
-         $new$IF EXISTS(SELECT 1 FROM chat.file_transfer_storage WHERE blob_id=v_blob.id AND state='gone') THEN
+         $new$IF EXISTS(SELECT 1 FROM chat.file_transfer_storage o WHERE o.blob_id=v_blob.id AND o.state='gone') THEN
         -- Copy precedes registration; keep the old identity and verify the post-GC copy.
         v_created:=true;
     ELSE

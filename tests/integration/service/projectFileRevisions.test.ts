@@ -233,6 +233,18 @@ describe('temporary generations reuse managed budgets and private key issuance',
     expect((await db.query('SELECT chat.file_managed_upload_as($1,$2,$3,128) AS r',[randomUUID(),group,owner])).rows[0].r.max_bytes).toBe(128)
     expect((await request()).transfer_status).toBe('requested')
   })
+  it('wakes the existing host device channel with only the request id, not a renderer-only user bus',async()=>{
+    const id=randomUUID(),transfer=await request(id)
+    await db.query('RESET ROLE')
+    const events=(await db.query("SELECT id,topic,event,payload,private FROM realtime.messages WHERE event='files.transfer' AND payload->>'request_id'=$1",[transfer.transfer_id])).rows
+    // Realtime adds its own transport UUID; the application sends only the request id.
+    expect(events).toHaveLength(1)
+    expect(events[0].payload.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
+    expect(events).toEqual([{id:events[0].payload.id,topic:`gugu:${device}:rpc`,event:'files.transfer',payload:{id:events[0].payload.id,request_id:transfer.transfer_id},private:true}])
+    await request(id)
+    await db.query('RESET ROLE')
+    expect((await db.query("SELECT topic FROM realtime.messages WHERE event='files.transfer' AND payload->>'request_id'=$1",[transfer.transfer_id])).rows).toHaveLength(1)
+  })
   it('deduplicates retained generations but preserves request identity, device ownership and pending metadata secrecy',async()=>{
     const id=randomUUID(),first=await request(id),again=await request()
     expect(again.transfer_id).toBe(first.transfer_id)

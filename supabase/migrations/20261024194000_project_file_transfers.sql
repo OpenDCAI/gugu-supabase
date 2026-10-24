@@ -100,7 +100,7 @@ BEGIN
             INSERT INTO chat.file_temporary_transfers(id,item_id,version,chat_id,host_device_id,reader_account,reader_actor,source_ref,retention,object_name)
             VALUES(p_id,(r->>'item_id')::uuid,(r->>'version')::integer,r->>'chat_id',r->>'host_device_id',auth.uid()::text,actor,p_ref,p->>'retention',
                 'temporary/'||(r->>'chat_id')||'/'||(r->>'item_id')||'/'||(r->>'version')||'/'||(r->>'sha256')||'/'||p_id::text) RETURNING * INTO t;
-            PERFORM chat.send_user_event(jsonb_build_object('request_id',t.id),'files.transfer','gugu:user:'||(r->>'host_account_id')||':events',true);
+            PERFORM realtime.send(jsonb_build_object('request_id',t.id),'files.transfer','gugu:'||t.host_device_id||':rpc',true);
         END IF;
     END IF;
     RETURN r||jsonb_build_object('transfer_id',t.id,'transfer_status',t.state);

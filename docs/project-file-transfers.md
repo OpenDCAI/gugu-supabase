@@ -2,14 +2,20 @@
 
 Backend mechanisms are developed in separate commits. Client resolution and its product acceptance remain separate work; database and source tests do not prove desktop or Android behavior.
 
-| Runtime group | Approved behavior | Added / removed lines |
-| --- | --- | --- |
-| Policy, local revisions, metadata resolver and write guard | Project files default to local storage; a bound host publishes immutable versions; remote access is read-only | 198 / 0 |
-| Temporary requests, scoped host accept/commit, original download issuance and private key return | Upload only for a real authorized read; ciphertext stays on a private origin; shared storage/download budgets apply before permits | 342 / 9 |
-| Temporary retention and existing collector integration | Expiry and revocation clear keys; LRU applies only to temporary inventory; physical confirmation precedes capacity release | 81 / 2 |
-| Atomic composer publication | The existing public function coordinates revision creation and message sending in one transaction; message insertion retains its original RLS | 60 / 0 |
+The combined permanent-retention and project-transfer diff uses one shared resolver, quota ledger and collector. Runtime accounting against its integration base is:
 
-These runtime totals are relative to the permanent-file expiry base: 681 added, 11 removed, net 670. Tests, documentation and the generated Deno lock are reported separately. Existing version snapshots gain a constrained local-revision pointer, preserving exactly one body provider per version; no placeholder cloud blob stands in for a local file. Enabling proactive cloud upload permits the host's next version through the existing managed upload path, while remote mutations remain refused. Historical pinned local versions retain their original provider.
+| Code | Added / removed lines | Behavior |
+| --- | --- | --- |
+| Permanent expiry release | 189 / 0 | Idle expiry, existing receipt reupload and physical collection |
+| Shared metadata status release | 37 / 0 | ACL-checked display without signing or reserving downloads |
+| Local revision release | 198 / 0 | Bound-device identity, immutable revisions and read-only remote references |
+| Temporary transfer release | 252 / 0 | Authorized requests, host acceptance, private ciphertext and key handoff |
+| Temporary retention release | 76 / 0 | Renewal, revocation and temporary-only LRU through the existing collector |
+| Atomic publication release | 74 / 0 | Original message RLS and content-editor timestamps |
+| Shared function changes | 104 / 14 | Existing provider, metadata, admission, signing and collection routes |
+| **Combined runtime** | **930 / 14; net +916** | No additional worker or quota ledger |
+
+Tests, documentation, the integration runner and generated Deno lock are reported separately. Existing version snapshots gain a constrained local-revision pointer, preserving exactly one body provider per version; no placeholder cloud blob stands in for a local file. Enabling proactive cloud upload permits the host's next version through the existing managed upload path, while remote mutations remain refused. Historical pinned local versions retain their original provider.
 
 `file_project_policy_as` requires the actual project binding, device ownership and group administrator membership. Proactive upload defaults to false; temporary transfer and its retention are separate explicit settings. An unbound or removed project cannot resolve a local revision even if an obsolete policy survives. Absolute roots are not included in the file resolver response.
 
@@ -42,3 +48,15 @@ An unverified placeholder is registered in the existing blob table when the uplo
 The client implementation will have one resolver before any cloud metadata lookup: local loopback, the reader's already-open owner SSH link, then encrypted temporary cloud transfer. Expired cards and ordinary re-upload belong to the separate permanent-file expiry change, not this resolver change.
 
 The full contract runner isolates quota policy and next-idle-pass GC assertions from unrelated object-writing suites. The original GC concurrency suite still uses real concurrent database transactions, with every original assertion preserved. This separation does not replace or remove concurrency coverage: collection legitimately skips a busy global quota lock, so another suite's incidental writer cannot stand in for the test's intended idle pass.
+
+## One backend activation event
+
+The budget enforcement code is already part of the integration branch. Deploying any later function bundle, including this combined lifecycle change, activates that same enforcement. Do not schedule an intermediate deployment while a previous compatible function bundle remains active. The lifecycle rollout and budget reactivation are one switchover, gated by the same operator checklist:
+
+1. Inventory the versions of actually running desktop, mobile and per-account server processes, with fresh observations. A downloaded package or desired-version record is not evidence. Exercise upload, commit and verified download for every active ingress. All known active uploaders must send the complete bounded protocol; unknown and incompatible active processes block activation. Document the explicitly accepted cutoff for offline legacy clients.
+2. Review and write the complete global `chat.file_transfer_limits` settings while intake is held: storage/download global, account and group limits, file ceiling, permit lifetime, signing lifetime/counts, link throttle, expiry threshold/idle interval, warning threshold and temporary-group capacity. Keep `paused` true until the cutover. Verify the real provider ceiling, required read permissions and both cached and uncached throttling. A rollback function bundle may not honor `paused`; an operational intake hold is required during drain.
+3. Reconcile authoritative physical inventory, exact object ownership, held upload permits and trusted completed download logs. Conservatively deduct unassignable prior usage from the available monthly budget. Missing observations, an expired link or one HEAD 404 do not release reservations. Keep original ledgers and a configuration snapshot.
+4. Drain previously issued capabilities and accepted uploads using trusted terminal evidence, finish the inventory delta, then deploy the reviewed combined source once through the existing deployment lock. Verify migrations and functions together; do not reapply or rewrite released migration history.
+5. Unpause and run real small-file upload/commit/download/SHA canaries plus exhausted-budget, full-storage and account-isolation refusals before removing the intake hold. On any failed gate, retain the hold or restore the single prior compatible function bundle and configuration snapshot. No compatibility dispatch or server restart is introduced.
+
+Fresh installation and an upgrade from the real integration base must install identical guarded sharing functions. Managed-file rename/move version changes retain the original content timestamp; only a new local publication without a cloud blob extends that content-edit rule. Original negative ACL and metadata-only timestamp assertions remain unchanged.

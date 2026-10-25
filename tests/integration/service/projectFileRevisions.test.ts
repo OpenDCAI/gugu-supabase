@@ -100,6 +100,36 @@ describe('project local metadata, exact references and read-only host ownership'
     expect((await fails("INSERT INTO chat.workspace_item_versions(item_id,n,content_type) VALUES($1,99,$2)",[item,type])).code).toBe('23514')
     expect((await fails("INSERT INTO chat.workspace_item_versions(item_id,n,device_version,content_type) VALUES($1,99,98,$2)",[item,type])).code).toBe('23514')
   })
+  it('publishes a composer attachment and its exact message pointer in one transaction through the existing RPC',async()=>{
+    const message=randomUUID(),request={message_id:message,to_user_ids:[member],caption:'  shared caption  '}
+    const result=(await db.query('SELECT chat.file_device_publish($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) AS r',[...args(),request])).rows[0].r
+    expect(result).toMatchObject({item_id:item,version:1,message:{id:message,chat_id:group,sender_user_id:owner,file_item_id:item,file_version:1,is_whisper:false,to_user_ids:[member]}})
+    expect(result.message.content).toBe('[附件] file.bin (application/octet-stream)\n[Size] 123\n[Kind] file\n[Caption]\nshared caption')
+    expect(await resolve({message_id:message})).toMatchObject({status:'ready',source:'local',sha256:sha,version:1})
+  })
+  it('rolls back the local file and revision when message authorization, payload or idempotency rejects sending',async()=>{
+    const send='SELECT chat.file_device_publish($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)'
+    const message=randomUUID();await db.query(`SELECT * FROM chat.send_message_idempotent($1,$2,$3,'{}','existing','text',NULL,NULL,false,false)`,[message,group,owner])
+    expect((await fails(send,[...args(),{message_id:randomUUID(),to_user_ids:[outsider]}])).code).toBe('42501')
+    await service()
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[item])).rows).toEqual([])
+    expect((await db.query('SELECT item_id FROM chat.file_device_revisions WHERE item_id=$1',[item])).rows).toEqual([])
+    await user()
+    for(const request of [{message_id:message},{message_id:randomUUID(),is_whisper:true},[],{message_id:randomUUID(),to_user_ids:'invalid'}]) {
+      expect((await fails(send,[...args(),request])).message).toBeTruthy()
+      await service()
+      expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[item])).rows).toEqual([])
+      expect((await db.query('SELECT item_id FROM chat.file_device_revisions WHERE item_id=$1',[item])).rows).toEqual([])
+      await user()
+    }
+  })
+  it('preserves the existing sender thread fields without introducing a second thread ACL',async()=>{
+    const thread=randomUUID(),plainId=randomUUID(),attachmentId=randomUUID()
+    const plain=(await db.query(`SELECT * FROM chat.send_message_idempotent($1,$2,$3,'{}','thread control','text',NULL,$4,false,false)`,[plainId,group,owner,thread])).rows[0]
+    expect(plain.thread_root_id).toBe(thread)
+    const result=(await db.query('SELECT chat.file_device_publish($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) AS r',[...args(),{message_id:attachmentId,thread_root_id:thread}])).rows[0].r
+    expect(result.message).toMatchObject({id:attachmentId,thread_root_id:plain.thread_root_id,file_item_id:item,file_version:1})
+  })
   it('preserves the real message pin and refuses retracted or hidden messages even when an item is readable',async()=>{
     await publish()
     // Use the production envelope to exercise the same send trigger as a client.
@@ -171,11 +201,19 @@ describe('project local metadata, exact references and read-only host ownership'
       for(const permission of ['SELECT','INSERT','UPDATE','DELETE']) expect((await db.query('SELECT has_table_privilege($1,$2,$3) AS ok',[role,'chat.'+table,permission])).rows[0].ok).toBe(false)
     }
     for(const signature of ['file_project_policy_as(text,text,text,boolean,boolean,text)','file_project_policy_for(text,text)',
-      'file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid)','file_resolve_as(jsonb,text)']) {
+      'file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb)','file_resolve_as(jsonb,text)']) {
       expect((await db.query("SELECT has_function_privilege('authenticated',$1,'EXECUTE') AS ok",['chat.'+signature])).rows[0].ok).toBe(true)
       expect((await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS ok",['chat.'+signature])).rows[0].ok).toBe(false)
     }
     expect((await db.query("SELECT has_function_privilege('authenticated','chat.file_device_read_only()','EXECUTE') AS ok")).rows[0].ok).toBe(false)
+    expect((await db.query("SELECT prosecdef FROM pg_proc WHERE oid='chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb)'::regprocedure")).rows[0].prosecdef).toBe(false)
+    const inner='file_private.publish_revision(uuid,text,text,text,text,bigint,text,text,integer,uuid)'
+    expect((await db.query("SELECT prosecdef FROM pg_proc WHERE oid=$1::regprocedure",[inner])).rows[0].prosecdef).toBe(true)
+    expect((await db.query("SELECT has_function_privilege('authenticated',$1,'EXECUTE') AS ok",[inner])).rows[0].ok).toBe(true)
+    expect((await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS ok",[inner])).rows[0].ok).toBe(false)
+    const schemas=(await db.query("SELECT rolconfig FROM pg_roles WHERE rolname='authenticator'")).rows[0].rolconfig
+    expect(schemas.find((value:string)=>value.startsWith('pgrst.db_schemas='))).not.toMatch(/file_private/)
+
   })
 })
 

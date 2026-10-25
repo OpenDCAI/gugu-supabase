@@ -29,6 +29,26 @@ describe('download input and signed throttles',()=>{
     expect(await handleFileResolve(deps as Parameters<typeof handleFileResolve>[0],'reader',{ref:{message_id:'message'}})).toEqual({status:'expired'})
     expect(calls).toEqual(['file_resolve_as'])
   })
+  it('batches metadata through the same ACL RPC, preserving each reference and actor without signing',async()=>{
+    const calls:unknown[]=[]
+    const deps=new Proxy({userRpc:async(fn:string,args:Record<string,unknown>)=>{
+      calls.push([fn,args]);return {data:{status:(args.p_ref as {message_id:string}).message_id==='expired'?'expired':'gone'},error:null}
+    }},{get(target,key){if(key==='userRpc')return target.userRpc;throw Error('Metadata touched '+String(key))}})
+    const refs=[{message_id:'expired'},{message_id:'hidden'}]
+    expect(await handleFileResolve(deps as Parameters<typeof handleFileResolve>[0],'reader',{refs,as:'agent'})).toEqual({files:[
+      {ref:refs[0],status:'expired'},{ref:refs[1],status:'gone'},
+    ]})
+    expect(calls).toEqual(refs.map(p_ref=>['file_resolve_as',{p_ref,p_as:'agent'}]))
+  })
+  it('validates the entire bounded metadata batch before any ACL call',async()=>{
+    let calls=0
+    const deps={userRpc:async()=>{calls++;return {data:{status:'gone'},error:null}}} as unknown as Parameters<typeof handleFileResolve>[0]
+    for(const body of [{refs:[]},{refs:Array.from({length:201},()=>({message_id:'m'}))},{refs:[{message_id:'good'},{message_id:'bad',path:'/secret'}]},
+      {refs:[{message_id:'m'}],ref:{message_id:'m'}}]) {
+      await expect(handleFileResolve(deps,'reader',body)).rejects.toMatchObject({status:400})
+    }
+    expect(calls).toBe(0)
+  })
   it('uses the CDN edge expiry equation rather than only shortening response metadata',()=>{
     const now=new Date('2026-10-24T00:00:00Z')
     for (const edgeTtl of [60,1800,7200]) {

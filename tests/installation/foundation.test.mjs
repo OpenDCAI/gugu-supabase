@@ -29,6 +29,15 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     const idleExpiryRelease = releases.find((release) => release.version.endsWith('_large_file_idle_expiry'))
     assert.ok(idleExpiryRelease)
     const releaseQuery = async (sql) => {
+      if (sql.includes(releases.find(release=>release.version.endsWith('_project_file_message_publication')).sql)) {
+        await t.test('atomic publication rollback restores the old function and leaves no private schema',async()=>{
+          await query(sql.replace(/COMMIT;\s*$/, 'ROLLBACK;'))
+          assert.equal((await query("SELECT to_regnamespace('file_private') AS schema"))[0].schema,null)
+          assert.equal((await query("SELECT prosecdef FROM pg_proc WHERE oid='chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid)'::regprocedure"))[0].prosecdef,true)
+          assert.equal((await query("SELECT to_regprocedure('chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb)') AS f"))[0].f,null)
+        })
+        return query(sql)
+      }
       if (sql.includes(idleExpiryRelease.sql)) {
         const owner=randomUUID(),group=randomUUID(),blob=randomUUID(),stored=randomUUID(),sha='ef'.repeat(32)
         await db.query("INSERT INTO identity.users(id,type,display_name) VALUES($1,'human','retention upgrade fixture')",[owner])
@@ -169,7 +178,7 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
         }
       }
       for (const signature of ['file_project_policy_as(text,text,text,boolean,boolean,text)','file_project_policy_for(text,text)',
-        'file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid)','file_resolve_as(jsonb,text)']) {
+        'file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb)','file_resolve_as(jsonb,text)']) {
         assert.equal((await db.query("SELECT has_function_privilege('authenticated',$1,'EXECUTE') AS allowed", ['chat.'+signature])).rows[0].allowed, true)
         assert.equal((await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS allowed", ['chat.'+signature])).rows[0].allowed, false)
       }

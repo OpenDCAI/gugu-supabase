@@ -15,7 +15,11 @@ export function fileRef(value:unknown):Record<string,unknown> {
 }
 
 export async function handleFileResolve(deps:AttachmentsDeps,user:string,body:Record<string,unknown>) {
-  return call(deps.userRpc,'file_resolve_as',{p_ref:fileRef(body.ref),p_as:typeof body.as==='string'?body.as:user})
+  const refs='refs'in body?body.refs:[body.ref]
+  if (!Array.isArray(refs)||refs.length<1||refs.length>200||'refs'in body&&'ref'in body) throw new Refusal(400,'invalid','Expected 1 to 200 file references')
+  const exact=refs.map(fileRef),actor=typeof body.as==='string'?body.as:user
+  const rows=await Promise.all(exact.map(ref=>call(deps.userRpc,'file_resolve_as',{p_ref:ref,p_as:actor})))
+  return 'refs'in body?{files:rows.map((row,i)=>({...row as Record<string,unknown>,ref:exact[i]}))}:rows[0]
 }
 
 export async function handleFileDownload(deps:AttachmentsDeps,user:string,body:Record<string,unknown>) {

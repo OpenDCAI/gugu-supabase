@@ -13,7 +13,6 @@ function id(body:Record<string,unknown>,name:string) {
 export async function handleProjectFiles(deps:AttachmentsDeps,user:string,route:string,body:Record<string,unknown>) {
   const actor=typeof body.as==='string'?body.as:user
   if(route==='file-download') return handleFileDownload(deps,user,body)
-  if(route==='file-resolve') return call(deps.userRpc,'file_resolve_as',{p_ref:fileRef(body.ref),p_as:actor})
   if(route==='file-request') return call(deps.userRpc,'file_temporary_request',{p_ref:fileRef(body.ref),p_as:actor,p_id:id(body,'request_id')})
   if(route==='file-pending') return {transfers:await call(deps.userRpc,'file_temporary_pending',{p_device:text(body,'device_id')})}
   if(route==='file-read-complete') {

@@ -158,7 +158,7 @@ Deno.serve(async (request) => {
     const { data: who, error: whoError } = await asUser.auth.getUser()
     if (whoError || !who?.user?.id) return json({ error: 'denied', message: 'sign in first' }, 401)
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-    if(route.startsWith('file-')) return json(await handleProjectFiles(deps,who.user.id,route,body))
+    if(route.startsWith('file-')&&route!=='file-resolve') return json(await handleProjectFiles(deps,who.user.id,route,body))
     switch (route) {
       case 'file-resolve':
         return json(await handleFileResolve(deps,who.user.id,body))

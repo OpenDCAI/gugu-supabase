@@ -179,7 +179,8 @@ GRANT EXECUTE ON FUNCTION chat.file_transfer_group_usage(text,text) TO authentic
 
 -- The installation DDL guard closes replaced functions too; restore only their existing API grants.
 GRANT EXECUTE ON FUNCTION chat.file_transfer_download_as(jsonb,text,uuid),
-    chat.attachment_place_forward(text,text,text,text,boolean) TO authenticated;
+    chat.attachment_place_forward(text,text,text,text,boolean),
+    chat.attachment_place_share(uuid,integer,text,text,text) TO authenticated;
 GRANT EXECUTE ON FUNCTION chat.file_managed_upload_registered(text,text),
     chat.file_blob_register(text,text,text,bigint,text,integer,integer),
     chat.file_blob_gc_claim(integer,integer),chat.file_blob_gc_finish(uuid,uuid) TO service_role;

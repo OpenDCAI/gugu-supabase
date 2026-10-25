@@ -1,0 +1,5 @@
+{
+  "storage-v1": {"exposed_headers": ["Content-Range", "Accept-Ranges", "Content-Length"]},
+  "storage-v1-s3": {"exposed_headers": ["Content-Range", "Accept-Ranges", "Content-Length"]},
+  "rest-v1": {"max_age": 600}
+}

@@ -338,3 +338,16 @@ describe('历史与搜索带上条目', () => {
     expect(found).toEqual([expect.objectContaining({ id: sent.id, file_item_id: sent.file_item_id, file_version: 1 })])
   })
 })
+
+describe('执行权', () => {
+  it('attachment_share 和两个放条目的 definer 给 authenticated、不给 anon;重建的 attachment_commit / attachment_place_forward 照旧给 authenticated', async () => {
+    await asOwner()
+    const { rows } = await database.query<{ fn: string; anon: boolean; auth: boolean }>(`
+      SELECT p.proname AS fn, has_function_privilege('anon', p.oid, 'EXECUTE') AS anon, has_function_privilege('authenticated', p.oid, 'EXECUTE') AS auth
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+       WHERE n.nspname = 'chat' AND p.proname IN ('attachment_share','attachment_place_share','attachment_place_version','attachment_commit','attachment_place_forward','message_history_as','message_search_as')
+       ORDER BY 1`)
+    expect(rows.map((row) => row.fn)).toEqual(['attachment_commit', 'attachment_place_forward', 'attachment_place_share', 'attachment_place_version', 'attachment_share', 'message_history_as', 'message_search_as'])
+    for (const row of rows) expect(row, row.fn).toMatchObject({ anon: false, auth: true })
+  })
+})

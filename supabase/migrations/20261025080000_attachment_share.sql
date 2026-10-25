@@ -202,6 +202,8 @@ BEGIN
     RETURN QUERY SELECT v_item.id, v_item.version, chat.workspace_version_envelope(v_item.id, v_item.version), NULL::UUID;
 END;
 $$;
+REVOKE ALL ON FUNCTION chat.attachment_place_forward(text, text, text, text, boolean) FROM PUBLIC, anon;
+GRANT ALL ON FUNCTION chat.attachment_place_forward(text, text, text, text, boolean) TO authenticated;
 
 -- ── history and search say which folder file an attachment is ───────────────────────────
 DROP FUNCTION chat.message_history_as(text, text, text, bigint, integer);

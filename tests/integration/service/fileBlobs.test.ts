@@ -256,12 +256,13 @@ describe('上传登记(chat.file_blob_register,只给 service_role)', () => {
     expect(uploads).toEqual([{ uploader: owner, blob_id: made.blob_id, minutes: 60 }, { uploader: member, blob_id: made.blob_id, minutes: 60 }])
   })
 
-  it('拒:哈希不是 64 位十六进制、超过 25 MiB 或空、暂存对象不在本人名下、同一个暂存对象换了内容;authenticated 叫不动它', async () => {
+  it('rejects invalid hash, empty bytes, foreign staging and changed replay identity; configured upload permits own the size ceiling', async () => {
     const digest = sha(`x-${randomUUID()}`)
     await asServiceRole()
     const call = 'SELECT * FROM chat.file_blob_register($1,$2,$3,$4,$5)'
     expect(await fails(call, [owner, staging(owner), 'abc', 10, 'image/png'])).toMatch(/64 hex digits/)
-    expect(await fails(call, [owner, staging(owner), digest, 26214401, 'image/png'])).toMatch(/hint: file_too_large/)
+    // The public configured permit enforces the ceiling (fileTransferPolicy.test.ts); internal registration supports larger files.
+    expect((await database.query(call, [owner, staging(owner), sha(`over-25-${randomUUID()}`), 26214401, 'image/png'])).rows[0]).toMatchObject({created:true})
     expect(await fails(call, [owner, staging(owner), digest, 0, 'image/png'])).toMatch(/hint: file_too_large/)
     expect(await fails(call, [owner, staging(member), digest, 10, 'image/png'])).toMatch(/file_blob_uploads_own_key/)
     expect(await fails(call, [owner, `staging/${owner}/not-a-uuid`, digest, 10, 'image/png'])).toMatch(/file_blob_uploads_staging_key_check/)

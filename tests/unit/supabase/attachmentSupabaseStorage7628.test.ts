@@ -12,6 +12,15 @@ function storage(fetcher: typeof fetch) {
 }
 
 describe('community attachment storage', () => {
+  it('reports the real bucket ceiling and fixed signed-upload lifetime instead of promising per-object enforcement',async()=>{
+    const fetcher=vi.fn(async()=>new Response(JSON.stringify({file_size_limit:26214400})))
+    expect(await storage(fetcher).uploadBounds(5,120)).toEqual({maxBytes:26214400,expiresSeconds:7200})
+    expect(fetcher.mock.calls[0]![0]).toBe('https://project.example/storage/v1/bucket/attachments')
+    for (const size of [null,0,26214401]) {
+      await expect(storage(vi.fn(async()=>new Response(JSON.stringify({file_size_limit:size})))).uploadBounds(5,120))
+        .rejects.toMatchObject({status:503,code:'not_configured'})
+    }
+  })
   it('promotes exactly the hashed bytes even when staging changes after the read', async () => {
     let staged = new Uint8Array([1, 2, 3])
     let stored: Uint8Array | undefined

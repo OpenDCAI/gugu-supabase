@@ -23,9 +23,10 @@
 // 内部口只有 /healthz 与 /stats,只绑回环、❌ 经 nginx 暴露。
 
 import http from 'node:http'
-import { Server } from '@hocuspocus/server'
+import { Server, isTransactionOrigin } from '@hocuspocus/server'
 import pg from 'pg'
 import * as Y from 'yjs'
+import { contentOriginOf } from '@gugu/files-core/concurrent'
 
 import {
   Denied,
@@ -146,7 +147,7 @@ export function createFileService(config, { log, pool: givenPool }) {
   }
 
   // 打开的文件里和存储无关的那一半(簿记、限速与上限、presence 盖章、self、同时建合并):和桌面本地服务共用同一个包。
-  /** @type {import('@gugu/files-core/open-files').OpenFiles<{ itemId: string, epoch: number, chatId: string, contentType: string, deleted: boolean }>} */
+  /** @type {import('@gugu/files-core/open-files').OpenFiles<{ itemId: string, epoch: number, chatId: string, contentType: string, deleted: boolean, updatedBy: string | null }>} */
   const openFiles = createOpenFiles({
     maxBytes,
     limits: config,
@@ -517,6 +518,21 @@ export function createFileService(config, { log, pool: givenPool }) {
           chatId: row.chat_id,
           contentType: row.content_type,
           deleted: false,
+          updatedBy: null,
+        })
+        // Capture the authenticated actor synchronously with the actual content transaction, not
+        // the later debounced store. Passive sync and changes to Yjs structure alone do not count.
+        let lastText = readable
+        document.on('afterTransaction', (transaction) => {
+          const text = readText(document, row.content_type)
+          if (text === lastText) return
+          lastText = text
+          const origin = contentOriginOf(transaction.origin)
+          const context = isTransactionOrigin(origin)
+            ? origin.source === 'connection' ? origin.connection.context : origin.source === 'local' ? origin.context : null
+            : null
+          const info = docs.get(documentName)
+          if (info) info.updatedBy = context?.actorId ?? null
         })
         // 加载时核对:ystate 算出来的和库里的正文对不上 = 有人绕过文件服务写了正文。记下来,❌ 静默吞掉。
         if (!built && !sameContent(row.content_type, readable, text)) {
@@ -559,11 +575,12 @@ export function createFileService(config, { log, pool: givenPool }) {
       info.dirty = false
       const snap = openFiles.snapshot(documentName, document)
       const { state, text, bytes } = snap
+      const updatedBy = info.updatedBy
       if (bytes > maxBytes) log.warn('storing a file over the size limit', { doc: documentName, bytes, limit: maxBytes })
       try {
         const u = await pool.query(
-          'UPDATE chat.workspace_items SET ystate = $1, inline_text = $2, size_bytes = $3 WHERE id = $4::uuid AND epoch = $5',
-          [Buffer.from(state), text, bytes, info.itemId, info.epoch],
+          'UPDATE chat.workspace_items SET ystate = $1, inline_text = $2, size_bytes = $3, updated_by = $6 WHERE id = $4::uuid AND epoch = $5',
+          [Buffer.from(state), text, bytes, info.itemId, info.epoch, updatedBy],
         )
         openFiles.stored(documentName, snap)
         stats.stores++

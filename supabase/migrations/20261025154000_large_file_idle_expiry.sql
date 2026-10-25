@@ -119,6 +119,12 @@ BEGIN
         RAISE EXCEPTION 'File has expired; upload a new copy' USING HINT='file_transfer_expired';
     END IF;
     -- ◇ 转成悄悄话:指同一份字节,不进目标的文件夹。$new$),
+        ('chat.attachment_place_share(uuid,integer,text,text,text)',
+         $old$v_resource := chat.workspace_require_room_member(p_chat_id, p_sender_user_id);$old$,
+         $new$IF chat.file_transfer_reference_expired(v_blob,v_item.chat_id) THEN
+        RAISE EXCEPTION 'File has expired; upload a new copy' USING HINT='file_transfer_expired';
+    END IF;
+    v_resource := chat.workspace_require_room_member(p_chat_id, p_sender_user_id);$new$),
         ('chat.file_blob_gc_claim(integer,integer)',
          $old$IF p_limit < 1 OR p_limit > 500 OR p_stale_seconds < 30 THEN$old$,
          $new$IF NOT pg_try_advisory_xact_lock(hashtextextended('gugu:file-transfer:quota',0)) THEN RETURN; END IF;

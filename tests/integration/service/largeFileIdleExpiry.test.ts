@@ -30,10 +30,10 @@ async function upload(bytes=60,sha=randomUUID().replaceAll('-','').repeat(2),tar
   await db.query('SELECT chat.file_managed_upload_registered($1,$2)',[permit.staging_key,owner])
   await user()
   const message=randomUUID()
-  await db.query('SELECT * FROM chat.attachment_commit($1,$2,$3,$4,$5)',[permit.staging_key,message,target,owner,'fixture.bin'])
+  const sent=(await db.query('SELECT * FROM chat.attachment_commit($1,$2,$3,$4,$5)',[permit.staging_key,message,target,owner,'fixture.bin'])).rows[0]
   await service()
   const stored=(await db.query('SELECT id FROM chat.file_transfer_storage WHERE blob_id=$1',[blob.blob_id])).rows[0].id
-  return {key:permit.staging_key,blob:blob.blob_id as string,stored:stored as string,message,sha,created:blob.created as boolean}
+  return {item:sent.file_item_id as string,key:permit.staging_key,blob:blob.blob_id as string,stored:stored as string,message,sha,created:blob.created as boolean}
 }
 async function age(stored:string,days=31,last:number|null=null,target=group) {
   await service()
@@ -184,6 +184,7 @@ describe('non-project idle expiry, not quota eviction',()=>{
     expect(r.status).toBe('expired');expect(r.url).toBeUndefined();expect(r.download_id).toBeUndefined()
     await user()
     expect((await reject('SELECT * FROM chat.attachment_forward($1,$2,$3,$4)',[file.message,randomUUID(),group,owner])).hint).toBe('file_transfer_expired')
+    expect((await reject('SELECT * FROM chat.attachment_share($1,$2,$3,$4,$5)',[file.item,1,randomUUID(),group,owner])).hint).toBe('file_transfer_expired')
     await service()
     expect((await db.query("SELECT id FROM chat.file_transfer_reservations WHERE kind='download' AND chat_id=$1",[group])).rows).toEqual([])
   })

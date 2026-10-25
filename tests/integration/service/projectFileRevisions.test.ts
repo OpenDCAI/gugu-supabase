@@ -94,6 +94,7 @@ describe('project local metadata, exact references and read-only host ownership'
     expect(await resolve({item_id:item})).toMatchObject({version:2,file_name:'new.bin',sha256:'cd'.repeat(32),size_bytes:456})
     expect(await resolve({item_id:item,version:1})).toMatchObject({version:1,file_name:'file.bin',sha256:sha,size_bytes:123})
     expect(await resolve({item_id:item,version:3})).toEqual({status:'gone'})
+    expect((await db.query('SELECT updated_by FROM chat.workspace_items WHERE id=$1',[item])).rows[0].updated_by).toBe(owner)
     await service()
     expect((await db.query('SELECT n,device_version,blob_id,inline_text FROM chat.workspace_item_versions WHERE item_id=$1',[item])).rows)
       .toEqual([{n:1,device_version:1,blob_id:null,inline_text:null}])

@@ -31,7 +31,7 @@ BEGIN
     INSERT INTO chat.file_device_revisions(item_id,version,host_device_id,host_project_id,relative_path,sha256,size_bytes,file_name,content_type)
     VALUES(p_item,n,p_device,p.host_project_id,p_path,p_sha,p_size,chat.workspace_stored_name(p_filename),p_type);
     IF w.id IS NOT NULL THEN
-        UPDATE chat.workspace_items SET version=n,blob_id=NULL,size_bytes=p_size,filename=p_filename,content_type=p_type WHERE id=w.id;
+        UPDATE chat.workspace_items SET version=n,blob_id=NULL,size_bytes=p_size,filename=p_filename,content_type=p_type,updated_by=auth.uid()::text WHERE id=w.id;
     END IF;
     RETURN jsonb_build_object('item_id',p_item,'version',n,'sha256',p_sha,'size_bytes',p_size,'envelope',chat.workspace_version_envelope(p_item,n));
 END $$;
@@ -58,3 +58,17 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb) FROM PUBLIC,anon,authenticated;
 GRANT EXECUTE ON FUNCTION chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb) TO authenticated;
+
+-- A local file's content version is a body edit even though its bytes stay outside the database.
+CREATE OR REPLACE FUNCTION chat.set_workspace_item_updated_at() RETURNS trigger
+LANGUAGE plpgsql SET search_path='' AS $$
+BEGIN
+    IF NEW.inline_text IS DISTINCT FROM OLD.inline_text OR NEW.blob_id IS DISTINCT FROM OLD.blob_id
+       OR (NEW.kind='file' AND NEW.version IS DISTINCT FROM OLD.version) THEN
+        NEW.updated_at:=now();
+    ELSE
+        NEW.updated_at:=OLD.updated_at;
+        NEW.updated_by:=OLD.updated_by;
+    END IF;
+    RETURN NEW;
+END $$;

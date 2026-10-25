@@ -4,7 +4,8 @@
 //
 //   POST upload   → 一张直传 OSS 的 PostObject 表单:key = staging/<调用者>/<uuid>,25 MiB 由 OSS 管。
 //   POST commit   → 读暂存对象(内网)、自己算 sha256 和类型 → 服务端复制到 <aa>/<sha256>(只复制读到的那一份)
-//                   → 登记(service_role)→ 删暂存 → 以调用者的身份 attachment_commit(放进「附件」、发消息,一个事务)。
+//                   → 登记(service_role)→ 删暂存 → 以调用者的身份 attachment_commit(放进「附件」、发消息,一个事务;
+//                   带 item_id + expected_version 就是那个文件的下一版)。
 //   POST forward  → 以调用者的身份 attachment_forward。
 //   POST urls     → 以调用者的身份 file_urls_as(条目的某一版,或悄悄话附件那条消息),再签:OSS 的走 CDN 鉴权 A(图片另给缩略图链接),老对象走存储的签名链接。
 //   POST gc       → 只认 service_role(pg_cron + pg_net 每 10 分钟叫一次):领一批该回收的,删对象、清 CDN、报完成 / 失败。
@@ -163,6 +164,7 @@ export async function handleCommit(deps: AttachmentsDeps, userId: string, body: 
     return await call(deps.userRpc, 'send_friend_file_as_owner', ownerArgs)
   }
   const caption = str(body, 'caption', false)
+  const itemId = str(body, 'item_id', false)
   const commitArgs = {
     p_staging_key: stagingKey,
     p_message_id: str(body, 'message_id'),
@@ -178,6 +180,8 @@ export async function handleCommit(deps: AttachmentsDeps, userId: string, body: 
     // 图配文字:库把它接在信封后面(首尾空白去掉,空的就没有)。没有说明就不带这个键:函数先于迁移落地时,
     // 老库的 attachment_commit 没有 p_caption,带上键(哪怕是 null)PostgREST 就找不到函数。
     ...(caption != null ? { p_caption: caption } : {}),
+    // 这份字节是群文件夹里一个文件的下一版(item_id + 它基于的 expected_version);同上,不给就不带这两个键。
+    ...(itemId != null ? { p_item_id: itemId, p_expected_version: int(body, 'expected_version') } : {}),
   }
   await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false))
   const rows = (await call(deps.userRpc, 'attachment_commit', commitArgs)) as unknown[]

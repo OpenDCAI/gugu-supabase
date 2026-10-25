@@ -39,6 +39,9 @@ Collaborative file editing needs the long-running Node service in `services/file
 
 ## Local verification
 
+For a self-managed Kong gateway, the versioned [CORS policy](deploy/kong/README.md)
+defines REST preflight caching and Storage range-response header exposure.
+
 On a development machine with Docker:
 
 ```sh

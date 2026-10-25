@@ -115,7 +115,7 @@ async function place(caller: string, key: string, chatId: string, name: string, 
 const REPLACE = 'SELECT * FROM chat.file_replace_as($1,$2,$3,$4)'
 async function replace(caller: string, key: string, itemId: string, expected: number | null, as: string | null = null) {
   await asUser(caller)
-  const { rows } = await database.query<{ id: string; version: number; pointer: string | null; pruned_pointers: string[]; parent_id: string | null; system_role: string | null; path: string }>(REPLACE, [key, itemId, as ?? caller, expected])
+  const { rows } = await database.query<{ id: string; version: number; pointer: string | null; pruned_pointers: string[]; parent_id: string | null; system_role: string | null; path: string; updated_by: string | null }>(REPLACE, [key, itemId, as ?? caller, expected])
   await asOwner()
   return rows[0]!
 }
@@ -218,7 +218,7 @@ describe('chat.file_replace_as:文件换成这份字节,升一版', () => {
     await database.query(`UPDATE chat.workspace_items SET updated_at = '2020-01-01T00:00:00Z' WHERE id = $1`, [placed.id])
     await database.query('SET LOCAL session_replication_role = origin')
     const replaced = await replace(member, second.key, placed.id, 1)
-    expect(replaced).toMatchObject({ id: placed.id, version: 2, pointer: null, parent_id: null, system_role: null, path: 'a.pdf' })
+    expect(replaced).toMatchObject({ id: placed.id, version: 2, pointer: null, parent_id: null, system_role: null, path: 'a.pdf', updated_by: member })
     expect((await database.query<{ t: Date }>('SELECT updated_at AS t FROM chat.workspace_items WHERE id = $1', [placed.id])).rows[0]!.t.toISOString())
       .not.toBe('2020-01-01T00:00:00.000Z')
     expect(await item(placed.id)).toMatchObject({ blob_id: second.blob, version: 2, size_bytes: '200' })

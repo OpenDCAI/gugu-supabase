@@ -20,6 +20,13 @@ import * as Y from 'yjs'
 
 const MERGE = Symbol('files:concurrent-create')
 
+// A repair still has its own origin for sync/broadcast and recursion, while retaining the
+// transaction that caused it so persistence can identify the actual content writer.
+/** @param {any} origin @returns {unknown} */
+export function contentOriginOf(origin) {
+  return origin?.merge === MERGE ? origin.cause : origin
+}
+
 /** @param {Y.Transaction} tr @param {Y.Item} item */
 const deletedHere = (tr, item) => Y.isDeleted(tr.deleteSet, item.id)
 /** @param {Y.Item | null | undefined} item */
@@ -162,7 +169,7 @@ export function mergeConcurrentCreations(doc, { onMerge } = {}) {
   }
 
   doc.on('afterTransaction', (/** @type {Y.Transaction} */ tr) => {
-    if (tr.origin === MERGE) return
+    if (tr.origin?.merge === MERGE) return
     /** @type {[Y.AbstractType<any>, Snap, 'create' | 'late-write'][]} */
     const plans = []
     /** @type {Set<Y.AbstractType<any>>} 本事务里判出来的输家:它下面新加的东西已在快照里,不再当迟到的写 */
@@ -221,7 +228,7 @@ export function mergeConcurrentCreations(doc, { onMerge } = {}) {
             mergeInto(into, snap, kind === 'create' ? 'union' : 'late')
             done.push(kind)
           }
-        }, MERGE)
+        }, { merge: MERGE, cause: tr.origin })
         for (const kind of done) onMerge?.(kind)
       })
     }

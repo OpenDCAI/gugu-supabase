@@ -101,7 +101,7 @@ async function document(chatId: string, by: string): Promise<string> {
   await asService()
   return rows[0]!.id
 }
-type Replaced = { id: string; version: number; pointer: string; size_bytes: string; content_type: string; pruned_pointers: string[] }
+type Replaced = { id: string; version: number; pointer: string; size_bytes: string; content_type: string; pruned_pointers: string[]; updated_by: string | null }
 async function replace(itemId: string, caller: string, actor: string, pointer: string, size: number, expected: number | null = null): Promise<Replaced> {
   await asUser(caller)
   const { rows } = await database.query<Replaced>('SELECT * FROM chat.workspace_replace_file_as($1,$2,$3,$4,NULL,$5)', [itemId, actor, pointer, size, expected])
@@ -151,7 +151,7 @@ describe('workspace_replace_file_as', () => {
     const file = await binary(group, owner)
     const next = await object(group, member)
     const done = await replace(file.id, member, member, next, 250)
-    expect(done).toMatchObject({ id: file.id, version: 2, pointer: next, pruned_pointers: [] })
+    expect(done).toMatchObject({ id: file.id, version: 2, pointer: next, pruned_pointers: [], updated_by: member })
     expect(String(done.size_bytes)).toBe('250')
     expect(await item(file.id)).toMatchObject({ pointer: next, version: 2 })
     expect(await history(file.id)).toMatchObject([
@@ -164,7 +164,7 @@ describe('workspace_replace_file_as', () => {
     const group = await newGroup(owner, [agent, member])
     const file = await binary(group, member)
     const next = await object(group, owner)
-    expect(await replace(file.id, owner, agent, next, 9)).toMatchObject({ version: 2 })
+    expect(await replace(file.id, owner, agent, next, 9)).toMatchObject({ version: 2, updated_by: agent })
     expect((await history(file.id)).at(-1)).toMatchObject({ n: 2, made_by: agent })
 
     const other = await object(group, member)

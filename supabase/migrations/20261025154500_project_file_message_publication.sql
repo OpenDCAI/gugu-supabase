@@ -64,7 +64,7 @@ CREATE OR REPLACE FUNCTION chat.set_workspace_item_updated_at() RETURNS trigger
 LANGUAGE plpgsql SET search_path='' AS $$
 BEGIN
     IF NEW.inline_text IS DISTINCT FROM OLD.inline_text OR NEW.blob_id IS DISTINCT FROM OLD.blob_id
-       OR (NEW.kind='file' AND NEW.version IS DISTINCT FROM OLD.version) THEN
+       OR (NEW.kind='file' AND NEW.blob_id IS NULL AND NEW.version IS DISTINCT FROM OLD.version) THEN
         NEW.updated_at:=now();
     ELSE
         NEW.updated_at:=OLD.updated_at;

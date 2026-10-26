@@ -5,7 +5,7 @@ import {
 import { type AttachmentObjectStorage, ObjectStorageError } from './object-storage.ts'
 import { inspectFileStream } from './file-inspection.ts'
 
-export function ossObjectStorage(config: { oss: OssConfig; cdn: CdnConfig; fetch: FetchLike }): AttachmentObjectStorage {
+export function ossObjectStorage(config: { oss: OssConfig; cdn: CdnConfig; fetch: FetchLike; directSign?:AttachmentObjectStorage['sign'] }): AttachmentObjectStorage {
   const { oss, cdn, fetch } = config
   const store: AttachmentObjectStorage = {
     uploadBounds: async (requestedBytes,requestedSeconds) => {
@@ -38,6 +38,10 @@ export function ossObjectStorage(config: { oss: OssConfig; cdn: CdnConfig; fetch
     exists: (key) => ossExists(oss, fetch, key),
     remove: (key) => ossDelete(oss, fetch, key),
     sign: async (key, image, now, permit) => {
+      if(permit?.direct) {
+        if(!config.directSign) throw new ObjectStorageError(503,'not_configured','Origin signing is not configured')
+        return config.directSign(key,false,now,permit)
+      }
       if (permit && (cdn.authTtlSeconds===undefined || cdn.requestLimitBitsPerSecond!==permit.trafficBits)) {
         throw new ObjectStorageError(503,'not_configured','CDN authentication TTL and fixed per-request throttle must match deployment settings')
       }
@@ -96,7 +100,7 @@ export function supabaseObjectStorage(config: SupabaseObjectConfig): AttachmentO
       await check(response)
       const metadata=await response.json() as {file_size_limit?:number|string|null}
       const maxBytes=Number(metadata.file_size_limit)
-      if (!Number.isSafeInteger(maxBytes)||maxBytes<1||maxBytes>MAX_ATTACHMENT_BYTES||requestedBytes>maxBytes) {
+      if (!Number.isSafeInteger(maxBytes)||maxBytes<1||requestedBytes>maxBytes) {
         throw new ObjectStorageError(503,'not_configured','A finite supported provider bucket limit must cover this upload')
       }
       // Supabase signed uploads do not bind a per-object size or custom TTL. Reserve the real bucket ceiling.
@@ -137,7 +141,7 @@ export function supabaseObjectStorage(config: SupabaseObjectConfig): AttachmentO
       return { bytes, etag: response.headers.get('etag') }
     },
     inspect: async (key, limit) => {
-      const read=await store.read(key,Math.min(limit,MAX_ATTACHMENT_BYTES))
+      const read=await store.read(key,limit)
       return { ...read,sizeBytes:read.bytes.byteLength,sha256:await sha256Hex(read.bytes) }
     },
     promote: async (_source, destination, read, headers) => write(destination, read.bytes, headers),

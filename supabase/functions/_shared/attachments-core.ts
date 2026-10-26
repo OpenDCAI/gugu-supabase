@@ -385,21 +385,22 @@ interface Claimed {
 }
 
 export async function handleGc(deps: AttachmentsDeps) {
+  await call(deps.serviceRpc, 'file_temporary_expire', { p_limit: 500 })
+  await call(deps.serviceRpc, 'file_transfer_expire', { p_limit: 500 })
   const claimed = ((await call(deps.serviceRpc, 'file_blob_gc_claim', { p_limit: 50, p_stale_seconds: 600 })) ?? []) as Claimed[]
   let deleted = 0
   let failed = 0
   for (const job of claimed) {
     try {
-      if (job.bucket_id === 'oss') {
+      if (job.bucket_id === 'oss' || job.bucket_id === 'temporary') {
         await objectStorage(deps).remove(job.object_name)
         // 清边缘缓存只是清理(见 refreshCdn):失败了记一行,不挡回收。
-        await objectStorage(deps).invalidate(job.object_name, hasThumbnail(job.content_type))
+        if (job.bucket_id === 'oss') await objectStorage(deps).invalidate(job.object_name, hasThumbnail(job.content_type))
           .catch((error) => deps.log('cdn_refresh_failed', { blob: job.blob_id, error: String(error) }))
       } else {
         await deps.storageRemove(job.bucket_id, job.object_name)
       }
       await call(deps.serviceRpc, 'file_blob_gc_finish', { p_blob_id: job.blob_id, p_claim_token: job.claim_token })
-      await call(deps.serviceRpc,'file_transfer_object_gone',{p_bucket:job.bucket_id,p_name:job.object_name})
       deleted++
     } catch (error) {
       failed++

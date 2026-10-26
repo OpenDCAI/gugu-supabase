@@ -14,24 +14,34 @@ export function fileRef(value:unknown):Record<string,unknown> {
   throw new Refusal(400,'invalid','Expected an exact item/version, attachment or message reference')
 }
 
+export async function handleFileResolve(deps:AttachmentsDeps,user:string,body:Record<string,unknown>) {
+  const refs='refs'in body?body.refs:[body.ref]
+  if (!Array.isArray(refs)||refs.length<1||refs.length>200||'refs'in body&&'ref'in body) throw new Refusal(400,'invalid','Expected 1 to 200 file references')
+  const exact=refs.map(fileRef),actor=typeof body.as==='string'?body.as:user
+  const rows=await Promise.all(exact.map(ref=>call(deps.userRpc,'file_resolve_as',{p_ref:ref,p_as:actor})))
+  return 'refs'in body?{files:rows.map((row,i)=>({...row as Record<string,unknown>,ref:exact[i]}))}:rows[0]
+}
+
 export async function handleFileDownload(deps:AttachmentsDeps,user:string,body:Record<string,unknown>) {
   if (typeof body.request_id!=='string'||!UUID.test(body.request_id)) throw new Refusal(400,'invalid','request_id must be a uuid')
   const row=await call(deps.userRpc,'file_transfer_download_as',{
     p_ref:fileRef(body.ref),p_as:typeof body.as==='string'?body.as:user,p_id:body.request_id,
-  }) as {status:string;bucket_id:string;object_name:string;download_id:string;signed_at:string;expires_at:string;content_type:string}
+  }) as {status:string;bucket_id:string;object_name:string;download_id:string;signed_at:string;expires_at:string;content_type:string;transfer_id?:string}
   if (row.status!=='ready') return row
   const cfg=await call(deps.serviceRpc,'file_transfer_settings',{}) as Record<string,unknown>
   const traffic=Number(cfg.download_link_bits_per_second)
   if (!Number.isSafeInteger(traffic)||traffic<819200||traffic>838860800) throw new Refusal(503,'not_configured','Download rate is not configured')
   try {
-    const signed=row.bucket_id==='oss'
+    const signed=row.bucket_id==='oss'||row.bucket_id==='temporary'
       ?await objectStorage(deps).sign(row.object_name,hasThumbnail(row.content_type),new Date(row.signed_at),{
-        requestId:row.download_id,expiresSeconds:60,trafficBits:traffic,
+        requestId:row.download_id,expiresSeconds:60,trafficBits:traffic,...(row.bucket_id==='temporary'?{direct:true}:{}),
       })
       :{url:await deps.storageSignedUrl(row.bucket_id,row.object_name,60,traffic),thumbUrl:null}
-    return {...row,url:signed.url,thumb_url:signed.thumbUrl,expires_at:row.expires_at}
+    const key=row.transfer_id?await call(deps.serviceRpc,'file_temporary_key_for',{p_download:row.download_id,p_account:user}):undefined
+    return {...row,url:signed.url,thumb_url:signed.thumbUrl,expires_at:row.expires_at,...(key?{key,codec:'secretstream-v1'}:{})}
   } catch(error) {
     if(error instanceof ObjectStorageError&&error.status===503) throw new Refusal(503,'not_configured',error.message)
+    if(error instanceof ObjectStorageError&&error.status===410) throw new Refusal(410,'expired',error.message)
     throw error
   }
 }

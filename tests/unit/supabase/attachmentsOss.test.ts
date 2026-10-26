@@ -247,7 +247,7 @@ function fakes(opts: {
     serviceRpc: async (fn, args) => {
       order.push('service:' + fn)
       if (fn==='file_managed_upload_for') {controls.push({as:'service',fn,args});return {data:{max_bytes:MAX_ATTACHMENT_BYTES},error:null}}
-      if (fn==='file_managed_upload_registered'||fn==='file_transfer_object_gone') {controls.push({as:'service',fn,args});return {data:null,error:null}}
+      if (fn==='file_managed_upload_registered'||fn==='file_transfer_expire'||fn==='file_temporary_expire') {controls.push({as:'service',fn,args});return {data:null,error:null}}
       if (fn==='file_transfer_settings') {controls.push({as:'service',fn,args});return {data:{download_link_bits_per_second:819200},error:null}}
       rpcs.push({ as: 'service', fn, args })
       if (fn === 'file_blob_register') {
@@ -301,6 +301,20 @@ describe('managed authorization before bytes or signatures', () => {
     await expect(handleUpload(f.deps,USER,{size_bytes:5})).rejects.toMatchObject({status:503,code:'not_configured'})
     expect(signed).toBe(false)
     expect(f.controls.map(r=>r.fn)).toEqual(['file_managed_upload_prepare'])
+  })
+  it('refuses a finite provider ceiling above the deployment quota before reserving or signing',async()=>{
+    const f=fakes(),store=await import('../../../supabase/functions/_shared/attachment-object-storage')
+    const original=f.deps.userRpc
+    f.deps.userRpc=async(fn,args)=>fn==='file_managed_upload_prepare'
+      ?{data:{max_bytes:MAX_ATTACHMENT_BYTES,permit_seconds:7200},error:null}:original(fn,args)
+    let signed=false
+    f.deps.objects=store.supabaseObjectStorage({url:'https://db.example',serviceKey:'fixture',bucket:'attachments',
+      fetch:async()=>new Response(JSON.stringify({file_size_limit:MAX_ATTACHMENT_BYTES+1})),
+      signUpload:async()=>{signed=true;return 'https://db.example/scoped'},signDownload:async()=>'',
+    })
+    await expect(handleUpload(f.deps,USER,{size_bytes:5})).rejects.toMatchObject({status:503,code:'not_configured'})
+    expect(signed).toBe(false)
+    expect(f.controls).toEqual([])
   })
   it.each(['upload','commit','place','session','urls'])('stops %s when its control-plane authorization is denied', async route => {
     const f=fakes({object:pngBytes()})
@@ -554,8 +568,13 @@ describe('直传表单、签名链接、回收', () => {
       { blob_id: 'b1', claim_token: 't1', bucket_id: 'oss', object_name: 'ab/x', content_type: 'image/png' },
       { blob_id: 'b2', claim_token: 't2', bucket_id: 'workspace', object_name: 'c/u/old', content_type: 'application/x' },
     ]
-    const { deps, calls, rpcs, removed } = fakes({ claimed })
+    const { deps, calls, rpcs, removed, controls, order } = fakes({ claimed })
     expect(await handleGc(deps)).toEqual({ claimed: 2, deleted: 2, failed: 0 })
+    expect(controls.filter(r => r.fn === 'file_temporary_expire')).toEqual([{as:'service',fn:'file_temporary_expire',args:{p_limit:500}}])
+    expect(order.indexOf('service:file_temporary_expire')).toBeLessThan(order.indexOf('service:file_transfer_expire'))
+    expect(controls.filter(r => r.fn === 'file_transfer_expire')).toEqual([{as:'service',fn:'file_transfer_expire',args:{p_limit:500}}])
+    expect(order.indexOf('service:file_transfer_expire')).toBeLessThan(order.indexOf('service:file_blob_gc_claim'))
+    expect(order).not.toContain('service:file_transfer_object_gone')
     expect(calls.map((c) => `${c.method} ${c.url.replace(/\?.*$/, '')}`)).toEqual([
       'DELETE https://gugu-files-test.oss-cn-wulanchabu.aliyuncs.com/ab/x',
       'POST https://cdn.aliyuncs.com/',
@@ -564,10 +583,18 @@ describe('直传表单、签名链接、回收', () => {
     expect(removed).toEqual(['workspace/c/u/old'])
     expect(rpcs.filter((r) => r.fn === 'file_blob_gc_finish').map((r) => r.args.p_blob_id)).toEqual(['b1', 'b2'])
 
+
     const broken = fakes({ claimed })
     broken.deps.storageRemove = async () => { throw new Error('storage 500') }
     expect(await handleGc(broken.deps)).toEqual({ claimed: 2, deleted: 1, failed: 1 })
     expect(broken.rpcs.filter((r) => r.fn === 'file_blob_gc_fail').map((r) => r.args)).toEqual([{ p_blob_id: 'b2', p_claim_token: 't2', p_error: 'Error: storage 500' }])
+  })
+  it('gc removes temporary ciphertext at the same private provider without invoking CDN or weakening claim confirmation',async()=>{
+    const {deps,calls,rpcs,removed}=fakes({claimed:[{blob_id:'temporary',claim_token:'token',bucket_id:'temporary',object_name:'temporary/group/file/generation',content_type:'application/octet-stream'}]})
+    expect(await handleGc(deps)).toEqual({claimed:1,deleted:1,failed:0})
+    expect(calls.map(c=>`${c.method} ${c.url.replace(/\?.*$/,'')}`)).toEqual(['DELETE https://gugu-files-test.oss-cn-wulanchabu.aliyuncs.com/temporary/group/file/generation'])
+    expect(removed).toEqual([])
+    expect(rpcs.filter(r=>r.fn==='file_blob_gc_finish').map(r=>r.args)).toEqual([{p_blob_id:'temporary',p_claim_token:'token'}])
   })
 })
 

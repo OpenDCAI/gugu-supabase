@@ -26,7 +26,42 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     assert.ok(userEventsRelease, 'human user-events is an incremental release')
     const topicRelease = releases.find((release) => release.version.endsWith('_topic_source_resources'))
     assert.ok(topicRelease)
+    const idleExpiryRelease = releases.find((release) => release.version.endsWith('_large_file_idle_expiry'))
+    assert.ok(idleExpiryRelease)
     const releaseQuery = async (sql) => {
+      if (sql.includes(releases.find(release=>release.version.endsWith('_project_file_message_publication')).sql)) {
+        await t.test('atomic publication rollback restores the old function and leaves no private schema',async()=>{
+          await query(sql.replace(/COMMIT;\s*$/, 'ROLLBACK;'))
+          assert.equal((await query("SELECT to_regnamespace('file_private') AS schema"))[0].schema,null)
+          assert.equal((await query("SELECT prosecdef FROM pg_proc WHERE oid='chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid)'::regprocedure"))[0].prosecdef,true)
+          assert.equal((await query("SELECT to_regprocedure('chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb)') AS f"))[0].f,null)
+        })
+        return query(sql)
+      }
+      if (sql.includes(idleExpiryRelease.sql)) {
+        const owner=randomUUID(),group=randomUUID(),blob=randomUUID(),stored=randomUUID(),sha='ef'.repeat(32)
+        await db.query("INSERT INTO identity.users(id,type,display_name) VALUES($1,'human','retention upgrade fixture')",[owner])
+        await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','retention upgrade',$2)",[group,owner])
+        await db.query("INSERT INTO chat.file_blobs(id,bucket_id,object_name,sha256,size_bytes,content_type,created_by) VALUES($1,'oss',$2,$3,51,'application/octet-stream',$4)",[blob,'ef/'+sha,sha,owner])
+        await db.query("INSERT INTO chat.file_transfer_storage(id,blob_id,bucket_id,object_name,size_bytes) VALUES($1,$2,'oss',$3,51)",[stored,blob,'ef/'+sha])
+        await db.query("INSERT INTO chat.file_transfer_storage_refs(storage_id,chat_id,account_id,created_at) VALUES($1,$2,$3,now()-interval '2 years')",[stored,group,owner])
+        const original=(await db.query('SELECT created_at FROM chat.file_transfer_storage_refs WHERE storage_id=$1',[stored])).rows[0].created_at
+        await t.test('idle expiry upgrade rolls back all columns and preserves legacy references',async()=>{
+          await query(sql.replace(/COMMIT;\s*$/, 'ROLLBACK;'))
+          assert.equal((await db.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema='chat' AND table_name='file_transfer_storage_refs' AND column_name='retention_started_at'")).rows[0].n,0)
+          assert.deepEqual((await db.query('SELECT created_at FROM chat.file_transfer_storage_refs WHERE storage_id=$1',[stored])).rows[0].created_at,original)
+        })
+        const result=await query(sql)
+        await t.test('idle expiry upgrade gives old references a full interval without inventing downloads',async()=>{
+          const r=(await db.query("SELECT *,retention_started_at>now()-interval '1 minute' AS fresh FROM chat.file_transfer_storage_refs WHERE storage_id=$1",[stored])).rows[0]
+          assert.deepEqual(r.created_at,original);assert.equal(r.last_download_at,null);assert.equal(r.expired_at,null);assert.equal(r.fresh,true)
+        })
+        await db.query('DELETE FROM chat.file_transfer_storage WHERE id=$1',[stored])
+        await db.query('DELETE FROM chat.file_blobs WHERE id=$1',[blob])
+        await db.query('DELETE FROM chat.chats WHERE id=$1',[group])
+        await db.query('DELETE FROM identity.users WHERE id=$1',[owner])
+        return result
+      }
       if (sql.includes(topicRelease.sql)) {
         const rolledBack = sql.replace(/COMMIT;\s*$/, 'ROLLBACK;')
         await t.test('topic resources install on an empty community database', async () => {
@@ -133,6 +168,21 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     } finally {
       await db.query('ROLLBACK')
     }
+    await t.test('project metadata tables are closed and only intended read/publish APIs are granted', async () => {
+      for (const table of ['file_project_policies','file_device_revisions']) {
+        assert.equal((await query(`SELECT relrowsecurity AS enabled FROM pg_class WHERE oid='chat.${table}'::regclass`))[0].enabled, true)
+        for (const role of ['anon','authenticated']) {
+          for (const privilege of ['SELECT','INSERT','UPDATE','DELETE']) {
+            assert.equal((await db.query('SELECT has_table_privilege($1,$2,$3) AS allowed', [role,'chat.'+table,privilege])).rows[0].allowed, false)
+          }
+        }
+      }
+      for (const signature of ['file_project_policy_as(text,text,text,boolean,boolean,text)','file_project_policy_for(text,text)',
+        'file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb)','file_resolve_as(jsonb,text)']) {
+        assert.equal((await db.query("SELECT has_function_privilege('authenticated',$1,'EXECUTE') AS allowed", ['chat.'+signature])).rows[0].allowed, true)
+        assert.equal((await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS allowed", ['chat.'+signature])).rows[0].allowed, false)
+      }
+    })
     await db.query('BEGIN')
     try {
       await db.query('CREATE FUNCTION public.foundation_acl_probe() RETURNS integer LANGUAGE sql AS $$SELECT 1$$')

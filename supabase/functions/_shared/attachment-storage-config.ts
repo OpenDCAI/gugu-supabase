@@ -40,12 +40,10 @@ export function attachmentStorageConfig(env: (key: string) => string | undefined
   // Optional physical prefix that keeps environments sharing one bucket apart; logical keys in the database never change.
   const objectPrefix = get('ATTACHMENTS_OBJECT_PREFIX')
   const cdnSettings: Partial<CdnConfig>={}
-  for (const [key,field] of [['CDN_AUTH_TTL_SECONDS','authTtlSeconds'],['CDN_REQUEST_LIMIT_BITS_PER_SECOND','requestLimitBitsPerSecond']] as const) {
-    if (get(key)) {
-      const value=Number(get(key))
-      if (!Number.isSafeInteger(value)||value<1) throw new StorageConfigError([key])
-      cdnSettings[field]=value
-    }
+  if (get('CDN_AUTH_TTL_SECONDS')) {
+    const value=Number(get('CDN_AUTH_TTL_SECONDS'))
+    if (!Number.isSafeInteger(value)||value<1) throw new StorageConfigError(['CDN_AUTH_TTL_SECONDS'])
+    cdnSettings.authTtlSeconds=value
   }
   return {
     kind: 'oss',

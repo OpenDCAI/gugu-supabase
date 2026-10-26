@@ -33,8 +33,6 @@ export interface CdnConfig {
   authKey: string
   /** Must equal the validity period configured at the CDN edge. */
   authTtlSeconds?: number
-  /** Fixed per-request edge limit, with no client-controlled URL override. */
-  requestLimitBitsPerSecond?: number
 }
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 

@@ -224,7 +224,7 @@ describe('temporary generations reuse managed budgets and private key issuance',
   const COMMIT='SELECT chat.file_temporary_commit($1,$2,$3,$4,$5)'
   const cfg={inventory_ready:true,storage_global_bytes:10000,storage_account_bytes:10000,storage_group_bytes:10000,
     download_global_bytes:10000,download_account_bytes:10000,download_group_bytes:10000,
-    upload_permit_seconds:120,sign_window_seconds:60,sign_account_count:100,sign_group_count:100,file_max_bytes:1000,download_link_bits_per_second:819200,temporary_group_bytes:10000}
+    upload_permit_seconds:120,sign_window_seconds:60,sign_account_count:100,sign_group_count:100,file_max_bytes:1000,temporary_group_bytes:10000}
   beforeEach(async()=>{
     await publish();await service()
     const baseline=Number((await db.query("SELECT chat.file_transfer_usage('upload','global','*') AS n")).rows[0].n)

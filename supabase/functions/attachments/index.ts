@@ -64,10 +64,10 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
     auth: { persistSession: false, autoRefreshToken: false },
   })
   const asService = createClient(url, env('SUPABASE_SERVICE_ROLE_KEY'), { db: { schema: 'chat' }, auth: { persistSession: false } })
-  const signStorage=async(bucket:string,object:string,seconds:number,trafficBits?:number)=>{
-    // Storage signing has no native per-connection throttle. Self-hosters configure it at their uncached gateway.
-    if(seconds!==60||!trafficBits||Number(env('SUPABASE_STORAGE_REQUEST_LIMIT_BITS_PER_SECOND'))!==trafficBits) {
-      throw new Refusal(503,'not_configured','An uncached, rate-limited Storage gateway must be configured before download signing')
+  const signStorage=async(bucket:string,object:string,seconds:number)=>{
+    // Storage signs the same 60-second capability; any gateway rate policy is independent.
+    if(seconds!==60) {
+      throw new Refusal(503,'not_configured','Managed Storage downloads require a 60-second capability')
     }
     const {data,error}=await asService.storage.from(bucket).createSignedUrl(object,seconds)
     if(error||!data?.signedUrl) throw new Error('Could not sign a managed Storage download')
@@ -84,7 +84,7 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
           if (error || !data?.signedUrl) throw new Error('could not sign attachment upload')
           return publicStorageUrl(data.signedUrl, url)
         },
-        signDownload: (key,seconds,traffic)=>signStorage(storage.bucket,key,seconds,traffic),
+        signDownload: (key,seconds)=>signStorage(storage.bucket,key,seconds),
       }),
     fetch: (input, init) => fetch(input, init),
     userRpc: async (fn, args) => {

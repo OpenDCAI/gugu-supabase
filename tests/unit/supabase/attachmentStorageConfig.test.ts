@@ -57,7 +57,7 @@ describe('attachment storage configuration', () => {
   })
 
   it('reads attachments already stored on OSS through CDN links', async () => {
-    const config = attachmentStorageConfig(from({...OSS,CDN_AUTH_TTL_SECONDS:'1800',CDN_REQUEST_LIMIT_BITS_PER_SECOND:'819200'}))
+    const config = attachmentStorageConfig(from({...OSS,CDN_AUTH_TTL_SECONDS:'1800'}))
     if (config.kind !== 'oss') throw new Error('expected OSS')
     const row = {
       item_id: null, version: null, message_id: 'm1', current_version: null, chat_id: 'c1', file_name: 'a.png',
@@ -74,7 +74,7 @@ describe('attachment storage configuration', () => {
       },
       serviceRpc: async (fn: string) => {
         expect(fn).toBe('file_transfer_settings')
-        return { data: { download_link_bits_per_second: 819200 }, error: null }
+        return { data: {}, error: null }
       },
       storageSignedUrl: async () => { throw new Error('OSS rows must not be signed by Supabase Storage') },
       now: () => new Date('2026-10-21T00:00:00Z'),
@@ -84,5 +84,9 @@ describe('attachment storage configuration', () => {
     expect(urls).toHaveLength(1)
     expect(urls[0]!.url).toMatch(/^https:\/\/files\.example\.test\/ab\/abcdef\?auth_key=/)
     expect(urls[0]!.thumb_url).toContain('x-oss-process=')
+    const timestamp=Number(new URL(urls[0]!.url).searchParams.get('auth_key')!.split('-')[0])
+    expect(timestamp+1800).toBe(Date.parse('2026-10-21T00:01:00Z')/1000)
+    delete config.cdn.authTtlSeconds
+    await expect(handleUrls(deps,'u1',{refs:[{message_id:'m1'}]})).rejects.toMatchObject({status:503,code:'not_configured'})
   })
 })

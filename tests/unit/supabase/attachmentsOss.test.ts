@@ -34,7 +34,7 @@ const OSS: OssConfig = {
   region: 'cn-wulanchabu', bucket: 'gugu-files-test', endpointInternal: 'oss-cn-wulanchabu-internal.aliyuncs.com',
   endpointPublic: 'oss-cn-wulanchabu.aliyuncs.com', accessKeyId: 'LTAI-test', accessKeySecret: 'secret-test',
 }
-const CDN = { domain: 'files-dev.gugu.nextmind.space', authKey: 'cdn-key-test', authTtlSeconds:1800, requestLimitBitsPerSecond:819200 }
+const CDN = { domain: 'files-dev.gugu.nextmind.space', authKey: 'cdn-key-test', authTtlSeconds:1800 }
 const USER = '11111111-1111-4111-8111-111111111111'
 const STAGING = `staging/${USER}/22222222-2222-4222-8222-222222222222`
 
@@ -248,7 +248,7 @@ function fakes(opts: {
       order.push('service:' + fn)
       if (fn==='file_managed_upload_for') {controls.push({as:'service',fn,args});return {data:{max_bytes:MAX_ATTACHMENT_BYTES},error:null}}
       if (fn==='file_managed_upload_registered'||fn==='file_transfer_expire'||fn==='file_temporary_expire') {controls.push({as:'service',fn,args});return {data:null,error:null}}
-      if (fn==='file_transfer_settings') {controls.push({as:'service',fn,args});return {data:{download_link_bits_per_second:819200},error:null}}
+      if (fn==='file_transfer_settings') {controls.push({as:'service',fn,args});return {data:{},error:null}}
       rpcs.push({ as: 'service', fn, args })
       if (fn === 'file_blob_register') {
         const next = registerErrors.shift()

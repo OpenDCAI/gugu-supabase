@@ -4,7 +4,7 @@ export class ObjectStorageError extends Error {
 
 export interface ReadObject { bytes: Uint8Array; etag: string | null }
 export interface InspectedObject extends ReadObject { sizeBytes: number; sha256: string }
-export interface DownloadPermit { requestId: string; expiresSeconds: number; trafficBits: number; direct?: boolean; }
+export interface DownloadPermit { requestId: string; expiresSeconds: number; trafficBits?: number; direct?: boolean; }
 export interface UploadPlan {
   url: string
   fields: Record<string, string>

@@ -8,7 +8,7 @@ CREATE INDEX file_transfer_download_group_signs ON chat.file_transfer_reservatio
 DO $download$
 DECLARE definition text; signature text;
     quota_lock text:='PERFORM pg_advisory_xact_lock(hashtextextended(''gugu:file-transfer:quota'',0));';
-    admission_lock text:='PERFORM 1 FROM chat.file_transfer_limits WHERE scope=''global'' AND scope_id=''*'' FOR UPDATE;';
+    admission_lock text:='PERFORM 1 FROM chat.file_transfer_limits limits WHERE limits.scope=''global'' AND limits.scope_id=''*'' FOR UPDATE;';
 BEGIN
     SELECT pg_get_functiondef('chat.file_transfer_reserve(uuid,text,text,text,bigint,text)'::regprocedure) INTO definition;
     IF position(quota_lock IN definition)=0 OR position('IF p_kind=''download'' THEN' IN definition)=0 THEN

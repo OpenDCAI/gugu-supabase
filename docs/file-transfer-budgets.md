@@ -1,6 +1,6 @@
 # Managed file transfer budgets
 
-This release adds the budget boundary to the existing attachments service. It does not implement project-local resolution, encrypted temporary transfers, idle-file expiry, or the separate public-media migration. Deploy it with a client that supplies the upload size, actor and group scope. Older unscoped upload requests fail closed.
+This release adds the budget boundary to the existing attachments service. It does not implement project-local resolution, encrypted temporary transfers, idle-file expiry, or the separate public-media migration. Deploy it with a client that supplies the upload size, actor and group scope. Older unscoped upload requests fail closed: an upload that declares no size gets `426 client_outdated`, whose message asks the person to update Gugu.
 
 ## Guarantees and limits
 

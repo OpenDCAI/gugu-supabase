@@ -143,7 +143,8 @@ async function issueUpload(deps: AttachmentsDeps, userId: string, body: Record<s
   const id=str(body,'request_id',false)??deps.uuid()
   if (!UUID.test(id)) throw new Refusal(400,'invalid','request_id must be a uuid')
   const declared=int(body,'size_bytes')
-  if (!declared) throw new Refusal(400,'invalid','size_bytes is required')
+  // Clients from before the budget release send an empty body; they cannot upload here, so tell their person to update.
+  if (!declared) throw new Refusal(426,'client_outdated','Update Gugu to send files (this version does not declare the file size)')
   const chat=str(body,'chat_id',false),actor=str(body,'as',false)??userId
   const prepared=await call(deps.userRpc,'file_managed_upload_prepare',{p_chat:chat,p_as:actor,p_bytes:declared}) as {
     max_bytes:number;permit_seconds:number

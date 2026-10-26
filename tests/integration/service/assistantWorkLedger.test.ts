@@ -648,6 +648,50 @@ describe('account work ledger and its only delivery outbox', () => {
     }
   })
 
+  it('serializes a report claim snapshot with an uncommitted coordinator move',async()=>{
+    const id=randomUUID(),event=report('progress')
+    await commit(id,[dispatch()],task());await commit(id,[event],null,randomUUID(),workerInstance)
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='admitted',executor_admitted_at=now() WHERE work_id=$1 AND kind='dispatch'",[id])
+    await db.query('COMMIT')
+    const moving=new pg.Client({connectionString:url}),taking=new pg.Client({connectionString:url})
+    await moving.connect();await taking.connect()
+    let flight:Promise<pg.QueryResult<{result:{events:Delivery[]}}>>|undefined
+    try {
+      await moving.query('BEGIN')
+      await moving.query("SELECT set_config('identity.agent_adopt_move_agent_id',$1,true)",[assistant])
+      await moving.query('UPDATE identity.users SET device_id=$1 WHERE id=$2',[device,assistant])
+      await taking.query('BEGIN')
+      await taking.query("SELECT set_config('request.jwt.claims',$1,true)",[JSON.stringify({sub:owner,role:'authenticated'})])
+      await taking.query('SET LOCAL ROLE authenticated')
+      const pid=(await taking.query<{pid:number}>('SELECT pg_backend_pid() AS pid')).rows[0]!.pid
+      let finished=false,blocked=false
+      flight=taking.query<{result:{events:Delivery[]}}>('SELECT identity.assistant_work_outbox_claim($1,20,60) AS result',[instance])
+      void flight.then(()=>{finished=true},()=>{finished=true})
+      const deadline=Date.now()+3000
+      while(!finished&&Date.now()<deadline) {
+        blocked=(await db.query<{blocked:boolean}>('SELECT cardinality(pg_blocking_pids($1))>0 AS blocked',[pid])).rows[0]!.blocked
+        if(blocked)break
+        await new Promise(resolve=>setTimeout(resolve,10))
+      }
+      await moving.query('COMMIT')
+      const answer=(await flight).rows[0]!.result
+      await taking.query('COMMIT')
+      expect(blocked).toBe(true)
+      expect(answer.events).toHaveLength(0)
+      expect((await db.query('SELECT delivery_state,attempts,assistant_admitted_at FROM identity.assistant_work_events WHERE message_id=$1',[event.message_id])).rows[0]).toEqual({delivery_state:'pending',attempts:0,assistant_admitted_at:null})
+    } finally {
+      await moving.query('ROLLBACK');await flight?.catch(()=>undefined);await taking.query('ROLLBACK')
+      await moving.end();await taking.end()
+      await db.query('DELETE FROM identity.assistant_work WHERE owner_user_id=$1',[owner])
+      await db.query('DELETE FROM identity.agent_provision_operations WHERE owner_user_id=$1',[owner])
+      await db.query('DELETE FROM chat.chats WHERE id=$1',[chat])
+      await db.query('DELETE FROM identity.users WHERE id=ANY($1)',[[assistant,executor]])
+      await db.query('DELETE FROM identity.gugu_devices WHERE device_id=ANY($1)',[[home,device]])
+      await db.query('DELETE FROM auth.users WHERE id=ANY($1::uuid[])',[[owner,stranger]])
+      await db.query('BEGIN')
+    }
+  })
+
   it('exercises atomic enqueue, lease acknowledgement and offline reads through authenticated HTTP', async () => {
     await db.query('COMMIT')
     const endpoint = process.env.GUGU_INTEGRATION_SUPABASE_URL ?? ''

@@ -202,6 +202,21 @@ describe('account work ledger and its only delivery outbox', () => {
     expect((await list()).items).toHaveLength(1)
   })
 
+  it('queues native session-file receipts addressed to the coordinator, with verified metadata', async () => {
+    const id = randomUUID(), attachment = randomUUID(), staging = `staging/${owner}/${randomUUID()}`
+    await commit(id,[dispatch()],task())
+    await db.query('SET LOCAL ROLE service_role')
+    await db.query('SELECT * FROM chat.file_blob_register($1,$2,$3,4,$4)',[owner,staging,'ab'.repeat(32),'application/octet-stream'])
+    await db.query('RESET ROLE')
+    const ref = await as(owner, async () => (await db.query<{ attachment_id: string; file_name: string; sha256: string; size_bytes: string; content_type: string }>(
+      'SELECT * FROM chat.session_attachment_commit($1,$2,$3,$4,$5,$6)',[staging,attachment,executor,worker,[assistant],'original.bin'])).rows[0]!)
+    const native = { ...ref,size_bytes: Number(ref.size_bytes) }
+    const completed = report('completed',{ attachment_refs: [native] })
+    await failure(() => commit(id,[{ ...completed,attachment_refs: [{ ...native,sha256: 'cd'.repeat(32) }] }],null,randomUUID(),workerInstance), /attachment|metadata|visible/i)
+    await commit(id,[completed],null,randomUUID(),workerInstance)
+    expect((await claim()).events.find(row => row.message_id === completed.message_id)!.attachment_refs).toEqual([native])
+  })
+
   it('does not expose queue tokens in history and performs no writes while reading', async () => {
     const id = randomUUID(); await commit(id,[dispatch()],task())
     await claim()

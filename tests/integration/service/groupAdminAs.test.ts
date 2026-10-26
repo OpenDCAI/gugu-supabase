@@ -187,6 +187,10 @@ describe('related membership and external consent', () => {
   it('adds one’s own Agent directly, and an Agent directly adds its human owner', async () => {
     expect((await invite(freshAgent)).status).toBe('joined'); expect(await present(freshAgent)).toBe(true)
     await service(); await db.query('DELETE FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [room, agentOwner])
+    expect(await present(adminAgent)).toBe(false)
+    // A new owner departure carries its Agent. Re-create a legacy Agent-only
+    // group seat to retain coverage of the existing related invitation path.
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'admin')", [room, adminAgent])
     expect((await invite(agentOwner, agentOwner, adminAgent)).status).toBe('joined')
     expect(await present(agentOwner)).toBe(true)
   })

@@ -80,11 +80,11 @@ BEGIN
         t.creator_user_id,
         t.last_message_at,
         -- 数的是 actor 读得到的条数:与 message_history_as 同一组条件(未删 + 可见下界 + 悄悄话规则);
-        -- 下界每个话题只算一次,逐行只剩内联后的悄悄话规则。
+        -- The one visibility rule; the floor is computed once per topic.
         (SELECT count(*) FROM chat.messages m
           WHERE m.chat_id = t.id AND m.deleted_at IS NULL
-            AND m.created_at >= (SELECT chat.history_floor(t.id, v_actor))
-            AND chat.whisper_visible_to(m.is_whisper, m.sender_user_id, m.to_user_ids, v_actor)),
+            AND chat.message_visible_at((SELECT chat.history_floor(t.id, v_actor)),
+                  m.created_at, m.is_whisper, m.sender_user_id, m.to_user_ids, v_actor)),
         (SELECT count(*) FROM chat.chat_members cm WHERE cm.chat_id = t.id),
         chat.is_chat_member(t.id, v_actor)
     FROM chat.chats t

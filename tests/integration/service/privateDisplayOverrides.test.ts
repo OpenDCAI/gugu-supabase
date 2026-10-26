@@ -9,7 +9,7 @@ it('keeps contact and group aliases private, synchronized and backward compatibl
   }
   const db = new Client({ connectionString: url })
   await db.connect()
-  const [owner, member, stranger, group, topic] = Array.from({ length: 5 }, () => randomUUID())
+  const [owner, member, stranger, group, direct] = Array.from({ length: 5 }, () => randomUUID())
   const q = async (sql: string, values: unknown[] = []) => (await db.query(sql, values)).rows
   const as = async (user: string) => {
     await q('RESET ROLE')
@@ -24,8 +24,8 @@ it('keeps contact and group aliases private, synchronized and backward compatibl
   try {
     await q('BEGIN')
     await q('INSERT INTO auth.users(id, created_at) SELECT id, now() FROM unnest($1::uuid[]) id', [[owner, member, stranger]])
-    await q("INSERT INTO chat.chats(id, kind, name, creator_user_id) VALUES ($1,'group','Shared group',$3),($2,'topic','Topic',$3)", [group, topic, owner])
-    await q("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner'),($1,$3,'member'),($4,$2,'owner')", [group, owner, member, topic])
+    await q("INSERT INTO chat.chats(id, kind, name, creator_user_id) VALUES ($1,'group','Shared group',$3),($2,'dm',NULL,$3)", [group, direct, owner])
+    await q("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner'),($1,$3,'member'),($4,$2,'owner')", [group, owner, member, direct])
     const start = await q('SELECT user_id, revision::text FROM chat.account_revision_heads WHERE user_id = ANY($1::text[])', [[owner, member, stranger]])
     const boundaries = new Map(start.map(row => [row.user_id, BigInt(row.revision)]))
     await as(owner)
@@ -43,7 +43,7 @@ it('keeps contact and group aliases private, synchronized and backward compatibl
       expect.objectContaining({ target_kind: 'contact', target_id: member, alias: 'My friend' }),
       expect.objectContaining({ target_kind: 'group', target_id: group, alias: 'My renamed group' }),
     ]))
-    await denied(upsert, [owner, topic, 'Not a group'])
+    await denied(upsert, [owner, direct, 'Not a group'])
     await denied(upsert, [owner, group, 'x'.repeat(81)])
     await denied('UPDATE identity.contact_overrides SET contact_user_id=$1 WHERE target_kind=\'group\'', [member])
     await as(member)

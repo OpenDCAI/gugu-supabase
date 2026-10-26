@@ -61,6 +61,55 @@ beforeEach(async () => {
 afterEach(async () => { await db.query('ROLLBACK') })
 
 describe('account work ledger and its only delivery outbox', () => {
+  it('leaves unbound reports unclaimed without spending attempts while dispatch remains available',async()=>{
+    const id=randomUUID(),event=report('progress'),other=randomUUID(),first=dispatch()
+    await commit(id,[dispatch()],task());await commit(id,[event],null,randomUUID(),workerInstance)
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='admitted',executor_admitted_at=now() WHERE work_id=$1 AND kind='dispatch'",[id])
+    await commit(other,[first],task())
+    await db.query("SELECT set_config('identity.agent_adopt_move_agent_id',$1,true)",[assistant])
+    await db.query('UPDATE identity.users SET device_id=$1 WHERE id=$2',[device,assistant])
+    expect((await claim()).events.map(row=>row.message_id)).toEqual([first.message_id])
+    expect((await claim(workerInstance)).events).toHaveLength(0)
+    expect((await db.query('SELECT delivery_state,attempts FROM identity.assistant_work_events WHERE message_id=$1',[event.message_id])).rows[0]).toEqual({delivery_state:'pending',attempts:0})
+    await as(owner,()=>call('assistant_work_coordinator_bind',[assistant,workerInstance,randomUUID()]))
+    const ready=(await claim(workerInstance)).events
+    expect(ready.map(row=>row.message_id)).toEqual([event.message_id])
+    await settle(ready[0]!,'assistant_admitted',workerInstance)
+    expect((await history(id)).events.find(row=>row.message_id===event.message_id)?.delivery_state).toBe('admitted')
+  })
+
+  it('invalidates an in-flight report lease when its coordinator moves',async()=>{
+    const id=randomUUID(),event=report('progress')
+    await commit(id,[dispatch()],task());await commit(id,[event],null,randomUUID(),workerInstance)
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='admitted',executor_admitted_at=now() WHERE work_id=$1 AND kind='dispatch'",[id])
+    const leased=(await claim()).events[0]!
+    await db.query("SELECT set_config('identity.agent_adopt_move_agent_id',$1,true)",[assistant])
+    await db.query('UPDATE identity.users SET device_id=$1 WHERE id=$2',[device,assistant])
+    await failure(()=>settle(leased,'assistant_admitted'),/lease|token/i)
+    expect((await claim()).events).toHaveLength(0)
+    expect((await db.query('SELECT delivery_state,assistant_admitted_at FROM identity.assistant_work_events WHERE message_id=$1',[event.message_id])).rows[0]).toEqual({delivery_state:'pending',assistant_admitted_at:null})
+    await as(owner,()=>call('assistant_work_coordinator_bind',[assistant,workerInstance,randomUUID()]))
+    expect((await claim(workerInstance)).events[0]?.message_id).toBe(event.message_id)
+  })
+
+  it('requires a fresh binding when returning to a previously bound or original home',async()=>{
+    const id=randomUUID(),nextSession=randomUUID(),third=`ledger-${randomUUID()}`
+    await commit(id,[dispatch()],task())
+    await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,'fixture','fixture','linux')",[third,owner])
+    await db.query("SELECT set_config('identity.agent_adopt_move_agent_id',$1,true)",[assistant])
+    await db.query('UPDATE identity.users SET device_id=$1 WHERE id=$2',[device,assistant])
+    await as(owner,()=>call('assistant_work_coordinator_bind',[assistant,workerInstance,nextSession]))
+    expect((await history(id)).work).toHaveProperty('coordinator_current',{session_id:nextSession,device_id:device})
+    for(const target of [third,device,home]) {
+      await db.query('UPDATE identity.users SET device_id=$1 WHERE id=$2',[target,assistant])
+      expect((await history(id)).work).toHaveProperty('coordinator_current',null)
+      expect((await db.query('SELECT current_coordinator_session_id,current_coordinator_device_id FROM identity.assistant_work WHERE work_id=$1',[id])).rows[0]).toEqual({current_coordinator_session_id:null,current_coordinator_device_id:null})
+    }
+    const fresh=randomUUID()
+    await as(owner,()=>call('assistant_work_coordinator_bind',[assistant,instance,fresh]))
+    expect((await history(id)).work).toHaveProperty('coordinator_current',{session_id:fresh,device_id:home})
+  })
+
   it('binds the moved assistant coordinator without rewriting original report endpoints or hashes',async()=>{
     const id=randomUUID(),pending=randomUUID(),event=report(),nextSession=randomUUID()
     await commit(pending,[dispatch()],task())

@@ -61,6 +61,33 @@ beforeEach(async () => {
 afterEach(async () => { await db.query('ROLLBACK') })
 
 describe('account work ledger and its only delivery outbox', () => {
+  it('binds the moved assistant coordinator without rewriting original report endpoints or hashes',async()=>{
+    const id=randomUUID(),pending=randomUUID(),event=report(),nextSession=randomUUID()
+    await commit(pending,[dispatch()],task())
+    await commit(id,[dispatch()],task());await commit(id,[event],null,randomUUID(),workerInstance)
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='admitted',executor_admitted_at=now() WHERE work_id=$1 AND kind='dispatch'",[id])
+    const original=(await db.query('SELECT event_hash,to_session_id,to_device_id FROM identity.assistant_work_events WHERE message_id=$1',[event.message_id])).rows[0]
+    await db.query("SELECT set_config('identity.agent_adopt_move_agent_id',$1,true)",[assistant])
+    await db.query('UPDATE identity.users SET device_id=$1 WHERE id=$2',[device,assistant])
+    expect((await history(id)).work).toHaveProperty('coordinator_current',null)
+    expect((await history(id)).events.find(row=>row.message_id===event.message_id)).toHaveProperty('delivery_target',null)
+    await failure(()=>as(owner,()=>call('assistant_work_coordinator_bind',[assistant,instance,nextSession])),/home|runtime/i)
+    await as(owner,()=>call('assistant_work_coordinator_bind',[assistant,workerInstance,nextSession]))
+    expect(await as(owner,()=>call('assistant_work_coordinator_bind',[assistant,workerInstance,nextSession]))).toMatchObject({bound_count:0})
+    expect((await history(id)).work).toHaveProperty('coordinator_current',{session_id:nextSession,device_id:device})
+    expect((await history(id)).events.find(row=>row.message_id===event.message_id)).toHaveProperty('delivery_target',{session_id:nextSession,device_id:device})
+    expect((await claim(workerInstance)).events.find(row=>row.message_id===event.message_id)).toHaveProperty('coordinator_current',{session_id:nextSession,device_id:device})
+    expect((await db.query('SELECT event_hash,to_session_id,to_device_id FROM identity.assistant_work_events WHERE message_id=$1',[event.message_id])).rows[0]).toEqual(original)
+    const inference=report('failed',{from_session_id:nextSession,from_device_id:device,executor_session_id:worker,reason_code:'EXECUTOR_ENDED_WITHOUT_REPORT'})
+    await commit(id,[inference],null,randomUUID(),workerInstance)
+    expect((await history(id)).work.outcome).toBe('completed') // A relocated inference never replaces a real result.
+    await failure(()=>commit(pending,[report('failed',{from_session_id:coordinator,from_device_id:home,executor_session_id:worker,reason_code:'RESULT_MISSING'})]),/sender|endpoint/i)
+    await commit(pending,[{...inference,message_id:randomUUID(),to_session_id:nextSession,to_device_id:device}],null,randomUUID(),workerInstance)
+    expect((await history(pending)).work.outcome).toBe('failed')
+    await commit(pending,[report()],null,randomUUID(),workerInstance)
+    expect((await history(pending)).work.outcome).toBe('completed')
+  })
+
   it('reserves at most six notice wakes across runtime restarts, with server leases and grouped reasons',async()=>{
     const id=randomUUID(),one=dispatch(),two=dispatch()
     await commit(id,[one,two],task())

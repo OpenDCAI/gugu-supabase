@@ -12,16 +12,17 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM identity.users WHERE id = v_actor AND type = 'human') THEN
         RAISE EXCEPTION 'Only a person can delete a topic' USING ERRCODE = '42501';
     END IF;
+    -- Lock the source before the topic, as source membership removal does.
+    -- Keep membership/role and source status stable until archival commits.
+    SELECT m.role, s.kind INTO v_role, v_source_kind
+      FROM chat.chats s JOIN chat.chat_members m ON m.chat_id = s.id
+     WHERE s.id = (SELECT source_chat_id FROM chat.chats WHERE id = p_chat_id AND kind = 'topic')
+       AND s.status <> 'archived' AND m.user_id = v_actor
+     FOR SHARE OF s, m;
     SELECT * INTO v_topic FROM chat.chats WHERE id = p_chat_id AND kind = 'topic' FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Topic not found' USING ERRCODE = '22023';
     END IF;
-    -- Keep the source membership/role stable until the archive commits. Topic
-    -- participant roles do not grant authority over the source conversation.
-    SELECT m.role, s.kind INTO v_role, v_source_kind
-      FROM chat.chats s JOIN chat.chat_members m ON m.chat_id = s.id
-     WHERE s.id = v_topic.source_chat_id AND s.status <> 'archived' AND m.user_id = v_actor
-     FOR SHARE OF m;
     IF v_role IS NULL OR NOT (
         (v_source_kind = 'group' AND v_role IN ('owner', 'admin'))
         OR EXISTS (SELECT 1 FROM identity.users creator WHERE creator.id = v_topic.creator_user_id

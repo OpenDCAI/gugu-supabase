@@ -72,6 +72,19 @@ describe('human topic archival within the source conversation', () => {
     expect(await denied(() => archive(reader))).toContain('Only the topic creator')
     expect(await topicState()).toBe('active')
   })
+  it('does not require the human creator to remain a topic participant', async () => {
+    await db.query('DELETE FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [topic, creator])
+    expect(await archive(creator)).toEqual({ chat_id: topic, status: 'archived' })
+  })
+  it('allows only the creator in a source DM, without treating a peer as a group manager', async () => {
+    const dm = randomUUID(), anchor = randomUUID()
+    await db.query(`INSERT INTO chat.chats(id,kind) VALUES ($1,'dm')`, [dm])
+    await db.query(`INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner'),($1,$3,'member')`, [dm, reader, creator])
+    await db.query(`INSERT INTO chat.messages(id,chat_id,sender_user_id,content) VALUES ($1,$2,$3,'DM source')`, [anchor, dm, creator])
+    await db.query('UPDATE chat.chats SET source_chat_id=$1, source_message_id=$2 WHERE id=$3', [dm, anchor, topic])
+    expect(await denied(() => archive(reader))).toContain('Only the topic creator')
+    expect(await archive(creator)).toEqual({ chat_id: topic, status: 'archived' })
+  })
   it('requires current source membership for creators and rejects outsiders or spoofed actors', async () => {
     await db.query('DELETE FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [source, creator])
     expect(await denied(() => archive(creator))).toContain('Only the topic creator')

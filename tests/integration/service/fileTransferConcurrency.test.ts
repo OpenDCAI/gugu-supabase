@@ -40,7 +40,7 @@ afterEach(async()=>{
   else await db.query("DELETE FROM chat.file_transfer_limits WHERE scope='global' AND scope_id='*'")
 })
 
-async function race(kind='download',sameId=false,chat:string|null=null) {
+async function race(kind='download',sameId=false,chat:string|null=null,distinctAccounts=false) {
   const clients=await Promise.all(Array.from({length:8},async()=>{
     const c=new pg.Client({connectionString:url,application_name:'file-quota-contender'});await c.connect();return c
   }))
@@ -51,7 +51,7 @@ async function race(kind='download',sameId=false,chat:string|null=null) {
   } else await db.query("SELECT pg_advisory_lock(hashtextextended('gugu:file-transfer:quota',0))")
   const tasks=clients.map(async(c)=>{
     const id=sameId?shared:randomUUID();ids.push(id)
-    try { return {row:(await c.query('SELECT * FROM chat.file_transfer_reserve($1,$2,$3,$4,1,$5)',[id,kind,owner,chat,'contract'])).rows[0]} }
+    try { return {row:(await c.query('SELECT * FROM chat.file_transfer_reserve($1,$2,$3,$4,1,$5)',[id,kind,distinctAccounts?randomUUID():owner,chat,'contract'])).rows[0]} }
     catch(e) { return {error:e as pg.DatabaseError} }
   })
   let setupFailure:unknown
@@ -124,6 +124,12 @@ describe('real concurrent quota admission',()=>{
     expect(outcomes.filter(o=>'row'in o)).toHaveLength(3)
     expect(outcomes.filter(o=>'error'in o).map(o=>o.error?.hint)).toEqual(Array(5).fill('file_transfer_global_storage_full'))
     expect(Number((await db.query("SELECT chat.file_transfer_usage('upload','global','*') AS n")).rows[0].n)-globalStorage).toBe(3)
+  })
+  it.each(['global','group'] as const)('different accounts cannot overbook shared %s download headroom',async(scope)=>{
+    await db.query("UPDATE chat.file_transfer_limits SET settings=settings||$1::jsonb WHERE scope='global'",[{['download_'+scope+'_bytes']:3}])
+    const outcomes=await race('download',false,scope==='group'?group:null,true)
+    expect(outcomes.filter(o=>'row'in o)).toHaveLength(3)
+    expect(outcomes.filter(o=>'error'in o).map(o=>o.error?.hint)).toEqual(Array(5).fill('file_transfer_'+scope+'_download_full'))
   })
   it('eight simultaneous retries of one identity reserve exactly one byte',async()=>{
     const outcomes=await race('download',true)

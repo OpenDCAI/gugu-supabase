@@ -10,13 +10,18 @@ DECLARE
   v_work identity.assistant_work; v_prior identity.assistant_work_events;
   v_event jsonb; v_target jsonb; v_subject text; v_kind text; v_message uuid; v_at timestamptz;
   v_seq bigint; v_status text; v_outcome text; v_ids jsonb := '[]';
-  v_hash text; v_initial jsonb; v_first timestamptz;
+  v_hash text; v_initial jsonb; v_first timestamptz; v_latest identity.assistant_work_events;
 BEGIN
   IF p_work_id IS NULL OR jsonb_typeof(p_task) IS DISTINCT FROM 'object'
     OR p_task - ARRAY['title','coordinator_session_id','coordinator_device_id','executors','source_link'] <> '{}'
     OR length(COALESCE(p_task->>'title','')) NOT BETWEEN 1 AND 500
     OR COALESCE(p_task->>'coordinator_session_id','') !~ '^[a-zA-Z0-9_-]{1,128}$'
-    OR NOT EXISTS (SELECT 1 FROM identity.users WHERE id=p_assistant AND device_id=p_task->>'coordinator_device_id')
+    OR NOT EXISTS (SELECT 1 FROM identity.gugu_devices d WHERE d.device_id=p_task->>'coordinator_device_id' AND d.user_id::text=v_owner AND (
+      EXISTS (SELECT 1 FROM identity.users u WHERE u.id=p_assistant AND u.device_id=d.device_id)
+      OR EXISTS (SELECT 1 FROM identity.agent_provisions p WHERE p.agent_user_id=p_assistant AND p.owner_user_id=v_owner AND p.device_id=d.device_id AND p.phase IN ('ready','completed'))
+      OR EXISTS (SELECT 1 FROM identity.gugu_device_commands c WHERE c.user_id::text=v_owner AND c.device_id=d.device_id AND c.type='agent.retire'
+        AND c.payload->>'agent_user_id'=p_assistant AND c.payload->>'reason'='moved')
+    ))
     OR jsonb_typeof(p_task->'executors') IS DISTINCT FROM 'array' OR jsonb_array_length(p_task->'executors') NOT BETWEEN 1 AND 32
     OR jsonb_typeof(p_events) IS DISTINCT FROM 'array' OR jsonb_array_length(p_events) NOT BETWEEN 1 AND 32
     OR octet_length(p_events::text)>1048576 OR octet_length(p_task::text)>16384 THEN
@@ -113,6 +118,27 @@ BEGIN
     END IF;
     v_ids:=v_ids||jsonb_build_array(v_message::text);
   END LOOP;
+  -- Expired legacy waiting is an inference, not an executor result or a new delivery.
+  -- Link it to the latest actual receipt and retain executor authority for late true results.
+  IF v_work.legacy_imported AND v_work.updated_at < clock_timestamp()-interval '24 hours' THEN
+    FOR v_target IN SELECT value FROM jsonb_array_elements(v_work.executors) LOOP
+      v_subject:=v_target->>'session_id';
+      IF v_work.executor_outcomes->v_subject IS NOT NULL THEN CONTINUE; END IF;
+      SELECT * INTO v_latest FROM identity.assistant_work_events
+        WHERE owner_user_id=v_owner AND work_id=p_work_id AND executor_session_id=v_subject ORDER BY seq DESC LIMIT 1;
+      IF NOT FOUND THEN CONTINUE; END IF;
+      v_work.executor_outcomes:=v_work.executor_outcomes||jsonb_build_object(v_subject,jsonb_build_object(
+        'status','failed','origin','coordinator','reason_code','LEGACY_REPORT_MISSING','reason','旧任务，没有等到回报',
+        'message_id',v_latest.message_id,'version',v_latest.seq::text));
+      v_work.terminal_version:=GREATEST(v_work.terminal_version,v_latest.seq);
+    END LOOP;
+    v_outcome:='active';
+    IF (SELECT count(*) FROM jsonb_object_keys(v_work.executor_outcomes))=jsonb_array_length(v_work.executors) THEN
+      SELECT CASE WHEN bool_or(value->>'status'='failed') THEN 'failed' WHEN bool_or(value->>'status'='cancelled') THEN 'cancelled' ELSE 'completed' END INTO v_outcome FROM jsonb_each(v_work.executor_outcomes);
+    END IF;
+    UPDATE identity.assistant_work SET executor_outcomes=v_work.executor_outcomes,outcome=v_outcome,terminal_version=v_work.terminal_version
+      WHERE owner_user_id=v_owner AND work_id=p_work_id RETURNING * INTO v_work;
+  END IF;
   RETURN jsonb_build_object('work_id',p_work_id,'event_ids',v_ids,'outcome',v_work.outcome,'terminal_version',v_work.terminal_version::text);
 END;
 $$;

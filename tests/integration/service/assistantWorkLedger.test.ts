@@ -61,6 +61,27 @@ beforeEach(async () => {
 afterEach(async () => { await db.query('ROLLBACK') })
 
 describe('account work ledger and its only delivery outbox', () => {
+  it('closes stale imported work without a result and allows a late genuine result to prevail',async()=>{
+    const id=randomUUID(),event=dispatch(),input={...task(),coordinator_device_id:home}
+    await as(owner,()=>call('assistant_work_import',[assistant,workerInstance,id,JSON.stringify(input),JSON.stringify([{...event,occurred_at:'2026-10-20T08:00:00Z',receipt_kind:'received'}])]))
+    expect((await list()).items.filter(row=>row.outcome==='active')).toHaveLength(0)
+    const row=(await history(id)).work as Work & {executor_outcomes:Record<string,{origin:string;reason_code:string}>}
+    expect(row.outcome).toBe('failed')
+    expect(row.executor_outcomes[worker]).toMatchObject({origin:'coordinator',reason_code:'LEGACY_REPORT_MISSING'})
+    await commit(id,[report()],null,randomUUID(),workerInstance)
+    expect((await history(id)).work.outcome).toBe('completed')
+  })
+  it('accepts an original coordinator home after an evidenced assistant move',async()=>{
+    const nextHome=`moved-${randomUUID()}`
+    await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,'next','next','linux')",[nextHome,owner])
+    await db.query("SELECT set_config('identity.agent_adopt_move_agent_id',$1,true)",[assistant])
+    await db.query('UPDATE identity.users SET device_id=$1 WHERE id=$2',[nextHome,assistant])
+    const id=randomUUID(),event=dispatch(),input={...task(),coordinator_device_id:home}
+    await as(owner,()=>call('assistant_work_import',[assistant,workerInstance,id,JSON.stringify(input),JSON.stringify([{...event,occurred_at:'2026-10-20T08:00:00Z',receipt_kind:'received'}])]))
+    expect((await history(id)).work.work_id).toBe(id)
+    const forged=randomUUID()
+    await failure(()=>as(owner,()=>call('assistant_work_import',[assistant,workerInstance,forged,JSON.stringify({...input,coordinator_device_id:device}),JSON.stringify([{...event,from_device_id:device,occurred_at:'2026-10-20T08:00:00Z',receipt_kind:'received'}])])),/historical|coordinator|invalid/i)
+  })
   it('imports a real legacy admission without rerunning the task or manufacturing owner delivery',async()=>{
     const id=randomUUID(),event=dispatch(),occurred='2026-10-20T08:00:00Z'
     const input={...task(),coordinator_device_id:home}

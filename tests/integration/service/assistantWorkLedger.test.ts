@@ -9,7 +9,7 @@ let instance: string, workerInstance: string, coordinator: string, worker: strin
 const url = process.env.GUGU_INTEGRATION_DATABASE_URL ?? ''
 type Event = { message_id: string; kind: string; from_session_id: string; from_device_id: string; to_session_id: string; to_device_id: string; content?: string; [key: string]: unknown }
 type Work = { work_id: string; outcome: string; terminal_version: string }
-type Delivery = Event & { lease_token: string; delivery_state: string; platform_received_at: string; assistant_admitted_at: string | null; owner_delivered_at: string | null }
+type Delivery = Event & { seq:string; lease_token: string; delivery_state: string; platform_received_at: string; assistant_admitted_at: string | null; owner_delivered_at: string | null; occurred_at?:string }
 
 async function as<T>(user: string, action: () => Promise<T>): Promise<T> {
   await db.query("SELECT set_config('request.jwt.claims',$1,true)", [JSON.stringify({ sub: user, role: 'authenticated' })])
@@ -61,6 +61,44 @@ beforeEach(async () => {
 afterEach(async () => { await db.query('ROLLBACK') })
 
 describe('account work ledger and its only delivery outbox', () => {
+  it('imports a real legacy admission without rerunning the task or manufacturing owner delivery',async()=>{
+    const id=randomUUID(),event=dispatch(),occurred='2026-10-20T08:00:00Z'
+    const input={...task(),coordinator_device_id:home}
+    const migrated={...event,occurred_at:occurred,receipt_kind:'received'}
+    const request=()=>as(owner,()=>call('assistant_work_import',[assistant,workerInstance,id,JSON.stringify(input),JSON.stringify([migrated])]))
+    await request();await request()
+    expect((await claim()).events).toHaveLength(0)
+    const page=await history(id)
+    expect(page.events).toHaveLength(1)
+    expect(page.events[0]).toMatchObject({content:event.content,delivery_state:'admitted',owner_delivered_at:null})
+    expect(Date.parse(page.events[0]!.occurred_at!)).toBe(Date.parse(occurred))
+    expect(Date.parse(page.events[0]!.platform_received_at)).toBeGreaterThan(Date.parse(occurred))
+  })
+  it('imports legacy executor results and preserves their terminal fact without another send',async()=>{
+    const id=randomUUID(),input={...task(),coordinator_device_id:home},event=report()
+    await as(owner,()=>call('assistant_work_import',[assistant,workerInstance,id,JSON.stringify(input),JSON.stringify([{...event,occurred_at:'2026-10-20T08:00:00Z',receipt_kind:'sent_admitted'}])]))
+    expect((await history(id)).work).toMatchObject({work_id:id,outcome:'completed'})
+    expect((await claim()).events).toHaveLength(0)
+  })
+  it('refuses a legacy admission attested by a device outside either receipt endpoint',async()=>{
+    const id=randomUUID(),input={...task(),coordinator_device_id:home}
+    await failure(()=>as(owner,()=>call('assistant_work_import',[assistant,instance,id,JSON.stringify(input),JSON.stringify([{...dispatch(),occurred_at:'2026-10-20T08:00:00Z',receipt_kind:'received'}])])),/receipt|runtime|recipient/i)
+    expect((await list()).items).toHaveLength(0)
+  })
+
+  it('does not let a later imported progress change the real terminal version or a live queue receipt',async()=>{
+    const id=randomUUID(),input={...task(),coordinator_device_id:home},final=report(),later=report('progress')
+    await as(owner,()=>call('assistant_work_import',[assistant,workerInstance,id,JSON.stringify(input),JSON.stringify([
+      {...final,occurred_at:'2026-10-20T08:00:00Z',receipt_kind:'sent_admitted'},
+      {...later,occurred_at:'2026-10-20T08:01:00Z',receipt_kind:'sent_admitted'}])]))
+    const page=await history(id)
+    expect(page.work.terminal_version).toBe(page.events.find(e=>e.message_id===final.message_id)!.seq)
+    const normal=randomUUID(),event=dispatch()
+    await commit(normal,[event],task())
+    await as(owner,()=>call('assistant_work_import',[assistant,workerInstance,normal,JSON.stringify(input),JSON.stringify([{...event,occurred_at:'2026-10-20T08:00:00Z',receipt_kind:'received'}])]))
+    expect((await history(normal)).events[0]!.delivery_state).toBe('pending')
+  })
+
   it('commits the task and delivery together; a failed second event leaves neither', async () => {
     const id = randomUUID()
     await failure(() => commit(id,[dispatch(),dispatch({ to_device_id: 'not-owned' })],task()), /endpoint|device|target/i)

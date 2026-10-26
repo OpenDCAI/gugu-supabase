@@ -74,13 +74,49 @@ describe('account work ledger and its only delivery outbox', () => {
       expect((await wakes()).items).toHaveLength(0)
       await failure(()=>as(owner,()=>call('assistant_work_notice_wake_release',[workerInstance,one.message_id,randomUUID()])),/lease|token/i)
       await as(owner,()=>call('assistant_work_notice_wake_release',[workerInstance,one.message_id,item.lease_token]))
+      await as(owner,()=>call('assistant_work_notice_wake_release',[workerInstance,one.message_id,item.lease_token]))
       expect((await wakes()).items).toHaveLength(0) // Releasing does not reset server backoff.
-      await db.query("UPDATE identity.assistant_work_events SET notice_wake_available_at=now()-interval '1 second' WHERE message_id=$1",[one.message_id])
+      await db.query("UPDATE identity.assistant_work_notice_wakes SET available_at=now()-interval '1 second' WHERE anchor_message_id=$1",[one.message_id])
       const next=randomUUID()
       await db.query('INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id) VALUES($1,$2,$3)',[next,device,owner]);workerInstance=next
     }
     expect((await wakes()).items).toHaveLength(0)
     expect((await history(id)).events).toHaveLength(2) // No second queue or synthetic payload.
+  })
+
+  it('keeps the same six-wake group and lease when an earlier event changes category',async()=>{
+    const id=randomUUID(),earlier=dispatch(),later=dispatch()
+    await commit(id,[earlier,later],task())
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='abandoned',abandoned_at=now(),abandoned_reason_code='DEVICE_OFFLINE' WHERE message_id=$1",[later.message_id])
+    const take=()=>as(owner,()=>call<{items:Array<{anchor_message_id:string;lease_token:string;wake_attempts:number}>}>('assistant_work_notice_wake_claim',[workerInstance,20,60]))
+    const first=(await take()).items[0]!
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='abandoned',abandoned_at=now(),abandoned_reason_code='DEVICE_UNREACHABLE' WHERE message_id=$1",[earlier.message_id])
+    expect((await take()).items).toHaveLength(0)
+    for(let n=1;n<=6;n++) {
+      await db.query("UPDATE identity.assistant_work_notice_wakes SET lease_until=now()-interval '1 second',available_at=now()-interval '1 second' WHERE work_id=$1",[id])
+      const rows=(await take()).items
+      if(n===6) expect(rows).toHaveLength(0)
+      else expect(rows[0]).toMatchObject({anchor_message_id:first.anchor_message_id,wake_attempts:n+1})
+    }
+  })
+
+  it('separates completed delivery from an earlier question notice and hides all wake metadata',async()=>{
+    const id=randomUUID(),question=report('question'),completed=report()
+    await commit(id,[dispatch()],task());await commit(id,[question],null,randomUUID(),workerInstance)
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='abandoned',abandoned_at=now(),abandoned_reason_code='DEVICE_OFFLINE' WHERE message_id=$1",[question.message_id])
+    const notice=randomUUID()
+    await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,'Question not delivered','text')",[notice,chat,assistant])
+    await as(owner,()=>call('assistant_work_owner_delivered',[assistant,instance,question.message_id,chat,notice,'abandonment_notice']))
+    await commit(id,[completed],null,randomUUID(),workerInstance)
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='abandoned',abandoned_at=now(),abandoned_reason_code='DEVICE_OFFLINE' WHERE message_id=$1",[completed.message_id])
+    const result=await as(owner,()=>call<{items:Array<{notice_kind:string}>}>('assistant_work_notice_wake_claim',[workerInstance,20,60]))
+    expect(result.items).toHaveLength(1);expect(result.items[0]!.notice_kind).toBe('completed')
+    for(const row of (await history(id)).events) expect(Object.keys(row).some(key=>key.startsWith('notice_wake_'))).toBe(false)
+    for(const row of (await claim()).events) expect(Object.keys(row).some(key=>key.startsWith('notice_wake_'))).toBe(false)
+    const abandoned=await as(owner,()=>call<{events:Delivery[]}>('assistant_work_abandoned',[instance,100]))
+    expect(abandoned.events.map(row=>row.message_id)).toEqual([completed.message_id])
+    await db.query('UPDATE identity.assistant_work_events SET owner_delivered_at=now() WHERE message_id=$1',[completed.message_id])
+    expect((await as(owner,()=>call<{items:Work[]}>('assistant_work_list',[assistant,null,100,true]))).items).toHaveLength(0)
   })
 
   it('uses the same stable reason categories as notice consumers without exposing the internal classifier',async()=>{
@@ -96,7 +132,9 @@ describe('account work ledger and its only delivery outbox', () => {
     await db.query("UPDATE identity.assistant_work_events SET delivery_state='abandoned',abandoned_at=now(),abandoned_reason_code='DEVICE_OFFLINE' WHERE work_id=$1",[id])
     const wake=()=>as(owner,()=>call<{items:Array<{anchor_message_id:string;lease_token:string}>}>('assistant_work_notice_wake_claim',[workerInstance,20,60]))
     const old=(await wake()).items[0]!
-    await db.query("UPDATE identity.assistant_work_events SET notice_wake_until=now()-interval '1 second',notice_wake_available_at=now()-interval '1 second' WHERE message_id=$1",[one.message_id])
+    await db.query("UPDATE identity.assistant_work_notice_wakes SET lease_until=now()-interval '1 second',available_at=now()-interval '1 second' WHERE anchor_message_id=$1",[one.message_id])
+    await as(owner,()=>call('assistant_work_notice_wake_release',[workerInstance,one.message_id,old.lease_token]))
+    await as(owner,()=>call('assistant_work_notice_wake_release',[workerInstance,one.message_id,old.lease_token]))
     const fresh=(await wake()).items[0]!
     expect(fresh.anchor_message_id).toBe(old.anchor_message_id);expect(fresh.lease_token).not.toBe(old.lease_token)
     await failure(()=>as(owner,()=>call('assistant_work_notice_wake_release',[workerInstance,one.message_id,old.lease_token])),/lease|token/i)

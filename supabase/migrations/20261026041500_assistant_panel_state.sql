@@ -7,7 +7,7 @@ CREATE TABLE identity.assistant_panel_items (
     resource_key text NOT NULL CHECK (length(resource_key) BETWEEN 1 AND 512),
     device_id text,
     revision bigint NOT NULL DEFAULT 0 CHECK (revision >= 0),
-    data jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(data) = 'object'),
+    data jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(data) = 'object' AND octet_length(data::text) <= 262144),
     body_item_id uuid REFERENCES chat.workspace_items(id) ON DELETE SET NULL,
     body_sha256 text CHECK (body_sha256 IS NULL OR body_sha256 ~ '^[0-9a-f]{64}$'),
     deleted_at timestamptz,
@@ -28,18 +28,18 @@ CREATE TABLE identity.assistant_panel_changes (
     resource_key text NOT NULL,
     device_id text,
     source text NOT NULL CHECK (source IN ('panel','runtime')),
-    operation text NOT NULL CHECK (operation IN ('save','remove','enable','disable','prepared','error')),
+    operation text NOT NULL CHECK (operation IN ('save','remove','enable','disable','prepared','error','notice')),
     expected_item_revision bigint NOT NULL,
     request_hash text NOT NULL,
-    payload jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
-    status text NOT NULL CHECK (status IN ('pending','applied','failed')),
+    payload jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object' AND octet_length(payload::text) <= 263168),
+    status text NOT NULL CHECK (status IN ('pending','applied','failed','superseded')),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     applied_at timestamptz,
     applied_device_id text,
     error_code text CHECK (error_code IS NULL OR error_code ~ '^[A-Z][A-Z0-9_]{0,63}$')
 );
 CREATE INDEX assistant_panel_pending ON identity.assistant_panel_changes(assistant_user_id, revision)
-    WHERE source = 'panel' AND status <> 'applied';
+    WHERE source = 'panel' AND status IN ('pending','failed');
 CREATE INDEX assistant_panel_resource_history ON identity.assistant_panel_changes(assistant_user_id,domain,resource_key,revision);
 CREATE INDEX assistant_panel_body_history ON identity.assistant_panel_changes((payload->>'bodyItemId'));
 
@@ -124,6 +124,14 @@ BEGIN
     IF p_data IS NULL OR jsonb_typeof(p_data) <> 'object' THEN
         RAISE EXCEPTION 'Panel data must be an object' USING ERRCODE = '22023';
     END IF;
+    IF octet_length(p_data::text) > 262144 THEN
+        RAISE EXCEPTION 'Panel metadata exceeds 256 KiB; store large content as a file' USING ERRCODE = '54000';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_each(p_data) e WHERE e.key IN ('path','relativePath') AND
+        (jsonb_typeof(e.value) <> 'string' OR length(e.value #>> '{}') NOT BETWEEN 1 AND 4096
+         OR e.value #>> '{}' ~ '(^[/~]|[\\:%[:cntrl:]]|(^|/)[.][.]?(/|$)|//|/$)')) THEN
+        RAISE EXCEPTION 'Panel paths must be normalized relative paths without traversal' USING ERRCODE = '22023';
+    END IF;
     v_keys := CASE WHEN p_key = '__collection__' OR starts_with(p_key,'__collection__:') THEN ARRAY['state','schemaVersion','itemCount','errorCode'] ELSE CASE p_domain
         WHEN 'tasks' THEN ARRAY['agentId','sessionId','parentSessionId','assistantSessionIds','chatId','title','createdAt','lastInteractedAt','status','statusDetail','statusObservedAt','sourceLinks']
         WHEN 'schedules' THEN ARRAY['title','prompt','at','cron','tz','enabled','nextRunAt','lastRun']
@@ -178,6 +186,145 @@ END;
 $$;
 REVOKE ALL ON FUNCTION identity.assistant_panel_validate(text,text,jsonb) FROM PUBLIC, anon, authenticated;
 
+-- Check the exact complete read representations while holding the assistant's
+-- control lock. A write cannot create a queue that admission cannot read.
+CREATE FUNCTION identity.assistant_panel_budget(p_assistant text) RETURNS void
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE v_snapshot jsonb; v_pending jsonb;
+BEGIN
+    SELECT jsonb_build_object('version',1,'revision',h.revision::text,
+        'items',COALESCE((SELECT jsonb_agg(to_jsonb(i) || jsonb_build_object('revision',i.revision::text))
+          FROM identity.assistant_panel_items i WHERE assistant_user_id = p_assistant AND domain <> 'control'),'[]'::jsonb),
+        'application',COALESCE((SELECT jsonb_agg(jsonb_build_object('operationId',operation_id,'revision',revision::text,
+          'domain',domain,'resourceKey',resource_key,'status',status,'errorCode',error_code))
+          FROM identity.assistant_panel_changes WHERE assistant_user_id = p_assistant AND source = 'panel'
+            AND status IN ('pending','failed')),'[]'::jsonb)),
+        jsonb_build_object('revision',h.revision::text,'changes',COALESCE((SELECT jsonb_agg(to_jsonb(c) ||
+          jsonb_build_object('revision',c.revision::text,'expected_item_revision',c.expected_item_revision::text))
+          FROM identity.assistant_panel_changes c WHERE assistant_user_id = p_assistant AND source = 'panel'
+            AND status IN ('pending','failed')),'[]'::jsonb))
+      INTO v_snapshot,v_pending FROM identity.assistant_panel_items h
+      WHERE assistant_user_id = p_assistant AND domain = 'control' AND resource_key = '__head__';
+    -- Reserve space for every pending entry's largest failure code/status. An
+    -- application error must itself remain recordable within the read budget.
+    IF octet_length(v_snapshot::text) + 128 * (SELECT count(*) FROM identity.assistant_panel_changes
+          WHERE assistant_user_id = p_assistant AND source = 'panel' AND status IN ('pending','failed')) > 16777216
+       OR octet_length(v_pending::text) + 128 * (SELECT count(*) FROM identity.assistant_panel_changes
+          WHERE assistant_user_id = p_assistant AND source = 'panel' AND status IN ('pending','failed')) > 16777216 THEN
+        RAISE EXCEPTION 'Panel write exceeds the complete response budget' USING ERRCODE = '54000';
+    END IF;
+END;
+$$;
+REVOKE ALL ON FUNCTION identity.assistant_panel_budget(text) FROM PUBLIC, anon, authenticated;
+
+-- Terminal receipts expire on the next mutation after 30 days. Pending/failed
+-- intent and compact resource tombstones never expire. Superseded file bodies
+-- are removed before dropping the last history reference; a failed authorized
+-- file deletion leaves that receipt for a later cleanup attempt.
+CREATE FUNCTION identity.assistant_panel_prune(p_assistant text, p_owner text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE v_body uuid;
+BEGIN
+    BEGIN
+        FOR v_body IN SELECT DISTINCT (payload->>'bodyItemId')::uuid FROM identity.assistant_panel_changes c
+          WHERE assistant_user_id = p_assistant AND status IN ('applied','superseded')
+            AND COALESCE(applied_at,created_at) < clock_timestamp() - interval '30 days'
+            AND payload->>'bodyItemId' IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM identity.assistant_panel_items i WHERE i.body_item_id = (c.payload->>'bodyItemId')::uuid)
+            AND NOT EXISTS (SELECT 1 FROM identity.assistant_panel_changes live
+              WHERE live.payload->>'bodyItemId' = c.payload->>'bodyItemId' AND (live.status IN ('pending','failed')
+                OR COALESCE(live.applied_at,live.created_at) >= clock_timestamp() - interval '30 days'))
+        LOOP
+            UPDATE identity.assistant_panel_changes SET payload = payload - 'bodyItemId' - 'bodySha256'
+              WHERE assistant_user_id = p_assistant AND payload->>'bodyItemId' = v_body::text;
+            IF EXISTS (SELECT 1 FROM chat.workspace_items WHERE id = v_body) THEN
+                PERFORM chat.workspace_delete_as(v_body::text,p_owner);
+            END IF;
+        END LOOP;
+        DELETE FROM identity.assistant_panel_changes WHERE assistant_user_id = p_assistant
+          AND status IN ('applied','superseded') AND COALESCE(applied_at,created_at) < clock_timestamp() - interval '30 days';
+    EXCEPTION WHEN insufficient_privilege THEN
+        -- This subtransaction preserves the reference and retries on a later
+        -- mutation. Cleanup must not prevent applying already-saved changes.
+        NULL;
+    END;
+END;
+$$;
+REVOKE ALL ON FUNCTION identity.assistant_panel_prune(text,text) FROM PUBLIC, anon, authenticated;
+
+-- Existing App edits (for example an account display name or a project) already
+-- persist in their own tables. Record only their allowlisted change notice here;
+-- no host dispatch, credentials, resource body or executable file path is added.
+CREATE FUNCTION identity.assistant_panel_notice(p_assistant text, p_notice jsonb) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE v_owner text; v_id uuid; v_hash text; v_revision bigint; v_summary jsonb;
+    v_existing identity.assistant_panel_changes%ROWTYPE;
+BEGIN
+    v_owner := identity.assistant_panel_lock(p_assistant);
+    IF p_notice IS NULL OR jsonb_typeof(p_notice) <> 'object' THEN
+        RAISE EXCEPTION 'App change notice must be an object' USING ERRCODE = '22023';
+    END IF;
+    IF octet_length(p_notice::text) > 16384 THEN
+        RAISE EXCEPTION 'App change notice exceeds 16 KiB' USING ERRCODE = '54000';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_object_keys(p_notice) k
+          WHERE k NOT IN ('operationId','resource','operation','id','deviceId','section','before','after'))
+       OR COALESCE(p_notice->>'resource','') NOT IN ('capabilities','device-notes','devices','projects','memory','pending-work','personality','files','integrations','schedules','assistant')
+       OR COALESCE(p_notice->>'operation','') NOT IN ('created','edited','removed','saved')
+       OR jsonb_typeof(p_notice->'id') IS DISTINCT FROM 'string' OR length(p_notice->>'id') NOT BETWEEN 1 AND 512
+       OR COALESCE(p_notice->>'operationId','') !~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+       OR (p_notice ? 'section' AND COALESCE(p_notice->>'section','') NOT IN ('folders','accounts','appearance','profile','permissions')) THEN
+        RAISE EXCEPTION 'App change notice has unsupported fields or identifiers' USING ERRCODE = '22023';
+    END IF;
+    IF p_notice ? 'deviceId' AND (jsonb_typeof(p_notice->'deviceId') <> 'string' OR NOT EXISTS (
+        SELECT 1 FROM identity.gugu_devices WHERE device_id = p_notice->>'deviceId' AND user_id::text = v_owner)) THEN
+        RAISE EXCEPTION 'App change device is not owned by this account' USING ERRCODE = '42501';
+    END IF;
+    FOR v_summary IN SELECT p_notice->k FROM unnest(ARRAY['before','after']) k WHERE p_notice ? k LOOP
+        IF jsonb_typeof(v_summary) <> 'object' THEN
+            RAISE EXCEPTION 'App change summaries contain unsupported content' USING ERRCODE = '22023';
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM jsonb_each(v_summary) e WHERE
+              e.key NOT IN ('name','description','group','path','modifiedAt','active','cron','at','tz','isDefault','enabled','action')
+              OR CASE WHEN e.key IN ('active','isDefault','enabled') THEN jsonb_typeof(e.value) <> 'boolean'
+                   WHEN e.key IN ('group','cron','at','tz') AND e.value = 'null'::jsonb THEN false
+                   ELSE jsonb_typeof(e.value) <> 'string' OR length(e.value #>> '{}') > 4096 END
+        ) THEN
+            RAISE EXCEPTION 'App change summaries contain unsupported content' USING ERRCODE = '22023';
+        END IF;
+        IF v_summary ? 'path' AND v_summary->>'path' ~ '([\\[:cntrl:]]|(^|/)[.][.](/|$))' THEN
+            RAISE EXCEPTION 'App change paths must not contain traversal' USING ERRCODE = '22023';
+        END IF;
+    END LOOP;
+    v_id := (p_notice->>'operationId')::uuid;
+    v_hash := encode(sha256(convert_to(jsonb_build_array(p_assistant,'notice',p_notice)::text,'UTF8')),'hex');
+    SELECT * INTO v_existing FROM identity.assistant_panel_changes WHERE operation_id = v_id;
+    IF FOUND THEN
+        IF v_existing.owner_user_id <> v_owner OR v_existing.assistant_user_id <> p_assistant OR v_existing.request_hash <> v_hash THEN
+            RAISE EXCEPTION 'Panel operation ID was already used for a different request' USING ERRCODE = '23505';
+        END IF;
+        RETURN jsonb_build_object('operationId',v_id,'revision',v_existing.revision::text,'status',v_existing.status);
+    END IF;
+    UPDATE identity.assistant_panel_changes SET status = 'superseded',payload = '{}',error_code = NULL,applied_at = clock_timestamp()
+      WHERE assistant_user_id = p_assistant AND domain = p_notice->>'resource' AND resource_key = p_notice->>'id'
+        AND operation = 'notice' AND status IN ('pending','failed');
+    INSERT INTO identity.assistant_panel_changes(operation_id,assistant_user_id,owner_user_id,domain,resource_key,
+        device_id,source,operation,expected_item_revision,request_hash,payload,status)
+      VALUES(v_id,p_assistant,v_owner,p_notice->>'resource',p_notice->>'id',p_notice->>'deviceId',
+        'panel','notice',0,v_hash,jsonb_build_object('notice',p_notice),'pending') RETURNING revision INTO v_revision;
+    UPDATE identity.assistant_panel_items SET revision = v_revision,updated_at = clock_timestamp()
+      WHERE assistant_user_id = p_assistant AND domain = 'control' AND resource_key = '__head__';
+    PERFORM identity.assistant_panel_prune(p_assistant,v_owner);
+    PERFORM identity.assistant_panel_budget(p_assistant);
+    PERFORM chat.send_user_event(jsonb_build_object('assistantId',p_assistant,'revision',v_revision::text),
+        'assistant_panel_changed','gugu:user:' || v_owner || ':events',true);
+    RETURN jsonb_build_object('operationId',v_id,'revision',v_revision::text,'status','pending');
+END;
+$$;
+REVOKE ALL ON FUNCTION identity.assistant_panel_notice(text,jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION identity.assistant_panel_notice(text,jsonb) TO authenticated;
+
 CREATE FUNCTION identity.assistant_panel_commit(
     p_assistant text, p_operation_id uuid, p_domain text, p_resource_key text,
     p_expected_revision bigint, p_operation text, p_data jsonb DEFAULT '{}',
@@ -185,13 +332,15 @@ CREATE FUNCTION identity.assistant_panel_commit(
     p_device_id text DEFAULT NULL, p_runtime_instance_id text DEFAULT NULL
 ) RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
-    v_owner text; v_device text; v_source text; v_hash text; v_revision bigint;
+    v_owner text; v_device text; v_home text; v_target text; v_source text; v_hash text; v_revision bigint;
     v_old identity.assistant_panel_items%ROWTYPE;
     v_existing identity.assistant_panel_changes%ROWTYPE;
-    v_data jsonb := p_data; v_payload jsonb; v_body uuid; v_collection boolean;
+    v_data jsonb := p_data; v_payload jsonb; v_body uuid; v_bodies uuid[]; v_collection boolean; v_device_scoped boolean;
 BEGIN
     v_owner := identity.assistant_panel_lock(p_assistant);
     v_source := CASE WHEN p_runtime_instance_id IS NULL THEN 'panel' ELSE 'runtime' END;
+    SELECT device_id INTO v_home FROM identity.users WHERE id = p_assistant;
+    v_device_scoped := p_domain IN ('tasks','capabilities','device-notes','integrations');
     v_collection := p_resource_key = '__collection__' OR starts_with(p_resource_key,'__collection__:');
     IF p_operation_id IS NULL OR p_data IS NULL OR p_expected_revision IS NULL OR p_expected_revision < 0
        OR p_domain IS NULL OR p_domain NOT IN ('tasks','schedules','memory','personality','integrations','voice-notes','capabilities','device-notes','files','skills')
@@ -205,7 +354,7 @@ BEGIN
     END IF;
     IF v_source = 'runtime' THEN
         v_device := identity.assistant_panel_runtime(p_assistant, p_runtime_instance_id,
-            p_domain NOT IN ('tasks','capabilities','device-notes','integrations'));
+            NOT v_device_scoped);
         IF p_device_id IS NOT NULL AND p_device_id <> v_device THEN
             RAISE EXCEPTION 'Runtime cannot publish another device resource' USING ERRCODE = '42501';
         END IF;
@@ -232,15 +381,19 @@ BEGIN
     IF COALESCE(v_old.revision,0) <> p_expected_revision THEN
         RAISE EXCEPTION 'Panel resource changed; read it again before editing' USING ERRCODE = '40001';
     END IF;
-    IF v_source = 'runtime' AND v_old.device_id IS NOT NULL AND v_old.device_id <> v_device THEN
+    IF v_source = 'runtime' AND v_device_scoped AND v_old.device_id IS NOT NULL AND v_old.device_id <> v_device THEN
         RAISE EXCEPTION 'Runtime cannot replace another device resource' USING ERRCODE = '42501';
+    END IF;
+    v_target := CASE WHEN v_device_scoped THEN COALESCE(p_device_id,v_old.device_id,v_device,v_home) ELSE v_home END;
+    IF v_source = 'panel' AND v_target IS DISTINCT FROM v_home THEN
+        RAISE EXCEPTION 'Panel edits for a non-home device are not supported' USING ERRCODE = '42501';
     END IF;
     IF v_old.deleted_at IS NOT NULL AND p_operation <> 'remove' THEN
         RAISE EXCEPTION 'Panel resource was deleted and cannot be republished' USING ERRCODE = '55000';
     END IF;
     IF v_source = 'runtime' AND EXISTS (SELECT 1 FROM identity.assistant_panel_changes
         WHERE assistant_user_id = p_assistant AND domain = p_domain AND resource_key = p_resource_key
-          AND source = 'panel' AND status <> 'applied') THEN
+          AND source = 'panel' AND status IN ('pending','failed')) THEN
         RAISE EXCEPTION 'Apply the committed panel change before publishing this resource' USING ERRCODE = '55000';
     END IF;
     IF p_operation IN ('enable','disable') THEN
@@ -292,24 +445,40 @@ BEGIN
         RAISE EXCEPTION 'Panel body already belongs to another resource' USING ERRCODE = '22023';
     END IF;
     v_payload := jsonb_build_object('data',v_data,'bodyItemId',p_body_item_id,'bodySha256',p_body_sha256,
-        'deviceId',COALESCE(p_device_id,v_old.device_id,v_device));
+        'deviceId',v_target);
+    IF p_operation IN ('enable','disable') THEN
+        v_payload := v_payload || jsonb_build_object('bodyItemId',v_old.body_item_id,'bodySha256',v_old.body_sha256);
+    END IF;
     IF p_operation = 'remove' THEN
         -- Keep routing for local cleanup, never the deleted body or personality text.
         v_payload := jsonb_build_object('before', jsonb_strip_nulls(jsonb_build_object(
             'path',v_old.data->'path','relativePath',v_old.data->'relativePath',
             'providerId',v_old.data->'providerId','accountId',v_old.data->'accountId',
             'kind',v_old.data->'kind','noteId',v_old.data->'noteId')),
-        'deviceId',COALESCE(v_old.device_id,p_device_id,v_device),'deleted',true);
+        'deviceId',v_target,'deleted',true);
+        SELECT array_agg(DISTINCT body) INTO v_bodies FROM (
+          SELECT (payload->>'bodyItemId')::uuid AS body FROM identity.assistant_panel_changes
+            WHERE assistant_user_id = p_assistant AND domain = p_domain AND resource_key = p_resource_key
+          UNION ALL SELECT v_old.body_item_id) refs WHERE body IS NOT NULL;
+    END IF;
+    -- Only the newest desired value must be applied. A failed save cannot keep
+    -- its later deletion/correction behind an impossible acknowledgement.
+    UPDATE identity.assistant_panel_changes SET status = 'superseded',error_code = NULL,applied_at = clock_timestamp()
+      WHERE assistant_user_id = p_assistant AND domain = p_domain AND resource_key = p_resource_key
+        AND source = 'panel' AND status IN ('pending','failed');
+    IF p_operation = 'remove' THEN
+        UPDATE identity.assistant_panel_changes SET payload = '{}'::jsonb
+          WHERE assistant_user_id = p_assistant AND domain = p_domain AND resource_key = p_resource_key;
     END IF;
     INSERT INTO identity.assistant_panel_changes(operation_id,assistant_user_id,owner_user_id,domain,resource_key,
         device_id,source,operation,expected_item_revision,request_hash,payload,status,applied_at,applied_device_id)
-      VALUES (p_operation_id,p_assistant,v_owner,p_domain,p_resource_key,COALESCE(p_device_id,v_old.device_id,v_device),
+      VALUES (p_operation_id,p_assistant,v_owner,p_domain,p_resource_key,v_target,
         v_source,p_operation,p_expected_revision,v_hash,v_payload,
         CASE WHEN v_source = 'runtime' THEN 'applied' ELSE 'pending' END,
         CASE WHEN v_source = 'runtime' THEN clock_timestamp() END,v_device) RETURNING revision INTO v_revision;
     INSERT INTO identity.assistant_panel_items(assistant_user_id,owner_user_id,domain,resource_key,device_id,
         revision,data,body_item_id,body_sha256,deleted_at,observed_at)
-      VALUES (p_assistant,v_owner,p_domain,p_resource_key,COALESCE(p_device_id,v_old.device_id,v_device),v_revision,v_data,
+      VALUES (p_assistant,v_owner,p_domain,p_resource_key,v_target,v_revision,v_data,
         CASE WHEN p_operation IN ('enable','disable') THEN v_old.body_item_id ELSE p_body_item_id END,
         CASE WHEN p_operation IN ('enable','disable') THEN v_old.body_sha256 ELSE p_body_sha256 END,
         CASE WHEN p_operation = 'remove' THEN COALESCE(v_old.deleted_at,clock_timestamp()) END,
@@ -318,9 +487,7 @@ BEGIN
         revision = EXCLUDED.revision,data = EXCLUDED.data,body_item_id = EXCLUDED.body_item_id,body_sha256 = EXCLUDED.body_sha256,
         deleted_at = EXCLUDED.deleted_at,observed_at = EXCLUDED.observed_at,updated_at = clock_timestamp();
     IF p_operation = 'remove' THEN
-        FOR v_body IN SELECT DISTINCT (payload->>'bodyItemId')::uuid FROM identity.assistant_panel_changes
-          WHERE assistant_user_id = p_assistant AND domain = p_domain AND resource_key = p_resource_key
-            AND payload->>'bodyItemId' IS NOT NULL
+        FOR v_body IN SELECT unnest(v_bodies)
         LOOP
             IF EXISTS (SELECT 1 FROM chat.workspace_items WHERE id = v_body) THEN
                 PERFORM chat.workspace_delete_as(v_body::text, v_owner);
@@ -329,6 +496,8 @@ BEGIN
     END IF;
     UPDATE identity.assistant_panel_items SET revision = v_revision,updated_at = clock_timestamp()
       WHERE assistant_user_id = p_assistant AND domain = 'control' AND resource_key = '__head__';
+    PERFORM identity.assistant_panel_prune(p_assistant,v_owner);
+    PERFORM identity.assistant_panel_budget(p_assistant);
     -- Transactional wake hints only: no message, model turn, or device command.
     PERFORM chat.send_user_event(jsonb_build_object('assistantId',p_assistant,'revision',v_revision::text),
         'assistant_panel_changed','gugu:user:' || v_owner || ':events',true);
@@ -352,7 +521,7 @@ BEGIN
             WHERE assistant_user_id = p_assistant AND domain <> 'control'),'[]'::jsonb),
         'application',COALESCE((SELECT jsonb_agg(jsonb_build_object('operationId',operation_id,'revision',revision::text,
             'domain',domain,'resourceKey',resource_key,'status',status,'errorCode',error_code) ORDER BY revision)
-            FROM identity.assistant_panel_changes WHERE assistant_user_id = p_assistant AND source = 'panel' AND status <> 'applied'),'[]'::jsonb)) INTO v_result;
+            FROM identity.assistant_panel_changes WHERE assistant_user_id = p_assistant AND source = 'panel' AND status IN ('pending','failed')),'[]'::jsonb)) INTO v_result;
     IF octet_length(v_result::text) > 16777216 THEN
         RAISE EXCEPTION 'Assistant panel snapshot exceeds the complete response budget' USING ERRCODE = '54000';
     END IF;
@@ -370,7 +539,7 @@ BEGIN
     PERFORM identity.assistant_panel_runtime(p_assistant,p_runtime_instance_id,true);
     SELECT jsonb_build_object('revision',h.revision::text,'changes',COALESCE((SELECT jsonb_agg(to_jsonb(c) ||
         jsonb_build_object('revision',c.revision::text,'expected_item_revision',c.expected_item_revision::text) ORDER BY revision)
-        FROM identity.assistant_panel_changes c WHERE assistant_user_id = p_assistant AND source = 'panel' AND status <> 'applied'),'[]'::jsonb))
+        FROM identity.assistant_panel_changes c WHERE assistant_user_id = p_assistant AND source = 'panel' AND status IN ('pending','failed')),'[]'::jsonb))
       INTO v_result FROM identity.assistant_panel_items h
       WHERE assistant_user_id = p_assistant AND domain = 'control' AND resource_key = '__head__';
     IF octet_length(v_result::text) > 16777216 THEN
@@ -394,16 +563,17 @@ BEGIN
     IF p_error_code IS NOT NULL AND p_error_code !~ '^[A-Z][A-Z0-9_]{0,63}$' THEN
         RAISE EXCEPTION 'Application failure requires a non-sensitive error code' USING ERRCODE = '22023';
     END IF;
-    IF v_change.status = 'applied' THEN
-        RETURN jsonb_build_object('operationId',p_operation_id,'status','applied','revision',v_change.revision::text);
+    IF v_change.status IN ('applied','superseded') THEN
+        RETURN jsonb_build_object('operationId',p_operation_id,'status',v_change.status,'revision',v_change.revision::text);
     END IF;
     IF EXISTS (SELECT 1 FROM identity.assistant_panel_changes WHERE assistant_user_id = p_assistant
-        AND source = 'panel' AND status <> 'applied' AND revision < v_change.revision) THEN
+        AND source = 'panel' AND status IN ('pending','failed') AND revision < v_change.revision) THEN
         RAISE EXCEPTION 'Earlier assistant panel changes must be applied first' USING ERRCODE = '55000';
     END IF;
     UPDATE identity.assistant_panel_changes SET status = CASE WHEN p_error_code IS NULL THEN 'applied' ELSE 'failed' END,
         applied_at = CASE WHEN p_error_code IS NULL THEN clock_timestamp() END,
-        applied_device_id = v_device,error_code = p_error_code WHERE operation_id = p_operation_id;
+        applied_device_id = CASE WHEN p_error_code IS NULL THEN v_device END,error_code = p_error_code WHERE operation_id = p_operation_id;
+    PERFORM identity.assistant_panel_prune(p_assistant,v_owner);
     PERFORM chat.send_user_event(jsonb_build_object('assistantId',p_assistant,'operationId',p_operation_id,
         'applicationStatus',CASE WHEN p_error_code IS NULL THEN 'applied' ELSE 'failed' END),
         'assistant_panel_changed','gugu:user:' || v_owner || ':events',true);
@@ -429,7 +599,7 @@ BEGIN
         RAISE EXCEPTION 'Assistant panel changed before admission; apply current changes' USING ERRCODE = '40001';
     END IF;
     SELECT * INTO v_change FROM identity.assistant_panel_changes WHERE assistant_user_id = p_assistant
-        AND source = 'panel' AND status <> 'applied' ORDER BY revision LIMIT 1;
+        AND source = 'panel' AND status IN ('pending','failed') ORDER BY revision LIMIT 1;
     IF FOUND THEN
         RETURN jsonb_build_object('admitted',false,'revision',v_revision::text,'operationId',v_change.operation_id,
             'domain',v_change.domain,'resourceKey',v_change.resource_key,'errorCode',v_change.error_code);
@@ -445,14 +615,19 @@ GRANT EXECUTE ON FUNCTION identity.assistant_panel_admit(text,text,bigint) TO au
 CREATE FUNCTION identity.assistant_panel_guard_body() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 BEGIN
-    IF (NEW.blob_id IS DISTINCT FROM OLD.blob_id OR NEW.kind IS DISTINCT FROM OLD.kind OR NEW.chat_id IS DISTINCT FROM OLD.chat_id) AND EXISTS (
-        SELECT 1 FROM identity.assistant_panel_changes WHERE payload->>'bodyItemId' = OLD.id::text
-    ) THEN
-        RAISE EXCEPTION 'Published assistant panel bodies are immutable; create a new file' USING ERRCODE = '55000';
+    IF EXISTS (SELECT 1 FROM identity.assistant_panel_items WHERE body_item_id = OLD.id)
+       OR EXISTS (SELECT 1 FROM identity.assistant_panel_changes WHERE payload->>'bodyItemId' = OLD.id::text) THEN
+        IF TG_OP = 'DELETE' THEN
+            RAISE EXCEPTION 'Published assistant panel bodies must be removed through the panel' USING ERRCODE = '55000';
+        END IF;
+        IF NEW.blob_id IS DISTINCT FROM OLD.blob_id OR NEW.kind IS DISTINCT FROM OLD.kind OR NEW.chat_id IS DISTINCT FROM OLD.chat_id THEN
+            RAISE EXCEPTION 'Published assistant panel bodies are immutable; create a new file' USING ERRCODE = '55000';
+        END IF;
     END IF;
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
     RETURN NEW;
 END;
 $$;
 REVOKE ALL ON FUNCTION identity.assistant_panel_guard_body() FROM PUBLIC, anon, authenticated;
-CREATE TRIGGER assistant_panel_body_immutable BEFORE UPDATE OF blob_id, kind, chat_id ON chat.workspace_items
+CREATE TRIGGER assistant_panel_body_immutable BEFORE UPDATE OF blob_id, kind, chat_id OR DELETE ON chat.workspace_items
     FOR EACH ROW EXECUTE FUNCTION identity.assistant_panel_guard_body();

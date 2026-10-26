@@ -155,12 +155,169 @@ describe('durable assistant panel contract', () => {
     expect(row).toMatchObject({ data: {},body_item_id: null,revision: removed.revision })
     expect(row.deleted_at).not.toBeNull()
     expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=ANY($1::uuid[])',[[old.id,current.id]])).rows).toEqual([])
-    expect((await pending()).changes[0]!.payload).toEqual({ before: { relativePath: 'remember.md' },deviceId: null,deleted: true })
+    expect((await pending()).changes[0]!.payload).toEqual({ before: { relativePath: 'remember.md' },deviceId: device,deleted: true })
     expect((await db.query('SELECT count(*)::int AS n FROM identity.gugu_device_commands WHERE user_id=$1',[owner])).rows[0]!.n).toBe(0)
     await ack(removed.operationId)
     await failure(() => commit({ domain: 'memory',key: 'remember',revision: two.revision,data: {},runtime: instance }),/read it again/)
     await failure(() => commit({ domain: 'memory',key: 'remember',revision: removed.revision,data: {},runtime: instance }),/deleted/)
     expect(await admit(removed.revision)).toMatchObject({ admitted: true })
+  })
+
+  it('supersedes an unacknowledged save before deleting its body and recovers admission', async () => {
+    const body = await file()
+    const saved = await commit({ domain: 'memory',key: 'not-yet-applied',data: { relativePath: 'not-yet-applied.md' },body: body.id,hash: body.hash })
+    const removed = await commit({ domain: 'memory',key: 'not-yet-applied',revision: saved.revision,operation: 'remove',data: {} })
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[body.id])).rows).toEqual([])
+    expect((await pending()).changes.map(c => c.operation_id)).toEqual([removed.operationId])
+    // A late result from the obsolete save must not resurrect a failure.
+    expect(await ack(saved.operationId,'BODY_READ_FAILED')).toMatchObject({ status: 'superseded' })
+    await ack(removed.operationId)
+    expect(await admit(removed.revision)).toMatchObject({ admitted: true })
+  })
+
+  it('recovers from a failed schedule application when the user corrects the same resource', async () => {
+    const saved = await commit({ domain: 'schedules',key: 'recover',data: { cron: 'invalid',tz: 'Invalid/Zone',prompt: 'Review' } })
+    await ack(saved.operationId,'SCHEDULE_INVALID')
+    const fixed = await commit({ domain: 'schedules',key: 'recover',revision: saved.revision,data: { cron: '0 8 * * *',tz: 'Asia/Shanghai',prompt: 'Review' } })
+    expect((await pending()).changes.map(c => c.operation_id)).toEqual([fixed.operationId])
+    expect(await ack(saved.operationId,'SCHEDULE_INVALID')).toMatchObject({ status: 'superseded' })
+    await ack(fixed.operationId)
+    expect(await admit(fixed.revision)).toMatchObject({ admitted: true })
+  })
+
+  it.each(['personality','schedules'])('erases deleted %s content from every historical payload', async domain => {
+    const data = domain === 'personality' ? { text: 'Forgotten private agreement' } : { prompt: 'Forgotten private prompt',cron: '0 8 * * *' }
+    const saved = await commit({ domain,key: 'forget-content',data })
+    await ack(saved.operationId)
+    const removed = await commit({ domain,key: 'forget-content',revision: saved.revision,operation: 'remove',data: {} })
+    const history = await as(owner,() => db.query<{ operation_id: string; payload: unknown }>(
+      'SELECT operation_id,payload FROM identity.assistant_panel_changes WHERE assistant_user_id=$1 AND domain=$2 AND resource_key=$3',[agent,domain,'forget-content']))
+    expect(history.rows.find(row => row.operation_id === saved.operationId)!.payload).toEqual({})
+    expect(JSON.stringify(history.rows)).not.toContain('Forgotten')
+    expect((await pending()).changes[0]!.operation_id).toBe(removed.operationId)
+  })
+
+  it('rejects deletion of a published body through the private folder without silently nulling its reference', async () => {
+    const body = await file()
+    const saved = await commit({ domain: 'memory',key: 'protected-body',data: { relativePath: 'protected.md' },body: body.id,hash: body.hash })
+    await failure(() => as(owner,() => db.query('SELECT chat.workspace_delete_as($1,$2)',[body.id,owner])),/through the panel/)
+    expect((await snapshot()).items[0]).toMatchObject({ body_item_id: body.id,revision: saved.revision })
+    await commit({ domain: 'memory',key: 'protected-body',revision: saved.revision,operation: 'remove',data: {} })
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[body.id])).rows).toEqual([])
+  })
+
+  it('preserves account privacy erasure and releases body guards after its panel state is gone', async () => {
+    const old = await file(), current = await file()
+    const first = await commit({ domain: 'memory',key: 'erase-account',data: { relativePath: 'private.md' },body: old.id,hash: old.hash })
+    await commit({ domain: 'memory',key: 'erase-account',revision: first.revision,data: { relativePath: 'private.md' },body: current.id,hash: current.hash })
+    await db.query('DELETE FROM auth.users WHERE id=$1',[owner])
+    expect((await db.query('SELECT 1 FROM identity.assistant_panel_items WHERE assistant_user_id=$1',[agent])).rows).toEqual([])
+    expect((await db.query('SELECT 1 FROM identity.assistant_panel_changes WHERE assistant_user_id=$1',[agent])).rows).toEqual([])
+    await db.query('DELETE FROM chat.chats WHERE id=$1',[chat])
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=ANY($1::uuid[])',[[old.id,current.id]])).rows).toEqual([])
+  })
+
+  it.each(['../escape.md','a/../../escape','./note','a/./note','/absolute','C:\\escape','a\\..\\escape','~/escape','%2e%2e/escape','a//note','note/','note\nother'])('rejects unsafe runtime paths: %j', async path => {
+    await failure(() => commit({ domain: 'memory',key: 'bad-path',data: { relativePath: path } }),/normalized relative paths/)
+    expect((await snapshot()).revision).toBe('0')
+  })
+
+  it('moves assistant-owned resources and error markers to the current home without accepting the former publisher', async () => {
+    const note = await commit({ domain: 'memory',key: 'moved',data: { relativePath: 'moved.md' },device,runtime: instance })
+    const marker = await commit({ domain: 'memory',key: '__collection__',operation: 'prepared',device,runtime: instance,data: { state: 'ready',schemaVersion: 1,itemCount: 1 } })
+    const nextDevice = `panel-${randomUUID()}`, nextInstance = randomUUID()
+    await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,'new','new','linux')",[nextDevice,owner])
+    await db.query('INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id) VALUES($1,$2,$3)',[nextInstance,nextDevice,owner])
+    await db.query("INSERT INTO identity.agent_profiles(id,owner_id,display_name,agent_type) VALUES($1,$2,'Panel assistant','claude-code')",[agent,owner])
+    const move = randomUUID(), provision = randomUUID()
+    const member = { provision_id: provision,member_key: 'single',display_name: 'Panel assistant',agent_type: 'claude-code',
+      project_path: '',inherit_memory: false,history_import_required: false,existing_agent_user_id: agent }
+    await as(owner,async () => {
+      await db.query('SELECT identity.start_agent_provision_operation($1,$2,$3::jsonb,NULL,NULL,$4,NULL,$5,$6,NULL)',
+        [move,nextDevice,JSON.stringify({ kind: 'single',members: [member] }),'platform:deepseek-v4-pro','full-access','claude'])
+      await db.query('SELECT identity.claim_provision_slots($1)',[move])
+      await db.query('SELECT identity.prepare_agent_provision($1,$2,$3,$4,$5,$6,$7,NULL,NULL,NULL,NULL)',
+        [provision,move,'single',nextDevice,'Panel assistant','claude-code',''])
+    })
+    await db.query("UPDATE identity.gugu_device_commands SET status='done',completed_at=now() WHERE id=(SELECT create_command_id FROM identity.agent_provisions WHERE id=$1)",[provision])
+    await as(owner,async () => {
+      await db.query('SELECT identity.settle_agent_provision_terminal($1)',[provision])
+      await db.query('SELECT identity.complete_agent_provision($1)',[provision])
+    })
+    await failure(() => commit({ domain: 'memory',key: 'moved',revision: note.revision,data: {},runtime: instance }),/required device/)
+    await commit({ domain: 'memory',key: 'moved',revision: note.revision,data: { relativePath: 'moved.md' },device: nextDevice,runtime: nextInstance })
+    await commit({ domain: 'memory',key: '__collection__',revision: marker.revision,operation: 'error',device: nextDevice,runtime: nextInstance,data: { state: 'error',schemaVersion: 1,errorCode: 'READ_FAILED' } })
+    expect((await snapshot()).items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ resource_key: 'moved',device_id: nextDevice }),
+      expect.objectContaining({ resource_key: '__collection__',device_id: nextDevice,data: { state: 'error',schemaVersion: 1,errorCode: 'READ_FAILED' } }),
+    ]))
+  })
+
+  it('refuses unsupported panel edits of non-home device resources while keeping their published metadata readable', async () => {
+    const nextDevice = `panel-${randomUUID()}`, nextInstance = randomUUID()
+    await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,'other','other','linux')",[nextDevice,owner])
+    await db.query('INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id) VALUES($1,$2,$3)',[nextInstance,nextDevice,owner])
+    const published = await commit({ domain: 'integrations',key: 'other-account',device: nextDevice,runtime: nextInstance,data: { configured: true } })
+    await failure(() => commit({ domain: 'integrations',key: 'other-account',revision: published.revision,operation: 'disable',data: {} }),/non-home device/)
+    expect((await snapshot()).items[0]!.data.configured).toBe(true)
+    expect((await pending()).changes).toEqual([])
+  })
+
+  it('rejects an individually oversized write before changing state', async () => {
+    await failure(() => commit({ data: { text: 'x'.repeat(262144) } }),/256 KiB/)
+    expect((await snapshot()).revision).toBe('0')
+    expect((await pending()).changes).toEqual([])
+  })
+
+  it.each(['snapshot','pending'])('rejects aggregate %s overflow while the preceding complete representation remains readable', async representation => {
+    const initial = await commit()
+    await ack(initial.operationId)
+    if (representation === 'snapshot') {
+      await db.query(`INSERT INTO identity.assistant_panel_items(assistant_user_id,owner_user_id,domain,resource_key,data)
+        SELECT $1,$2,'personality','fill-' || n,jsonb_build_object('text',repeat('x',255000)) FROM generate_series(1,65) n`,[agent,owner])
+    } else {
+      await db.query(`INSERT INTO identity.assistant_panel_changes(operation_id,assistant_user_id,owner_user_id,domain,resource_key,
+        source,operation,expected_item_revision,request_hash,payload,status)
+        SELECT gen_random_uuid(),$1,$2,'personality','fill-' || n,'panel','save',0,'fixture',
+          jsonb_build_object('data',jsonb_build_object('text',repeat('x',255000))),'pending' FROM generate_series(1,65) n`,[agent,owner])
+    }
+    await failure(() => commit({ key: 'overflow',data: { text: 'x'.repeat(255000) } }),/complete response budget/)
+    expect((await snapshot()).items.some(i => i.resource_key === 'overflow')).toBe(false)
+    expect((await pending()).changes.some(c => c.operation_id === initial.operationId)).toBe(false)
+  })
+
+  it('prunes terminal receipts after 30 days while retaining revocation and unapplied intent', async () => {
+    const body = await file(), replacement = await file()
+    const old = await commit({ domain: 'memory',key: 'old-body',data: { relativePath: 'old.md' },body: body.id,hash: body.hash })
+    await ack(old.operationId)
+    const current = await commit({ domain: 'memory',key: 'old-body',revision: old.revision,data: { relativePath: 'old.md' },body: replacement.id,hash: replacement.hash })
+    const tombstone = await commit({ key: 'revoked',operation: 'remove',data: {} })
+    await ack(current.operationId); await ack(tombstone.operationId)
+    const unapplied = await commit({ key: 'must-remain' })
+    await db.query("UPDATE identity.assistant_panel_changes SET created_at=now()-interval '31 days',applied_at=CASE WHEN status='applied' THEN now()-interval '31 days' END WHERE assistant_user_id=$1",[agent])
+    await commit({ key: 'prune-trigger' })
+    expect((await db.query('SELECT operation_id FROM identity.assistant_panel_changes WHERE operation_id=ANY($1::uuid[])',[[old.operationId,current.operationId,tombstone.operationId]])).rows).toEqual([])
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[body.id])).rows).toEqual([])
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[replacement.id])).rows).toHaveLength(1)
+    expect((await pending()).changes.map(c => c.operation_id)).toContain(unapplied.operationId)
+    await failure(() => commit({ key: 'revoked',revision: tombstone.revision }),/deleted/)
+  })
+
+  it('durably records allowlisted App notices without changing desired resources, sending messages or waking a host', async () => {
+    const change = { operationId: randomUUID(),resource: 'projects',operation: 'edited',id: 'project-a',deviceId: device,after: { name: 'New name',path: '/work/project' } }
+    const notice = () => as(owner,() => call<Commit>('assistant_panel_notice',[agent,JSON.stringify(change)]))
+    const saved = await notice()
+    expect(await notice()).toEqual(saved)
+    expect((await snapshot()).items).toEqual([])
+    expect((await pending()).changes[0]!.payload).toEqual({ notice: change })
+    await failure(() => as(stranger,() => call('assistant_panel_notice',[agent,JSON.stringify(change)])),/not available/)
+    await failure(() => as(owner,() => call('assistant_panel_notice',[agent,JSON.stringify({ ...change,after: { text: 'Resource body is forbidden' } })])),/unsupported content/)
+    await failure(() => as(owner,() => call('assistant_panel_notice',[agent,JSON.stringify({ ...change,operationId: randomUUID(),deviceId: otherDevice })])),/not owned/)
+    await failure(() => as(owner,() => call('assistant_panel_notice',[agent,JSON.stringify({ ...change,after: { path: '/work/../outside' } })])),/traversal/)
+    await ack(saved.operationId)
+    expect(await admit(saved.revision)).toMatchObject({ admitted: true })
+    expect((await db.query('SELECT count(*)::int AS n FROM identity.gugu_device_commands WHERE user_id=$1',[owner])).rows[0]!.n).toBe(0)
+    expect((await db.query('SELECT count(*)::int AS n FROM chat.messages WHERE chat_id=$1',[chat])).rows[0]!.n).toBe(0)
   })
 
   it('rolls back both current state and its queue if validation or body removal fails', async () => {

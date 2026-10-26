@@ -20,6 +20,7 @@ SELECT-only with RLS; internal helpers and direct writes are closed to clients.
 | --- | --- | --- |
 | `assistant_panel_snapshot` | `p_assistant` | `{version:1, revision, items, application}` from one database snapshot; an unprepared account has no collection marker; pending/failed application entries identify the affected resource without copying its body |
 | `assistant_panel_commit` | `p_assistant`, UUID `p_operation_id`, `p_domain`, `p_resource_key`, bigint `p_expected_revision`, `p_operation`; optional `p_data`, `p_body_item_id`, `p_body_sha256`, `p_device_id`, `p_runtime_instance_id` | `{operationId, revision, status}` after atomically committing the resource and its application record |
+| `assistant_panel_notice` | `p_assistant`, `p_notice` | Durable metadata-only notice for an App edit already saved by its owning service; no desired-state row, execution command or message is created |
 | `assistant_panel_pending` | `p_assistant`, `p_runtime_instance_id` | `{revision, changes}` in committed order, including failed changes that still require application |
 | `assistant_panel_ack` | `p_assistant`, `p_runtime_instance_id`, `p_operation_id`; optional `p_error_code` | Item-specific application receipt; only success removes a change from the pending set |
 | `assistant_panel_admit` | `p_assistant`, `p_runtime_instance_id`, `p_expected_revision` | `{admitted:true, revision}` only when the head still matches and all preceding panel changes have been applied; otherwise identifies the pending item or raises a version conflict |
@@ -28,12 +29,19 @@ Revisions in JSON results are decimal strings. An absent resource has expected
 revision `0`. A stale expected revision returns SQLSTATE `40001`; retain the draft
 and re-read before editing. An operation ID retry with the identical request
 returns its existing receipt. Reusing the ID for different input is rejected.
+Receipts are retained for 30 days after application or supersession; automatic
+retries must keep the same ID and remain within that interval. Resource versions
+and permanent tombstones continue to reject stale replay after receipt expiry.
 
 The operation is `save`, `remove`, `enable`, `disable`, `prepared` or `error`.
 Enable/disable accept an existing schedule/integration and no replacement data;
 they preserve the current prompt, schedule, body and other metadata. Remove
 accepts no content. A removed stable resource ID remains revoked; a late import
 cannot republish it even if it supplies the tombstone's current version.
+Each new commit marks older pending/failed changes for the same resource
+`superseded`. Only the newest desired state requires application; a corrected
+schedule or a deletion can therefore recover from an obsolete failed save.
+Acknowledging a superseded operation returns that status without changing it.
 
 ## Data and preparation
 
@@ -49,10 +57,18 @@ individual device. Only the actual runtime publisher can submit `prepared` or
 whose count matches all non-deleted resources in that collection. A failed source
 uses `{state:"error", schemaVersion:1, errorCode}` and leaves existing items intact.
 No marker means not yet prepared, not a successfully read empty collection.
+Paths in resource metadata must be normalized relative paths, without absolute
+roots, drive prefixes, backslashes, percent escapes, control characters or dot
+segments. The runtime must additionally resolve them inside its own resource root
+and reject symbolic-link escapes; database validation is not a filesystem check.
 
 The snapshot and pending APIs return complete data or an explicit response-budget
 error; they never truncate a collection and present the remainder as absent.
 Snapshot reads never create an initialization row or enqueue a wake command.
+Metadata is limited to 256 KiB per item; larger content uses a file body. Every
+commit/notice checks the exact complete snapshot and pending representations
+against the same 16 MiB read budget, with room reserved for failure codes. A write
+that would make either representation unreadable rolls back entirely.
 
 ## Bodies and deletion
 
@@ -62,7 +78,8 @@ the hash must match `chat.file_blobs`. Other chats, collaboratively mutable
 documents and references already assigned to another panel resource are refused.
 Today remains a collaborative document and is not subject to this file-body API.
 
-A published body ID is immutable: changing its blob in place is rejected. Upload
+A published body ID is immutable: changing its blob in place or deleting it from
+the private folder is rejected while a current/history reference exists. Upload
 a new object and atomically commit its reference instead. Failed uploads or
 uncommitted objects continue through the existing file cleanup mechanisms.
 
@@ -70,22 +87,47 @@ Removal atomically writes the tombstone/application record and deletes all body
 objects previously published for that resource through the existing authorized
 workspace deletion API. Any deletion failure rolls back the complete operation.
 Deleted body text is never copied into the removal record; it retains only the
-resource/device and the paths or account IDs needed for local cleanup. File
+resource/device and the paths or account IDs needed for local cleanup. All older
+change payloads for that resource are scrubbed in the same transaction, including
+inline personality text, schedule prompts and body references. File
 storage bytes continue through existing retention and garbage collection.
 
 The runtime must delete local originals, memory-index references and retrieval
 caches, reject reads of revoked files and append a structured committed-change
 notice before the next request. It preserves native conversation context and its
 prefix; this protocol does not reset sessions or erase historical chat messages.
+Compact tombstones remain for the lifetime of the assistant and disappear with
+account deletion. Terminal change receipts are pruned on the next mutation after
+30 days; pending/failed intent never expires. Unreferenced historical body files
+are deleted through the existing authorized file API before their last history
+reference is pruned. A permission failure retains the reference for a later
+cleanup attempt and does not block applying saved intent.
 
 ## Writers, failure and admission
 
 Panel commits do not require a runtime. Runtime publication supplies a current
 `runtime_instances` lease owned by the account. Assistant-owned data requires the
 assistant's assigned device; device/task metadata can originate from its actual
-owned device. A still-live publisher cannot be replaced by another instance.
+owned device. Non-home device metadata is currently read-only in the panel:
+mutation is rejected until a corresponding per-device applier exists. Notices
+about changes already saved elsewhere are informational and need no remote effect.
+A still-live publisher cannot be replaced by another instance.
 Expired, unowned or revoked assistant bindings are rejected. A runtime cannot
 overwrite a resource with an unapplied panel change.
+Assistant-owned domains follow the currently assigned home after adoption;
+their former publisher's device ID cannot prevent a new home from publishing
+either fresh content or an explicit read-failure marker. Device-scoped resources
+remain bound to their actual publishing device.
+
+The notice API accepts the existing App change fields (`operationId`, `resource`,
+`operation`, `id`, optional owned `deviceId`, `section`, `before`, `after`). Both
+summaries use a strict scalar-field allowlist, and the whole notice is limited to
+16 KiB. It rejects bodies, prompts, credentials and arbitrary nested configuration.
+Newer pending notices for the same resource replace obsolete notices, while an
+actual pending resource mutation remains required. The next home execution
+appends the structured notice and acknowledges it through the same ordered queue.
+Clients persist retries for post-save notices themselves; saving an already
+persisted App edit is not contingent on a live host acknowledgement.
 
 The per-assistant control row serializes all commits, acknowledgements and
 admission. Revisions are allocated after acquiring the lock, so sequence order

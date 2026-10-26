@@ -19,7 +19,7 @@ No permanent file is evicted to satisfy a quota. This release contains no LRU. A
 
 ## Deployment settings
 
-Download admission calculates usage directly from the original reservation and observation ledgers. The existing global limits row serializes only signature-rate checks, quota checks and the reservation insert. A shared row is necessary for the installation-wide hard download budget: locking different accounts or groups independently would let them overbook the same global headroom. Observations and settlement enter the same fence before changing usage. There is no copied usage total or reconciliation path.
+Download admission calculates usage directly from the original reservation and observation ledgers. It locks the existing global limits row for signature-rate checks, quota checks and the reservation insert near the end of the transaction; the lock remains held through the already locked metadata updates and RPC commit. A shared row is necessary for the installation-wide hard download budget: locking different accounts or groups independently would let them overbook the same global headroom. Observations and settlement enter the same fence before changing usage. There is no copied usage total or reconciliation path.
 
 Downloads do not acquire the installation-wide storage/inventory/GC advisory lock. Reference resolution runs before quota admission; garbage collection uses the existing per-blob shared-lock fence, expiry coordinates on the individual storage reference, and read-once transfers lock their own generation. Only retries of the same request ID share a download advisory lock. Usage and its UTC-month treatment, immutable request IDs, and signature-rate limits retain their existing ledger semantics.
 

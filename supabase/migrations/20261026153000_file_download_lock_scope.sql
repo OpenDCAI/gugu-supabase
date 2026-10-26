@@ -16,8 +16,8 @@ BEGIN
     END IF;
     definition:=replace(definition,quota_lock,'IF p_kind=''upload'' THEN '||quota_lock||
         ' ELSE PERFORM pg_advisory_xact_lock(hashtextextended(''gugu:file-download:''||p_id::text,0)); END IF;');
-    -- Existing identical retries return before this fence. Only rate/byte checks
-    -- and the reservation insert run under it; all three quota scopes stay atomic.
+    -- Existing identical retries return before this fence. New admission takes it
+    -- near the end of the RPC and holds it until commit, keeping all scopes atomic.
     EXECUTE replace(definition,'IF p_kind=''download'' THEN','IF p_kind=''download'' THEN '||admission_lock);
 
     FOREACH signature IN ARRAY ARRAY['chat.file_transfer_observe(text,uuid,bigint,timestamptz)','chat.file_transfer_settle(uuid)'] LOOP

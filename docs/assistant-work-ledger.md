@@ -33,3 +33,5 @@ The normal single-executor path has five business commits: dispatch, executor ad
 Already uploaded history is displayed immediately. Natural host activity can backfill old evidence without user-facing synchronization labels. Missing old evidence is never fabricated. Removing a directory observation, archiving a local session or moving the assistant does not delete the ledger.
 
 Development, migration rehearsals and trial use stay on an isolated local Supabase on the owner's development machine. No shared or production database is changed by this branch. Client/server/mobile trial validation must exercise a model request, a file transfer and direct cloud-ledger reads before final acceptance.
+
+History pages also return `work` (the same public task projection as list, without `initial_task`). A result sender reads coordinator/executor endpoints by assistant + work_id without attaching to any device or scanning completed tasks.

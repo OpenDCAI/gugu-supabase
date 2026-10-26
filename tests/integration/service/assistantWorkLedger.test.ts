@@ -28,7 +28,7 @@ const dispatch = (extra: Partial<Event> = {}): Event => ({ message_id: randomUUI
 const report = (kind = 'completed', extra: Partial<Event> = {}): Event => ({ message_id: randomUUID(), kind, from_session_id: worker, from_device_id: device, to_session_id: coordinator, to_device_id: home, content: 'Verified the result', ...extra })
 const commit = (id: string, events: Event[], initial: unknown = null, op = randomUUID(), runtime = instance) => as(owner, () => call<Work>('assistant_work_commit', [assistant,runtime,op,id,initial === null ? null : JSON.stringify(initial),JSON.stringify(events)]))
 const list = (before: string | null = null, limit = 50) => as(owner, () => call<{ items: (Work & { created_seq: string; executors: unknown[] })[]; next_before: string | null }>('assistant_work_list', [assistant,before,limit]))
-const history = (id: string, after = '0', limit = 100) => as(owner, () => call<{ events: Delivery[]; next_after: string | null }>('assistant_work_history', [assistant,id,after,limit]))
+const history = (id: string, after = '0', limit = 100) => as(owner, () => call<{ work: Work & {coordinator_session_id:string;coordinator_device_id:string;executors:unknown[]}; events: Delivery[]; next_after: string | null }>('assistant_work_history', [assistant,id,after,limit]))
 const claim = (runtime = instance, limit = 20) => as(owner, () => call<{ events: Delivery[] }>('assistant_work_outbox_claim', [runtime,limit,60]))
 const settle = (event: Delivery, stage = 'executor_admitted', runtime = instance, receipt = {}) => as(owner, () => call('assistant_work_outbox_settle', [runtime,event.message_id,event.lease_token,stage,stage === 'retry' ? 'CHANNEL_UNAVAILABLE' : null,5,JSON.stringify(receipt)]))
 
@@ -69,6 +69,16 @@ describe('account work ledger and its only delivery outbox', () => {
     await commit(id,[dispatch()],task())
     expect((await list()).items[0]).toMatchObject({ work_id: id,outcome: 'active' })
     expect((await claim()).events).toHaveLength(1)
+  })
+
+  it('returns the exact task endpoints with each history page without touching a sleeping device', async () => {
+    const id=randomUUID()
+    await commit(id,[dispatch()],task())
+    await db.query("UPDATE identity.runtime_instances SET last_heartbeat_at = now() - interval '1 day'")
+    const page=await history(id)
+    expect(page.work).toMatchObject({work_id:id,coordinator_session_id:task().coordinator_session_id,executors:task().executors})
+    expect(page.work.coordinator_device_id).toBe(home)
+    expect(page.work).not.toHaveProperty('initial_task')
   })
 
   it('deduplicates lost responses by operation and stable message ID; different bodies are refused', async () => {

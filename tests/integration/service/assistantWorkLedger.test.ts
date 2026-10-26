@@ -127,11 +127,12 @@ describe('account work ledger and its only delivery outbox', () => {
   it('releases failed deliveries with backoff and rejects an old acknowledgement', async () => {
     const id = randomUUID(); await commit(id,[dispatch()],task())
     const event = (await claim()).events[0]!
+    expect(event.failed_attempts).toBe(0)
     await settle(event,'retry')
     expect((await claim()).events).toHaveLength(0)
     await failure(() => settle(event), /lease|token/i)
     await db.query("UPDATE identity.assistant_work_events SET available_at=now()-interval '1 second' WHERE message_id=$1",[event.message_id])
-    expect((await claim()).events[0]!.message_id).toBe(event.message_id)
+    expect((await claim()).events[0]).toMatchObject({ message_id: event.message_id,failed_attempts: 1 })
   })
 
   it('keeps platform acceptance, assistant admission and owner delivery as independent facts', async () => {
@@ -242,6 +243,52 @@ describe('account work ledger and its only delivery outbox', () => {
     await settle(claimed,'assistant_admitted')
     await failure(() => as(owner,() => call('assistant_work_owner_delivered',[assistant,instance,event.message_id,chat,randomUUID()])), /source|message|visible/i)
     expect((await history(id)).events.find(row => row.message_id === event.message_id)!.owner_delivered_at).toBeNull()
+  })
+
+  it('delivers a late executor completion with its file after an inferred coordinator failure', async () => {
+    const id = randomUUID(), blob = randomUUID(), item = randomUUID(), hash = randomUUID().replaceAll('-','').repeat(2)
+    await db.query("INSERT INTO chat.file_blobs(id,bucket_id,object_name,sha256,size_bytes,content_type,created_by) VALUES($1,'workspace',$2,$3,10,'text/plain',$4)",[blob,`${chat}/${blob}`,hash,owner])
+    await db.query("INSERT INTO chat.workspace_items(id,chat_id,kind,filename,blob_id,created_by) VALUES($1,$2,'file','late-result.txt',$3,$4)",[item,chat,blob,owner])
+    await commit(id,[dispatch()],task())
+    await commit(id,[report('failed',{ from_session_id: coordinator,from_device_id: home,executor_session_id: worker,reason_code: 'RESULT_MISSING' })])
+    expect((await list()).items[0]!.outcome).toBe('failed')
+    const completed = report('completed',{ attachment_refs: [{ item_id: item }] })
+    await commit(id,[completed],null,randomUUID(),workerInstance)
+    expect((await list()).items[0]!.outcome).toBe('completed')
+    expect((await claim()).events.find(row => row.message_id === completed.message_id)).toMatchObject({ attachment_refs: [{ item_id: item }] })
+    await failure(() => commit(id,[report('cancelled')],null,randomUUID(),workerInstance), /terminal|conflict/i)
+  })
+
+  it('keeps an executor terminal outcome authoritative over later coordinator inference', async () => {
+    const id = randomUUID(); await commit(id,[dispatch()],task())
+    await commit(id,[report()],null,randomUUID(),workerInstance)
+    const before = (await list()).items[0]!
+    await commit(id,[report('failed',{ from_session_id: coordinator,from_device_id: home,executor_session_id: worker,reason_code: 'RESULT_MISSING' })])
+    expect((await list()).items[0]).toMatchObject({ outcome: 'completed',terminal_version: before.terminal_version })
+  })
+
+  it('abandons an undeliverable event once without claiming result delivery to the owner', async () => {
+    const id = randomUUID(); await commit(id,[dispatch()],task())
+    const event = (await claim()).events[0]!
+    const args = [instance,event.message_id,event.lease_token,'abandoned','CHANNEL_UNAVAILABLE',5,'{}']
+    await as(owner,() => call('assistant_work_outbox_settle',args))
+    await as(owner,() => call('assistant_work_outbox_settle',args))
+    expect((await claim(workerInstance)).events).toHaveLength(0)
+    expect((await as(owner,() => call<{ events: Delivery[] }>('assistant_work_abandoned',[instance,100]))).events).toHaveLength(1)
+    const notice = randomUUID()
+    await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,'This task could not be delivered: network unavailable','text')",[notice,chat,assistant])
+    const receipt = [assistant,instance,event.message_id,chat,notice,'abandonment_notice']
+    await as(owner,() => call('assistant_work_owner_delivered',receipt))
+    await as(owner,() => call('assistant_work_owner_delivered',receipt))
+    const abandoned = (await history(id)).events[0]!
+    expect(abandoned).toMatchObject({ delivery_state: 'abandoned',abandoned_reason_code: 'CHANNEL_UNAVAILABLE',owner_delivered_at: null })
+    expect(abandoned.abandonment_notified_at).toBeTruthy()
+    expect(abandoned.executor_admitted_at).toBeNull()
+    expect((await as(owner,() => call<{ events: Delivery[] }>('assistant_work_abandoned',[instance,100]))).events).toHaveLength(0)
+  })
+
+  it('does not advertise unused direct SELECT policies on the closed tables', async () => {
+    expect((await db.query("SELECT count(*)::int AS n FROM pg_policies WHERE schemaname='identity' AND tablename IN ('assistant_work','assistant_work_events')")).rows[0]!.n).toBe(0)
   })
 
   it('allows concurrent runtimes to claim each durable message at most once', async () => {

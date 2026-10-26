@@ -137,7 +137,7 @@ describe('Agent topic participation carries its eligible human owner', () => {
   it('rejects an ineligible Agent joining by speaking or its owner invoking add-agent', async () => {
     expect(await denied(() => send(foreignAgent))).toContain('not a member of its source conversation')
     await asUser(outsider)
-    expect(await denied(() => db.query('SELECT chat.add_group_agent($1,$2,$3,$4)', [topic, foreignAgent, 'Join', outsider]))).toContain('not a member of its source conversation')
+    expect(await denied(() => db.query('SELECT chat.add_group_agent($1,$2,$3,$4)', [topic, foreignAgent, 'Join', foreignAgent]))).toContain('not a member of its source conversation')
     expect(await member(outsider)).toBeUndefined()
     expect(await member(foreignAgent)).toBeUndefined()
   })

@@ -141,7 +141,7 @@ describe('chat.list_my_chats_as', () => {
     expect(byId((await listAs(owner, owner)).rows).get(outside)).toMatchObject({ role: 'owner' })
   })
 
-  it('主人退群后 agent 还在:照样在列;同一时刻主人令牌直读看不到这一行', async () => {
+  it('lists a legacy Agent-only membership without requiring its owner to remain a member', async () => {
     const group = await newGroup(stranger, 'Owner left', [[owner, 'member']])
     await addMember(group, ownerAgent, 'passive')
     // 正对照:主人还在群里时,旧路和新路都看得到。
@@ -150,7 +150,10 @@ describe('chat.list_my_chats_as', () => {
 
     await asService()
     await database.query('DELETE FROM chat.chat_members WHERE chat_id = $1 AND user_id = $2', [group, owner])
-    // 前提:agent 没有随主人一起被移出(否则这条 RPC 没有必要)。
+    // New owner departures carry their Agents. Explicitly restore the legacy
+    // Agent-only seat to keep testing the actor-scoped read boundary.
+    expect((await database.query('SELECT 1 FROM chat.chat_members WHERE chat_id = $1 AND user_id = $2', [group, ownerAgent])).rows).toHaveLength(0)
+    await addMember(group, ownerAgent, 'passive')
     expect((await database.query('SELECT 1 FROM chat.chat_members WHERE chat_id = $1 AND user_id = $2', [group, ownerAgent])).rows).toHaveLength(1)
 
     expect(await ownerTokenMemberRows(ownerAgent)).not.toContain(group)

@@ -348,6 +348,27 @@ describe('durable assistant panel contract', () => {
     await commit({ domain: 'memory',key: 'same-key',revision: edit.revision,runtime: instance,data: { relativePath: 'note.md' } })
   })
 
+  it('bounds offline notices, expires them and never charges them to required mutation budgets', async () => {
+    const base = await commit()
+    await ack(base.operationId)
+    await db.query(`INSERT INTO identity.assistant_panel_changes(operation_id,assistant_user_id,owner_user_id,domain,resource_key,
+      source,operation,expected_item_revision,request_hash,payload,status)
+      SELECT gen_random_uuid(),$1,$2,'personality','large-' || n,'panel','save',0,'fixture',
+        jsonb_build_object('data',jsonb_build_object('text',repeat('x',255000))),'pending' FROM generate_series(1,65) n`,[agent,owner])
+    for (let n = 0; n < 70; n++) await as(owner,() => call('assistant_panel_notice',[agent,JSON.stringify({
+      operationId: randomUUID(),resource: 'projects',operation: 'edited',id: `offline-${n}`,
+      after: { name: 'x'.repeat(4000),description: 'x'.repeat(4000),action: 'x'.repeat(4000) },
+    })]))
+    await commit({ key: 'still-writable',data: { text: 'real owner change' } })
+    const together = await pending()
+    expect(together.notices).toHaveLength(64)
+    expect(JSON.stringify(together).length).toBeGreaterThan(16777216)
+    expect(together.changes).toHaveLength(66)
+    await db.query("UPDATE identity.assistant_panel_changes SET created_at=now()-interval '8 days' WHERE assistant_user_id=$1 AND operation='notice'",[agent])
+    expect((await pending()).notices).toEqual([])
+    expect((await pending()).changes).toHaveLength(66)
+  },30_000)
+
   it.each(['memory','integrations'])('preserves original cleanup routing when retrying a failed %s deletion', async domain => {
     const data = domain === 'memory' ? { relativePath: 'still-needs-removal.md' } : { providerId: 'github',accountId: 'account-a',configured: true }
     const saved = await commit({ domain,key: 'retry-delete',data })
@@ -412,6 +433,24 @@ describe('durable assistant panel contract', () => {
     expect(await admit(waiting.revision)).toMatchObject({ admitted: true })
   })
 
+  it('rotates failed cleanup attempts so a permanently failing first batch cannot starve later receipts', async () => {
+    await db.query(`INSERT INTO identity.assistant_panel_changes(operation_id,assistant_user_id,owner_user_id,domain,resource_key,
+      source,operation,expected_item_revision,request_hash,payload,status,created_at,applied_at)
+      SELECT gen_random_uuid(),$1,$2,'memory','permanent-failure-' || n,'runtime','save',0,'fixture',
+        jsonb_build_object('bodyItemId','invalid-uuid'),'applied',now()-interval '31 days',now()-interval '31 days'
+      FROM generate_series(1,100) n`,[agent,owner])
+    const body = await file(), receipt = randomUUID()
+    await db.query(`INSERT INTO identity.assistant_panel_changes(operation_id,assistant_user_id,owner_user_id,domain,resource_key,
+      source,operation,expected_item_revision,request_hash,payload,status,created_at,applied_at)
+      VALUES($1,$2,$3,'memory','after-failing-batch','runtime','save',0,'fixture',jsonb_build_object('bodyItemId',$4::text),
+        'applied',now()-interval '31 days',now()-interval '31 days')`,[receipt,agent,owner,body.id])
+    const saved = await commit()
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[body.id])).rows).toHaveLength(1)
+    await ack(saved.operationId)
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[body.id])).rows).toEqual([])
+    expect((await db.query('SELECT operation_id FROM identity.assistant_panel_changes WHERE operation_id=$1',[receipt])).rows).toEqual([])
+  })
+
   it('withdraws the former home inventory on actual adoption and lets the new home publish a fresh observation', async () => {
     for (const [domain,data] of [['tasks',{ title: 'Old task' }],['capabilities',{ name: 'Old capability' }],
       ['device-notes',{ name: 'Old device note' }],['integrations',{ providerId: 'github',configured: true }]] as const) {
@@ -422,7 +461,7 @@ describe('durable assistant panel contract', () => {
     expect((await snapshot()).items).toEqual([])
     const stale = (await db.query('SELECT * FROM identity.assistant_panel_items WHERE assistant_user_id=$1 AND domain=$2 AND resource_key=$3',[agent,'capabilities','old-observation'])).rows[0]!
     expect(stale.stale_at).not.toBeNull()
-    await commit({ domain: 'capabilities',key: 'old-observation',revision: stale.revision,device: nextDevice,runtime: nextInstance,data: { name: 'Fresh capability' } })
+    await commit({ domain: 'capabilities',key: 'old-observation',revision: stale.revision,runtime: nextInstance,data: { name: 'Fresh capability' } })
     expect((await snapshot()).items).toEqual([expect.objectContaining({ device_id: nextDevice,data: { name: 'Fresh capability' },stale_at: null })])
     await commit({ domain: 'tasks',key: '__collection__',operation: 'prepared',device: nextDevice,runtime: nextInstance,data: { state: 'ready',schemaVersion: 1,itemCount: 0 } })
   })
@@ -447,6 +486,8 @@ describe('durable assistant panel contract', () => {
   it.each([
     ['capabilities',{ name: {} }],['capabilities',{ name: '../escape' }],['capabilities',{ name: 'x'.repeat(257) }],
     ['device-notes',{ group: {} }],['device-notes',{ group: '../escape' }],['device-notes',{ group: 'bad\nlabel' }],
+    ['capabilities',{ name: '/etc/x' }],['capabilities',{ name: 'C:\\x' }],
+    ['device-notes',{ group: '~/private' }],['device-notes',{ group: '\\absolute' }],
     ['voice-notes',{ noteId: '../escape' }],['voice-notes',{ noteId: 5 }],
     ['integrations',{ providerId: '/absolute' }],['integrations',{ providerId: 'a\\b' }],
   ])('validates identifiers and display labels for %s: %j', async (domain,data) => {

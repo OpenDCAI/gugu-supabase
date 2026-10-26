@@ -70,9 +70,11 @@ The snapshot and pending APIs return complete data or an explicit response-budge
 error; they never truncate a collection and present the remainder as absent.
 Snapshot reads never create an initialization row or enqueue a wake command.
 Metadata is limited to 256 KiB per item; larger content uses a file body. Every
-commit/notice checks the exact complete snapshot and pending representations
-against the same 16 MiB read budget, with room reserved for failure codes. A write
-that would make either representation unreadable rolls back entirely.
+resource commit checks the complete snapshot and required-change representations
+against a 16 MiB budget, reserving room for failure codes. Notices are entirely
+outside these write budgets; their separately bounded channel cannot make a
+required resource write fail. Pending reads enforce 16 MiB for required changes
+plus the independent bounded notice channel.
 
 ## Bodies and deletion
 
@@ -111,6 +113,8 @@ are deleted through the existing authorized file API before their last history
 reference is pruned. Each receipt has its own cleanup subtransaction: any cleanup
 error retains only that receipt for a later attempt, allows other eligible
 receipts to be cleaned, and cannot roll back an application acknowledgement.
+Failed attempts record their last cleanup time and rotate behind untried
+receipts, so a permanently failing first batch cannot starve later cleanup.
 Parent-chat deletion can still cascade through referenced bodies, following the
 existing workspace guard's administrative cleanup semantics.
 
@@ -144,6 +148,11 @@ the same informational key replace obsolete notices. Notice writes do not advanc
 the admission version. Home execution attempts to append and acknowledge notices
 separately. Their acknowledgements have no ordering dependency, unsuccessful
 delivery never becomes `failed`, and pending notices do not block admission.
+At most 64 pending notices are retained per assistant, for at most seven days;
+older hints are superseded and their payloads scrubbed on the next mutation or
+pending read. Required owner intent does not expire. Runtime publication always
+assigns its actual lease device, including when replacing a retired observation
+without an explicit device argument.
 Clients persist retries for post-save notices themselves; saving an already
 persisted App edit is not contingent on a live host acknowledgement.
 

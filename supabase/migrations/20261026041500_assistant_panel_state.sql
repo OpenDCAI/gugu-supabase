@@ -37,6 +37,7 @@ CREATE TABLE identity.assistant_panel_changes (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     applied_at timestamptz,
     applied_device_id text,
+    cleanup_attempted_at timestamptz,
     error_code text CHECK (error_code IS NULL OR error_code ~ '^[A-Z][A-Z0-9_]{0,63}$')
 );
 CREATE INDEX assistant_panel_pending ON identity.assistant_panel_changes(assistant_user_id, revision)
@@ -136,6 +137,8 @@ BEGIN
     IF EXISTS (SELECT 1 FROM jsonb_each(p_data) e WHERE e.key IN ('name','group') AND
         NOT (e.key = 'group' AND e.value = 'null'::jsonb) AND
         (jsonb_typeof(e.value) <> 'string' OR length(e.value #>> '{}') NOT BETWEEN 1 AND 256
+          OR length(btrim(e.value #>> '{}')) = 0
+          OR btrim(e.value #>> '{}') ~ '(^[/~\\]|^[A-Za-z]:)'
           OR e.value #>> '{}' ~ '([[:cntrl:]]|(^|[/\\])[.][.]?([/\\]|$))')) THEN
         RAISE EXCEPTION 'Panel names and groups must be bounded display labels' USING ERRCODE = '22023';
     END IF;
@@ -213,17 +216,15 @@ BEGIN
         jsonb_build_object('revision',h.revision::text,'changes',COALESCE((SELECT jsonb_agg(to_jsonb(c) ||
           jsonb_build_object('revision',c.revision::text,'expected_item_revision',c.expected_item_revision::text))
           FROM identity.assistant_panel_changes c WHERE assistant_user_id = p_assistant AND source = 'panel'
-            AND operation <> 'notice' AND status IN ('pending','failed')),'[]'::jsonb),
-        'notices',COALESCE((SELECT jsonb_agg(to_jsonb(c) || jsonb_build_object('revision',c.revision::text,'expected_item_revision',c.expected_item_revision::text))
-          FROM identity.assistant_panel_changes c WHERE assistant_user_id = p_assistant AND operation = 'notice' AND status = 'pending'),'[]'::jsonb))
+            AND operation <> 'notice' AND status IN ('pending','failed')),'[]'::jsonb))
       INTO v_snapshot,v_pending FROM identity.assistant_panel_items h
       WHERE assistant_user_id = p_assistant AND domain = 'control' AND resource_key = '__head__';
     -- Reserve space for every pending entry's largest failure code/status. An
     -- application error must itself remain recordable within the read budget.
     IF octet_length(v_snapshot::text) + 128 * (SELECT count(*) FROM identity.assistant_panel_changes
-          WHERE assistant_user_id = p_assistant AND source = 'panel' AND status IN ('pending','failed')) > 16777216
+          WHERE assistant_user_id = p_assistant AND source = 'panel' AND operation <> 'notice' AND status IN ('pending','failed')) > 16777216
        OR octet_length(v_pending::text) + 128 * (SELECT count(*) FROM identity.assistant_panel_changes
-          WHERE assistant_user_id = p_assistant AND source = 'panel' AND status IN ('pending','failed')) > 16777216 THEN
+          WHERE assistant_user_id = p_assistant AND source = 'panel' AND operation <> 'notice' AND status IN ('pending','failed')) > 16777216 THEN
         RAISE EXCEPTION 'Panel write exceeds the complete response budget' USING ERRCODE = '54000';
     END IF;
 END;
@@ -238,10 +239,17 @@ CREATE FUNCTION identity.assistant_panel_prune(p_assistant text, p_owner text) R
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE v_receipt identity.assistant_panel_changes%ROWTYPE; v_body uuid;
 BEGIN
+    -- Metadata hints are best-effort recent context, never required intent.
+    -- Retain at most 64 pending notices for seven days, independent of budgets.
+    UPDATE identity.assistant_panel_changes SET status = 'superseded',payload = '{}',applied_at = clock_timestamp()
+      WHERE assistant_user_id = p_assistant AND operation = 'notice' AND status = 'pending'
+        AND (created_at < clock_timestamp() - interval '7 days' OR operation_id IN (
+          SELECT operation_id FROM identity.assistant_panel_changes WHERE assistant_user_id = p_assistant
+            AND operation = 'notice' AND status = 'pending' ORDER BY revision DESC OFFSET 64));
     FOR v_receipt IN SELECT * FROM identity.assistant_panel_changes
       WHERE assistant_user_id = p_assistant AND status IN ('applied','superseded')
         AND COALESCE(applied_at,created_at) < clock_timestamp() - interval '30 days'
-      ORDER BY revision LIMIT 100
+      ORDER BY cleanup_attempted_at NULLS FIRST,revision LIMIT 100
     LOOP
         BEGIN
             v_body := (v_receipt.payload->>'bodyItemId')::uuid;
@@ -258,7 +266,8 @@ BEGIN
         EXCEPTION WHEN OTHERS THEN
             -- Preserve only this receipt/reference for a later attempt. Cleanup
             -- never rolls back other receipts or an application acknowledgement.
-            NULL;
+            UPDATE identity.assistant_panel_changes SET cleanup_attempted_at = clock_timestamp()
+              WHERE operation_id = v_receipt.operation_id;
         END;
     END LOOP;
 END;
@@ -327,7 +336,6 @@ BEGIN
       VALUES(v_id,p_assistant,v_owner,'notice',jsonb_build_array(p_notice->>'resource',p_notice->>'id')::text,p_notice->>'deviceId',
         'panel','notice',0,v_hash,jsonb_build_object('notice',p_notice),'pending') RETURNING revision INTO v_revision;
     PERFORM identity.assistant_panel_prune(p_assistant,v_owner);
-    PERFORM identity.assistant_panel_budget(p_assistant);
     PERFORM chat.send_user_event(jsonb_build_object('assistantId',p_assistant,'revision',v_revision::text),
         'assistant_panel_changed','gugu:user:' || v_owner || ':events',true);
     RETURN jsonb_build_object('operationId',v_id,'revision',v_revision::text,'status','pending');
@@ -396,7 +404,8 @@ BEGIN
        AND NOT (v_old.stale_at IS NOT NULL AND v_device = v_home) THEN
         RAISE EXCEPTION 'Runtime cannot replace another device resource' USING ERRCODE = '42501';
     END IF;
-    v_target := CASE WHEN v_device_scoped THEN COALESCE(p_device_id,v_old.device_id,v_device,v_home) ELSE v_home END;
+    v_target := CASE WHEN v_source = 'runtime' THEN v_device
+      WHEN v_device_scoped THEN COALESCE(p_device_id,v_old.device_id,v_home) ELSE v_home END;
     IF v_source = 'panel' AND (v_target IS DISTINCT FROM v_home
        OR v_device_scoped AND v_old.device_id IS NOT NULL AND v_old.device_id <> v_target) THEN
         RAISE EXCEPTION 'Panel edits for a non-home device are not supported' USING ERRCODE = '42501';
@@ -577,6 +586,7 @@ DECLARE v_owner text; v_result jsonb;
 BEGIN
     v_owner := identity.assistant_panel_lock(p_assistant);
     PERFORM identity.assistant_panel_runtime(p_assistant,p_runtime_instance_id,true);
+    PERFORM identity.assistant_panel_prune(p_assistant,v_owner);
     SELECT jsonb_build_object('revision',h.revision::text,'changes',COALESCE((SELECT jsonb_agg(to_jsonb(c) ||
         jsonb_build_object('revision',c.revision::text,'expected_item_revision',c.expected_item_revision::text) ORDER BY revision)
         FROM identity.assistant_panel_changes c WHERE assistant_user_id = p_assistant AND source = 'panel' AND operation <> 'notice' AND status IN ('pending','failed')),'[]'::jsonb),
@@ -584,7 +594,7 @@ BEGIN
         FROM identity.assistant_panel_changes c WHERE assistant_user_id = p_assistant AND operation = 'notice' AND status = 'pending'),'[]'::jsonb))
       INTO v_result FROM identity.assistant_panel_items h
       WHERE assistant_user_id = p_assistant AND domain = 'control' AND resource_key = '__head__';
-    IF octet_length(v_result::text) > 16777216 THEN
+    IF octet_length((v_result - 'notices')::text) > 16777216 THEN
         RAISE EXCEPTION 'Assistant pending changes exceed the complete response budget' USING ERRCODE = '54000';
     END IF;
     RETURN v_result;

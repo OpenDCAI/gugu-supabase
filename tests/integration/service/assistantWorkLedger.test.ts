@@ -339,6 +339,9 @@ describe('account work ledger and its only delivery outbox', () => {
     const completed = report('completed',{ attachment_refs: [{ item_id: item }] })
     await commit(id,[completed],null,randomUUID(),workerInstance)
     expect((await list()).items[0]!.outcome).toBe('completed')
+    const older=(await claim()).events.find(row=>row.kind==='failed')!
+    expect(older.message_id).not.toBe(completed.message_id)
+    await settle(older,'assistant_admitted')
     expect((await claim()).events.find(row => row.message_id === completed.message_id)).toMatchObject({ attachment_refs: [{ item_id: item }] })
     await failure(() => commit(id,[report('cancelled')],null,randomUUID(),workerInstance), /terminal|conflict/i)
   })
@@ -375,9 +378,19 @@ describe('account work ledger and its only delivery outbox', () => {
     expect((await db.query("SELECT count(*)::int AS n FROM pg_policies WHERE schemaname='identity' AND tablename IN ('assistant_work','assistant_work_events')")).rows[0]!.n).toBe(0)
   })
 
+  it('keeps later messages behind an older lease for the same work and seat, but not behind abandonment',async()=>{
+    const id=randomUUID(),first=dispatch(),second=dispatch()
+    await commit(id,[first,second],task())
+    const claimed=(await claim()).events
+    expect(claimed.map(row=>row.message_id)).toEqual([first.message_id])
+    expect((await claim(workerInstance)).events).toHaveLength(0)
+    await as(owner,()=>call('assistant_work_outbox_settle',[instance,claimed[0]!.message_id,claimed[0]!.lease_token,'abandoned','NETWORK',5,JSON.stringify({failure_observed:true})]))
+    expect((await claim(workerInstance)).events.map(row=>row.message_id)).toEqual([second.message_id])
+  })
+
   it('allows concurrent runtimes to claim each durable message at most once', async () => {
-    const id = randomUUID(), events = Array.from({ length: 8 },() => dispatch())
-    await commit(id,events,task())
+    const events = Array.from({ length: 8 },() => dispatch())
+    for(const event of events) await commit(randomUUID(),[event],task())
     await db.query('COMMIT')
     const other = new pg.Client({ connectionString: url }); await other.connect()
     try {

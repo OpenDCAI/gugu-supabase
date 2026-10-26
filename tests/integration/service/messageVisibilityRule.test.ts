@@ -50,11 +50,11 @@ async function agentOf(ownerId: string): Promise<string> {
     VALUES ($1,'agent','Assistant',$2,$3)`, [id, ownerId, `dev-${ownerId}`])
   return id
 }
-async function say(chatId: string, sender: string, hour: number, opts: { to?: string[] } = {}): Promise<string> {
+async function say(chatId: string, sender: string, hour: number, opts: { to?: string[]; whisper?: boolean } = {}): Promise<string> {
   await asService()
   const id = randomUUID()
-  await database.query(`INSERT INTO chat.messages (id, chat_id, sender_user_id, content, content_type, to_user_ids, created_at)
-    VALUES ($1,$2,$3,'visibility needle','text',$4,$5)`, [id, chatId, sender, opts.to ?? null, at(hour)])
+  await database.query(`INSERT INTO chat.messages (id, chat_id, sender_user_id, content, content_type, to_user_ids, created_at, is_whisper)
+    VALUES ($1,$2,$3,'visibility needle','text',$4,$5,$6)`, [id, chatId, sender, opts.to ?? null, at(hour), opts.whisper ?? false])
   return id
 }
 
@@ -133,6 +133,29 @@ afterEach(async () => {
 })
 
 describe('one message-visibility rule for every actor-scoped reader', () => {
+  it('returns reply privacy for an agent without exposing another pair of whisper participants', async () => {
+    const owner = await human('Owner'), other = await human('Other'), outsider = await human('Outsider')
+    const agent = await agentOf(owner)
+    const group = await groupWith(owner, [other, outsider, agent])
+    const incoming = await say(group, other, 1, { to: [agent], whisper: true })
+    const outgoing = await say(group, agent, 2, { to: [other], whisper: true })
+    const unrelated = await say(group, owner, 3, { to: [other], whisper: true })
+    const publicMessage = await say(group, other, 4, { to: [agent] })
+    await asUser(owner)
+    // Owner-scoped table reads deliberately do not impersonate the agent.
+    expect((await database.query('SELECT id FROM chat.messages WHERE id = $1', [incoming])).rows).toEqual([])
+    const rows = (await database.query('SELECT id, sender_user_id, to_user_ids, is_whisper FROM chat.message_history_as($1,$2)', [group, agent])).rows
+    expect(rows).toEqual(expect.arrayContaining([
+      { id: incoming, sender_user_id: other, to_user_ids: [agent], is_whisper: true },
+      { id: outgoing, sender_user_id: agent, to_user_ids: [other], is_whisper: true },
+      { id: publicMessage, sender_user_id: other, to_user_ids: [agent], is_whisper: false },
+    ]))
+    expect(rows.some((row) => row.id === unrelated)).toBe(false)
+    await asUser(outsider)
+    expect((await attempt('SELECT * FROM chat.message_history_as($1,$2)', [group, agent])).error).toMatch(/Not allowed to act as/)
+    const outsiderRows = (await database.query('SELECT id FROM chat.message_history_as($1,$2)', [group, outsider])).rows
+    expect(outsiderRows).toEqual([{ id: publicMessage }])
+  })
   it('a change to chat.message_visible_at reaches every reader at once', async () => {
     const owner = await human('Owner')
     const peer = await human('Peer')

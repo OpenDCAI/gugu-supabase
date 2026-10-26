@@ -33,7 +33,8 @@ async function commit(options: {
     options.device ?? null,options.runtime ?? null]))
 }
 const snapshot = () => as(owner, () => call<Snapshot>('assistant_panel_snapshot',[agent]))
-const pending = () => as(owner, () => call<{ revision: string; changes: { operation_id: string; status: string; payload: unknown }[] }>('assistant_panel_pending',[agent,instance]))
+type PendingChange = { operation_id: string; status: string; payload: unknown; device_id: string }
+const pending = () => as(owner, () => call<{ revision: string; changes: PendingChange[]; notices: PendingChange[] }>('assistant_panel_pending',[agent,instance]))
 const ack = (id: string, error: string | null = null) => as(owner, () => call('assistant_panel_ack',[agent,instance,id,error]))
 const admit = (revision: string) => as(owner, () => call<{ admitted: boolean; domain?: string; resourceKey?: string; errorCode?: string }>('assistant_panel_admit',[agent,instance,revision]))
 
@@ -72,6 +73,30 @@ async function file(room = chat) {
   await db.query("INSERT INTO chat.file_blobs(id,bucket_id,object_name,sha256,size_bytes,content_type,created_by) VALUES($1,'workspace',$2,$3,10,'text/plain',$4)",[blob,`${room}/${blob}`,hash,owner])
   await db.query("INSERT INTO chat.workspace_items(id,chat_id,kind,filename,blob_id,created_by) VALUES($1,$2,'file',$3,$4,$5)",[id,room,`${id}.txt`,blob,owner])
   return { id,blob,hash }
+}
+
+
+async function moveHome() {
+  const nextDevice = `panel-${randomUUID()}`, nextInstance = randomUUID()
+  await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,'new','new','linux')",[nextDevice,owner])
+  await db.query('INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id) VALUES($1,$2,$3)',[nextInstance,nextDevice,owner])
+  await db.query("INSERT INTO identity.agent_profiles(id,owner_id,display_name,agent_type) VALUES($1,$2,'Panel assistant','claude-code')",[agent,owner])
+  const move = randomUUID(), provision = randomUUID()
+  const member = { provision_id: provision,member_key: 'single',display_name: 'Panel assistant',agent_type: 'claude-code',
+    project_path: '',inherit_memory: false,history_import_required: false,existing_agent_user_id: agent }
+  await as(owner,async () => {
+    await db.query('SELECT identity.start_agent_provision_operation($1,$2,$3::jsonb,NULL,NULL,$4,NULL,$5,$6,NULL)',
+      [move,nextDevice,JSON.stringify({ kind: 'single',members: [member] }),'platform:deepseek-v4-pro','full-access','claude'])
+    await db.query('SELECT identity.claim_provision_slots($1)',[move])
+    await db.query('SELECT identity.prepare_agent_provision($1,$2,$3,$4,$5,$6,$7,NULL,NULL,NULL,NULL)',
+      [provision,move,'single',nextDevice,'Panel assistant','claude-code',''])
+  })
+  await db.query("UPDATE identity.gugu_device_commands SET status='done',completed_at=now() WHERE id=(SELECT create_command_id FROM identity.agent_provisions WHERE id=$1)",[provision])
+  await as(owner,async () => {
+    await db.query('SELECT identity.settle_agent_provision_terminal($1)',[provision])
+    await db.query('SELECT identity.complete_agent_provision($1)',[provision])
+  })
+  return { nextDevice,nextInstance }
 }
 
 describe('durable assistant panel contract', () => {
@@ -151,7 +176,8 @@ describe('durable assistant panel contract', () => {
     const two = await commit({ domain: 'memory',key: 'remember',revision: one.revision,data: { title: 'Private',relativePath: 'remember.md' },body: current.id,hash: current.hash })
     await ack(two.operationId)
     const removed = await commit({ domain: 'memory',key: 'remember',revision: two.revision,operation: 'remove',data: {} })
-    const row = (await snapshot()).items[0]!
+    expect((await snapshot()).items).toEqual([])
+    const row = (await db.query('SELECT * FROM identity.assistant_panel_items WHERE assistant_user_id=$1 AND domain=$2 AND resource_key=$3',[agent,'memory','remember'])).rows[0]!
     expect(row).toMatchObject({ data: {},body_item_id: null,revision: removed.revision })
     expect(row.deleted_at).not.toBeNull()
     expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=ANY($1::uuid[])',[[old.id,current.id]])).rows).toEqual([])
@@ -225,25 +251,7 @@ describe('durable assistant panel contract', () => {
   it('moves assistant-owned resources and error markers to the current home without accepting the former publisher', async () => {
     const note = await commit({ domain: 'memory',key: 'moved',data: { relativePath: 'moved.md' },device,runtime: instance })
     const marker = await commit({ domain: 'memory',key: '__collection__',operation: 'prepared',device,runtime: instance,data: { state: 'ready',schemaVersion: 1,itemCount: 1 } })
-    const nextDevice = `panel-${randomUUID()}`, nextInstance = randomUUID()
-    await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,'new','new','linux')",[nextDevice,owner])
-    await db.query('INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id) VALUES($1,$2,$3)',[nextInstance,nextDevice,owner])
-    await db.query("INSERT INTO identity.agent_profiles(id,owner_id,display_name,agent_type) VALUES($1,$2,'Panel assistant','claude-code')",[agent,owner])
-    const move = randomUUID(), provision = randomUUID()
-    const member = { provision_id: provision,member_key: 'single',display_name: 'Panel assistant',agent_type: 'claude-code',
-      project_path: '',inherit_memory: false,history_import_required: false,existing_agent_user_id: agent }
-    await as(owner,async () => {
-      await db.query('SELECT identity.start_agent_provision_operation($1,$2,$3::jsonb,NULL,NULL,$4,NULL,$5,$6,NULL)',
-        [move,nextDevice,JSON.stringify({ kind: 'single',members: [member] }),'platform:deepseek-v4-pro','full-access','claude'])
-      await db.query('SELECT identity.claim_provision_slots($1)',[move])
-      await db.query('SELECT identity.prepare_agent_provision($1,$2,$3,$4,$5,$6,$7,NULL,NULL,NULL,NULL)',
-        [provision,move,'single',nextDevice,'Panel assistant','claude-code',''])
-    })
-    await db.query("UPDATE identity.gugu_device_commands SET status='done',completed_at=now() WHERE id=(SELECT create_command_id FROM identity.agent_provisions WHERE id=$1)",[provision])
-    await as(owner,async () => {
-      await db.query('SELECT identity.settle_agent_provision_terminal($1)',[provision])
-      await db.query('SELECT identity.complete_agent_provision($1)',[provision])
-    })
+    const { nextDevice,nextInstance } = await moveHome()
     await failure(() => commit({ domain: 'memory',key: 'moved',revision: note.revision,data: {},runtime: instance }),/required device/)
     await commit({ domain: 'memory',key: 'moved',revision: note.revision,data: { relativePath: 'moved.md' },device: nextDevice,runtime: nextInstance })
     await commit({ domain: 'memory',key: '__collection__',revision: marker.revision,operation: 'error',device: nextDevice,runtime: nextInstance,data: { state: 'error',schemaVersion: 1,errorCode: 'READ_FAILED' } })
@@ -309,15 +317,141 @@ describe('durable assistant panel contract', () => {
     const saved = await notice()
     expect(await notice()).toEqual(saved)
     expect((await snapshot()).items).toEqual([])
-    expect((await pending()).changes[0]!.payload).toEqual({ notice: change })
+    expect((await pending()).notices[0]!.payload).toEqual({ notice: change })
     await failure(() => as(stranger,() => call('assistant_panel_notice',[agent,JSON.stringify(change)])),/not available/)
     await failure(() => as(owner,() => call('assistant_panel_notice',[agent,JSON.stringify({ ...change,after: { text: 'Resource body is forbidden' } })])),/unsupported content/)
     await failure(() => as(owner,() => call('assistant_panel_notice',[agent,JSON.stringify({ ...change,operationId: randomUUID(),deviceId: otherDevice })])),/not owned/)
     await failure(() => as(owner,() => call('assistant_panel_notice',[agent,JSON.stringify({ ...change,after: { path: '/work/../outside' } })])),/traversal/)
     await ack(saved.operationId)
-    expect(await admit(saved.revision)).toMatchObject({ admitted: true })
+    expect(await admit((await snapshot()).revision)).toMatchObject({ admitted: true })
     expect((await db.query('SELECT count(*)::int AS n FROM identity.gugu_device_commands WHERE user_id=$1',[owner])).rows[0]!.n).toBe(0)
     expect((await db.query('SELECT count(*)::int AS n FROM chat.messages WHERE chat_id=$1',[chat])).rows[0]!.n).toBe(0)
+  })
+
+  it('keeps failed notice delivery outside mutation ordering, publication guards and admission', async () => {
+    const input = { operationId: randomUUID(),resource: 'memory',operation: 'edited',id: 'same-key' }
+    const notice = await as(owner,() => call<Commit>('assistant_panel_notice',[agent,JSON.stringify(input)]))
+    const observed = await commit({ domain: 'memory',key: 'same-key',runtime: instance,data: { relativePath: 'note.md' } })
+    const edit = await commit({ domain: 'memory',key: 'same-key',revision: observed.revision,data: { relativePath: 'note.md' } })
+    await as(owner,() => call('assistant_panel_notice',[agent,JSON.stringify({ ...input,operationId: randomUUID() })]))
+    expect((await pending()).changes.map(c => c.operation_id)).toEqual([edit.operationId])
+    expect((await pending()).notices).toHaveLength(1)
+    const newerNotice = (await pending()).notices[0]!
+    expect(await ack(newerNotice.operation_id,'NOTICE_APPEND_FAILED')).toMatchObject({ status: 'pending' })
+    expect((await db.query('SELECT status,error_code FROM identity.assistant_panel_changes WHERE operation_id=$1',[newerNotice.operation_id])).rows[0])
+      .toEqual({ status: 'pending',error_code: null })
+    await ack(edit.operationId)
+    expect(await admit((await snapshot()).revision)).toMatchObject({ admitted: true })
+    expect((await snapshot()).application).toEqual([])
+    expect(await ack(notice.operationId)).toMatchObject({ status: 'superseded' })
+    // A pending informational notice does not fence a fresh runtime publication.
+    await commit({ domain: 'memory',key: 'same-key',revision: edit.revision,runtime: instance,data: { relativePath: 'note.md' } })
+  })
+
+  it.each(['memory','integrations'])('preserves original cleanup routing when retrying a failed %s deletion', async domain => {
+    const data = domain === 'memory' ? { relativePath: 'still-needs-removal.md' } : { providerId: 'github',accountId: 'account-a',configured: true }
+    const saved = await commit({ domain,key: 'retry-delete',data })
+    const first = await commit({ domain,key: 'retry-delete',revision: saved.revision,operation: 'remove',data: {} })
+    await ack(first.operationId,'LOCAL_DELETE_FAILED')
+    const before = (await pending()).changes[0]!.payload
+    const retry = await commit({ domain,key: 'retry-delete',revision: first.revision,operation: 'remove',data: {} })
+    expect((await pending()).changes).toEqual([expect.objectContaining({ operation_id: retry.operationId,payload: before })])
+    await ack(retry.operationId)
+    expect(await admit(retry.revision)).toMatchObject({ admitted: true })
+  })
+
+  it.each(['save','remove'])('rejects %s of another device resource even when the panel explicitly supplies its home device', async operation => {
+    const nextDevice = `panel-${randomUUID()}`, nextInstance = randomUUID()
+    await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,'other','other','linux')",[nextDevice,owner])
+    await db.query('INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id) VALUES($1,$2,$3)',[nextInstance,nextDevice,owner])
+    const observed = await commit({ domain: 'integrations',key: 'belongs-elsewhere',device: nextDevice,runtime: nextInstance,data: { configured: true } })
+    await failure(() => commit({ domain: 'integrations',key: 'belongs-elsewhere',revision: observed.revision,device,operation,
+      data: operation === 'remove' ? {} : { configured: false } }),/non-home device/)
+    expect((await snapshot()).items[0]).toMatchObject({ device_id: nextDevice,data: { configured: true } })
+    await commit({ domain: 'integrations',key: 'belongs-elsewhere',revision: observed.revision,device: nextDevice,runtime: nextInstance,data: { configured: false } })
+  })
+
+  it('keeps 50,000 permanent revocations outside complete reads and write budgets', async () => {
+    await db.query(`INSERT INTO identity.assistant_panel_items(assistant_user_id,owner_user_id,domain,resource_key,deleted_at)
+      SELECT $1,$2,'memory','revoked-' || n,now() FROM generate_series(1,50000) n`,[agent,owner])
+    const saved = await commit()
+    expect((await snapshot()).items).toEqual([expect.objectContaining({ resource_key: 'current' })])
+    await failure(() => commit({ domain: 'memory',key: 'revoked-49999',runtime: instance,data: {} }),/deleted/)
+    await ack(saved.operationId)
+    expect(await admit(saved.revision)).toMatchObject({ admitted: true })
+  },30_000)
+
+  it('looks up a known revoked key with its precise version without exposing the complete revocation set', async () => {
+    const removed = await commit({ domain: 'memory',key: 'known-revocation',operation: 'remove',data: {} })
+    const read = (key: string) => as(owner,() => call('assistant_panel_resource',[agent,'memory',key]))
+    expect(await read('known-revocation')).toMatchObject({ version: 1,item: { resource_key: 'known-revocation',revision: removed.revision,deleted_at: expect.any(String) } })
+    expect(await read('missing')).toEqual({ version: 1,item: null })
+    expect((await snapshot()).items).toEqual([])
+    await failure(() => as(stranger,() => call('assistant_panel_resource',[agent,'memory','known-revocation'])),/not available/)
+    await failure(() => as(owner,() => call('assistant_panel_resource',[agent,'control','__head__'])),/Invalid panel resource/)
+  })
+
+  it('isolates each cleanup failure and never lets cleanup roll back an acknowledgement', async () => {
+    const old: { receipt: Commit; body: Awaited<ReturnType<typeof file>> }[] = []
+    for (const key of ['bad-permission','good','bad-payload']) {
+      const body = await file(), next = await file()
+      const receipt = await commit({ domain: 'memory',key,data: { relativePath: `${key}.md` },body: body.id,hash: body.hash })
+      await ack(receipt.operationId)
+      const replacement = await commit({ domain: 'memory',key,revision: receipt.revision,data: { relativePath: `${key}.md` },body: next.id,hash: next.hash })
+      await ack(replacement.operationId)
+      old.push({ receipt,body })
+    }
+    await db.query('UPDATE chat.workspace_items SET created_by=$2 WHERE id=$1',[old[0]!.body.id,stranger])
+    await db.query("UPDATE identity.assistant_panel_changes SET payload=jsonb_set(payload,'{bodyItemId}','\"invalid-uuid\"') WHERE operation_id=$1",[old[2]!.receipt.operationId])
+    const waiting = await commit({ key: 'ack-survives-cleanup' })
+    await db.query("UPDATE identity.assistant_panel_changes SET created_at=now()-interval '31 days',applied_at=now()-interval '31 days' WHERE operation_id=ANY($1::uuid[])",[old.map(entry => entry.receipt.operationId)])
+    expect(await ack(waiting.operationId)).toMatchObject({ status: 'applied' })
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[old[1]!.body.id])).rows).toEqual([])
+    const remaining = (await db.query<{ operation_id: string }>('SELECT operation_id FROM identity.assistant_panel_changes WHERE operation_id=ANY($1::uuid[])',[old.map(entry => entry.receipt.operationId)])).rows
+    expect(remaining.map(row => row.operation_id).sort()).toEqual([old[0]!.receipt.operationId,old[2]!.receipt.operationId].sort())
+    expect(await admit(waiting.revision)).toMatchObject({ admitted: true })
+  })
+
+  it('withdraws the former home inventory on actual adoption and lets the new home publish a fresh observation', async () => {
+    for (const [domain,data] of [['tasks',{ title: 'Old task' }],['capabilities',{ name: 'Old capability' }],
+      ['device-notes',{ name: 'Old device note' }],['integrations',{ providerId: 'github',configured: true }]] as const) {
+      await commit({ domain,key: 'old-observation',data,runtime: instance,device })
+      await commit({ domain,key: `__collection__:${device}`,operation: 'prepared',runtime: instance,device,data: { state: 'ready',schemaVersion: 1,itemCount: 1 } })
+    }
+    const { nextDevice,nextInstance } = await moveHome()
+    expect((await snapshot()).items).toEqual([])
+    const stale = (await db.query('SELECT * FROM identity.assistant_panel_items WHERE assistant_user_id=$1 AND domain=$2 AND resource_key=$3',[agent,'capabilities','old-observation'])).rows[0]!
+    expect(stale.stale_at).not.toBeNull()
+    await commit({ domain: 'capabilities',key: 'old-observation',revision: stale.revision,device: nextDevice,runtime: nextInstance,data: { name: 'Fresh capability' } })
+    expect((await snapshot()).items).toEqual([expect.objectContaining({ device_id: nextDevice,data: { name: 'Fresh capability' },stale_at: null })])
+    await commit({ domain: 'tasks',key: '__collection__',operation: 'prepared',device: nextDevice,runtime: nextInstance,data: { state: 'ready',schemaVersion: 1,itemCount: 0 } })
+  })
+
+  it('moves still-unapplied owner intent to the new home instead of orphaning it', async () => {
+    const saved = await commit({ domain: 'capabilities',key: 'pending-across-move',device,data: { name: 'User change' } })
+    const { nextDevice,nextInstance } = await moveHome()
+    const state = await as(owner,() => call<{ revision: string; changes: PendingChange[] }>('assistant_panel_pending',[agent,nextInstance]))
+    expect(state.changes).toEqual([expect.objectContaining({ operation_id: saved.operationId,device_id: nextDevice,payload: expect.objectContaining({ deviceId: nextDevice }) })])
+    expect((await snapshot()).items[0]).toMatchObject({ device_id: nextDevice,data: { name: 'User change' } })
+    await as(owner,() => call('assistant_panel_ack',[agent,nextInstance,saved.operationId,null]))
+    expect(await as(owner,() => call('assistant_panel_admit',[agent,nextInstance,state.revision]))).toMatchObject({ admitted: true })
+  })
+
+  it('allows administrator chat deletion to cascade through referenced bodies', async () => {
+    const body = await file()
+    await commit({ domain: 'memory',key: 'chat-deleted',data: { relativePath: 'note.md' },body: body.id,hash: body.hash })
+    await db.query('DELETE FROM chat.chats WHERE id=$1',[chat])
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[body.id])).rows).toEqual([])
+  })
+
+  it.each([
+    ['capabilities',{ name: {} }],['capabilities',{ name: '../escape' }],['capabilities',{ name: 'x'.repeat(257) }],
+    ['device-notes',{ group: {} }],['device-notes',{ group: '../escape' }],['device-notes',{ group: 'bad\nlabel' }],
+    ['voice-notes',{ noteId: '../escape' }],['voice-notes',{ noteId: 5 }],
+    ['integrations',{ providerId: '/absolute' }],['integrations',{ providerId: 'a\\b' }],
+  ])('validates identifiers and display labels for %s: %j', async (domain,data) => {
+    await failure(() => commit({ domain: domain as string,data }),/bounded display labels|safe identifiers/)
+    expect((await snapshot()).revision).toBe('0')
   })
 
   it('rolls back both current state and its queue if validation or body removal fails', async () => {
@@ -423,7 +557,7 @@ describe('durable assistant panel contract', () => {
       await db.query('BEGIN')
       const after = await snapshot()
       expect(after.revision).toBe(deletion.revision)
-      expect(after.items[0]!.deleted_at).not.toBeNull()
+      expect(after.items).toEqual([])
       expect((await pending()).changes.map(c => c.operation_id)).toEqual([deletion.operationId])
       await db.query('COMMIT')
     } finally {
@@ -459,6 +593,12 @@ describe('durable assistant panel contract', () => {
       const read = await client.rpc('assistant_panel_snapshot',{ p_assistant: agent })
       expect(read.error).toBeNull()
       expect(read.data.items[0].data).toEqual(input.p_data)
+      const lookup = { p_assistant: agent,p_domain: 'personality',p_resource_key: 'current' }
+      expect((await client.rpc('assistant_panel_resource',lookup)).data.item.revision).toBe(saved.data.revision)
+      const removed = await client.rpc('assistant_panel_commit',{ ...input,p_operation_id: randomUUID(),p_expected_revision: saved.data.revision,p_operation: 'remove',p_data: {} })
+      expect(removed.error).toBeNull()
+      expect((await client.rpc('assistant_panel_snapshot',{ p_assistant: agent })).data.items).toEqual([])
+      expect((await client.rpc('assistant_panel_resource',lookup)).data.item).toMatchObject({ revision: removed.data.revision,deleted_at: expect.any(String) })
       expect((await client.from('assistant_panel_items').update({ data: {} }).eq('assistant_user_id',agent)).error?.code).toBe('42501')
       const anonymous = createClient(endpoint,process.env.VITE_SUPABASE_ANON_KEY!,options)
       expect((await anonymous.rpc('assistant_panel_snapshot',{ p_assistant: agent })).error?.code).toBe('42501')

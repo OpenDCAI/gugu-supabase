@@ -18,11 +18,12 @@ SELECT-only with RLS; internal helpers and direct writes are closed to clients.
 
 | RPC | Arguments | Result |
 | --- | --- | --- |
-| `assistant_panel_snapshot` | `p_assistant` | `{version:1, revision, items, application}` from one database snapshot; an unprepared account has no collection marker; pending/failed application entries identify the affected resource without copying its body |
+| `assistant_panel_snapshot` | `p_assistant` | `{version:1, revision, items, application}` from one database snapshot; excludes revoked and retired observations; an unprepared account has no collection marker; pending/failed mutations identify the affected resource without copying its body |
+| `assistant_panel_resource` | `p_assistant`, `p_domain`, `p_resource_key` | `{version:1, item}` for a known key, including revocation/retirement state and a precise version; `item:null` means that key has never been stored |
 | `assistant_panel_commit` | `p_assistant`, UUID `p_operation_id`, `p_domain`, `p_resource_key`, bigint `p_expected_revision`, `p_operation`; optional `p_data`, `p_body_item_id`, `p_body_sha256`, `p_device_id`, `p_runtime_instance_id` | `{operationId, revision, status}` after atomically committing the resource and its application record |
 | `assistant_panel_notice` | `p_assistant`, `p_notice` | Durable metadata-only notice for an App edit already saved by its owning service; no desired-state row, execution command or message is created |
-| `assistant_panel_pending` | `p_assistant`, `p_runtime_instance_id` | `{revision, changes}` in committed order, including failed changes that still require application |
-| `assistant_panel_ack` | `p_assistant`, `p_runtime_instance_id`, `p_operation_id`; optional `p_error_code` | Item-specific application receipt; only success removes a change from the pending set |
+| `assistant_panel_pending` | `p_assistant`, `p_runtime_instance_id` | `{revision, changes, notices}`; changes include failed mutations requiring application; notices use a separate, non-blocking channel |
+| `assistant_panel_ack` | `p_assistant`, `p_runtime_instance_id`, `p_operation_id`; optional `p_error_code` | Item-specific receipt; mutation failure blocks admission, while unsuccessful notice delivery remains pending without blocking anything |
 | `assistant_panel_admit` | `p_assistant`, `p_runtime_instance_id`, `p_expected_revision` | `{admitted:true, revision}` only when the head still matches and all preceding panel changes have been applied; otherwise identifies the pending item or raises a version conflict |
 
 Revisions in JSON results are decimal strings. An absent resource has expected
@@ -54,13 +55,16 @@ configuration. Credentials stay in the existing encrypted store.
 Collection markers use `__collection__`, or `__collection__:<device ID>` for an
 individual device. Only the actual runtime publisher can submit `prepared` or
 `error`. A prepared marker requires `{state:"ready", schemaVersion:1, itemCount}`
-whose count matches all non-deleted resources in that collection. A failed source
+whose count matches all non-deleted, non-retired resources in that collection. A failed source
 uses `{state:"error", schemaVersion:1, errorCode}` and leaves existing items intact.
 No marker means not yet prepared, not a successfully read empty collection.
 Paths in resource metadata must be normalized relative paths, without absolute
 roots, drive prefixes, backslashes, percent escapes, control characters or dot
 segments. The runtime must additionally resolve them inside its own resource root
 and reject symbolic-link escapes; database validation is not a filesystem check.
+Names/groups are bounded display labels, not filesystem locations. Note/provider
+IDs use a bounded identifier grammar. Runtime handlers must constrain every
+identifier they use in a path to the appropriate host-owned resource root.
 
 The snapshot and pending APIs return complete data or an explicit response-budget
 error; they never truncate a collection and present the remainder as absent.
@@ -97,11 +101,18 @@ caches, reject reads of revoked files and append a structured committed-change
 notice before the next request. It preserves native conversation context and its
 prefix; this protocol does not reset sessions or erase historical chat messages.
 Compact tombstones remain for the lifetime of the assistant and disappear with
-account deletion. Terminal change receipts are pruned on the next mutation after
-30 days; pending/failed intent never expires. Unreferenced historical body files
+account deletion. They are excluded from complete reads and response budgets;
+a publisher probes each known local key before uploading, using the exact
+resource API to enforce revocation and obtain its version. Repeated removal of
+an unapplied tombstone preserves the previous removal's original cleanup routing.
+Up to 100 terminal receipts are pruned per mutation after 30 days;
+pending/failed intent never expires. Unreferenced historical body files
 are deleted through the existing authorized file API before their last history
-reference is pruned. A permission failure retains the reference for a later
-cleanup attempt and does not block applying saved intent.
+reference is pruned. Each receipt has its own cleanup subtransaction: any cleanup
+error retains only that receipt for a later attempt, allows other eligible
+receipts to be cleaned, and cannot roll back an application acknowledgement.
+Parent-chat deletion can still cascade through referenced bodies, following the
+existing workspace guard's administrative cleanup semantics.
 
 ## Writers, failure and admission
 
@@ -118,14 +129,21 @@ Assistant-owned domains follow the currently assigned home after adoption;
 their former publisher's device ID cannot prevent a new home from publishing
 either fresh content or an explicit read-failure marker. Device-scoped resources
 remain bound to their actual publishing device.
+On adoption, former-home observations and preparation markers are marked retired
+and withdrawn from complete panel reads. Unapplied owner intent instead follows
+the new home, including its cleanup routing. A fresh current-home publication
+can replace a retired key.
 
 The notice API accepts the existing App change fields (`operationId`, `resource`,
 `operation`, `id`, optional owned `deviceId`, `section`, `before`, `after`). Both
 summaries use a strict scalar-field allowlist, and the whole notice is limited to
 16 KiB. It rejects bodies, prompts, credentials and arbitrary nested configuration.
-Newer pending notices for the same resource replace obsolete notices, while an
-actual pending resource mutation remains required. The next home execution
-appends the structured notice and acknowledges it through the same ordered queue.
+Notices use a separate `notice` namespace with an encoded resource/key pair;
+they cannot fence publication or supersede a mutation. Newer pending notices for
+the same informational key replace obsolete notices. Notice writes do not advance
+the admission version. Home execution attempts to append and acknowledge notices
+separately. Their acknowledgements have no ordering dependency, unsuccessful
+delivery never becomes `failed`, and pending notices do not block admission.
 Clients persist retries for post-save notices themselves; saving an already
 persisted App edit is not contingent on a live host acknowledgement.
 

@@ -147,7 +147,7 @@ BEGIN
         RAISE EXCEPTION 'Panel note and provider IDs must be safe identifiers' USING ERRCODE = '22023';
     END IF;
     v_keys := CASE WHEN p_key = '__collection__' OR starts_with(p_key,'__collection__:') THEN ARRAY['state','schemaVersion','itemCount','errorCode'] ELSE CASE p_domain
-        WHEN 'tasks' THEN ARRAY['agentId','sessionId','parentSessionId','assistantSessionIds','chatId','title','createdAt','lastInteractedAt','status','statusDetail','statusObservedAt','sourceLinks']
+        WHEN 'tasks' THEN ARRAY['agentId','sessionId','parentSessionId','assistantSessionIds','chatId','title','createdAt','lastInteractedAt','status','statusDetail','statusObservedAt','sourceLinks','harness','unseen']
         WHEN 'schedules' THEN ARRAY['title','prompt','at','cron','tz','enabled','nextRunAt','lastRun']
         WHEN 'memory' THEN ARRAY['title','path','relativePath','createdAt','modifiedAt','kind']
         WHEN 'personality' THEN ARRAY['preset','text']
@@ -410,7 +410,10 @@ BEGIN
        OR v_device_scoped AND v_old.device_id IS NOT NULL AND v_old.device_id <> v_target) THEN
         RAISE EXCEPTION 'Panel edits for a non-home device are not supported' USING ERRCODE = '42501';
     END IF;
-    IF v_old.deleted_at IS NOT NULL AND p_operation <> 'remove' THEN
+    IF v_old.deleted_at IS NOT NULL AND p_operation <> 'remove' AND NOT (
+        v_source = 'panel' AND p_operation = 'save' AND p_domain IN ('memory','files','skills','voice-notes')
+        AND (p_body_item_id IS NOT NULL OR p_domain IN ('files','voice-notes') AND p_data->>'kind' = 'directory')
+    ) THEN
         RAISE EXCEPTION 'Panel resource was deleted and cannot be republished' USING ERRCODE = '55000';
     END IF;
     IF v_source = 'runtime' AND EXISTS (SELECT 1 FROM identity.assistant_panel_changes
@@ -468,6 +471,9 @@ BEGIN
     END IF;
     v_payload := jsonb_build_object('data',v_data,'bodyItemId',p_body_item_id,'bodySha256',p_body_sha256,
         'deviceId',v_target);
+    IF v_old.deleted_at IS NOT NULL AND p_operation = 'save' THEN
+        v_payload := v_payload || jsonb_build_object('recreated',true);
+    END IF;
     IF p_operation IN ('enable','disable') THEN
         v_payload := v_payload || jsonb_build_object('bodyItemId',v_old.body_item_id,'bodySha256',v_old.body_sha256);
     END IF;

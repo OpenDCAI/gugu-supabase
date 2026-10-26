@@ -189,6 +189,26 @@ describe('durable assistant panel contract', () => {
     expect(await admit(removed.revision)).toMatchObject({ admitted: true })
   })
 
+  it('preserves the task title provider and unread marker in cloud observations', async () => {
+    await commit({ domain: 'tasks',key: 'task',runtime: instance,device,data: { sessionId: 'task',title: 'codex (1)',harness: 'codex',unseen: true } })
+    expect((await snapshot()).items).toMatchObject([{ data: { harness: 'codex',unseen: true } }])
+  })
+
+  it('permits owner supplied replacement content after deletion while rejecting runtime resurrection and stale drafts', async () => {
+    const original = await file(), replacement = await file()
+    const saved = await commit({ domain: 'memory',key: 'recreated',data: { relativePath: 'note.md' },body: original.id,hash: original.hash })
+    const removed = await commit({ domain: 'memory',key: 'recreated',revision: saved.revision,operation: 'remove',data: {} })
+    await ack(removed.operationId)
+    await failure(() => commit({ domain: 'memory',key: 'recreated',revision: removed.revision,data: { relativePath: 'note.md' },body: replacement.id,hash: replacement.hash,runtime: instance }),/deleted/)
+    await failure(() => commit({ domain: 'memory',key: 'recreated',revision: saved.revision,data: { relativePath: 'note.md' },body: replacement.id,hash: replacement.hash }),/read it again/)
+    const recreated = await commit({ domain: 'memory',key: 'recreated',revision: removed.revision,data: { relativePath: 'note.md' },body: replacement.id,hash: replacement.hash })
+    expect((await pending()).changes).toMatchObject([{ operation_id: recreated.operationId,payload: { recreated: true,bodyItemId: replacement.id } }])
+    await ack(recreated.operationId)
+    expect(await admit(recreated.revision)).toMatchObject({ admitted: true })
+    await commit({ domain: 'memory',key: 'recreated',revision: recreated.revision,operation: 'remove',data: {} })
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[replacement.id])).rows).toEqual([])
+  })
+
   it('supersedes an unacknowledged save before deleting its body and recovers admission', async () => {
     const body = await file()
     const saved = await commit({ domain: 'memory',key: 'not-yet-applied',data: { relativePath: 'not-yet-applied.md' },body: body.id,hash: body.hash })

@@ -35,3 +35,11 @@ Already uploaded history is displayed immediately. Natural host activity can bac
 Development, migration rehearsals and trial use stay on an isolated local Supabase on the owner's development machine. No shared or production database is changed by this branch. Client/server/mobile trial validation must exercise a model request, a file transfer and direct cloud-ledger reads before final acceptance.
 
 History pages also return `work` (the same public task projection as list, without `initial_task`). A result sender reads coordinator/executor endpoints by assistant + work_id without attaching to any device or scanning completed tasks.
+
+## Historical admissions
+
+`assistant_work_import(p_assistant text,p_runtime_instance_id text,p_work_id uuid,p_task jsonb,p_events jsonb)` upgrades evidence from an awake host. It requires the same account and current owned runtime as ordinary writes. Historical task input additionally names `coordinator_device_id`; each executor includes its real `agent_user_id`. The original work/message IDs, exact direct-message content and `occurred_at` are required. Each event supplies `receipt_kind=received` (runtime must be the recipient) or `sent_admitted` (runtime must be the sender and possess its existing successful delivery receipt). The host must recheck current local data permissions before upload. Missing or ambiguous evidence is skipped.
+
+Imported events are already `admitted`, never enter the delivery pump, and never rerun an old task or manufacture an owner receipt. `platform_received_at` remains the current database receipt; `occurred_at` preserves the original time for display. Repeating a message is idempotent; a conflicting original message ID is rejected. Importing an already live queued event does not mark it delivered. Additional targets can extend only a legacy work item, never an immutable new assignment. Existing executor terminal authority and late true-result rules still apply.
+
+This additive migration changes only the two existing tables (one historical-time field and one legacy-work marker) and adds a restricted RPC. It has been exercised on the isolated my-laptop fixture with 28 targeted database tests; actual desktop/server/phone trial acceptance remains separate.

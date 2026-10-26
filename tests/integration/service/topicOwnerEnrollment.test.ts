@@ -146,6 +146,14 @@ describe('Agent topic participation carries its eligible human owner', () => {
     expect(await member(owner)).toBeTruthy()
     expect(await denied(() => db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'member')", [topic, foreignAgent]))).toContain('not a member of its source conversation')
   })
+  it('carries the owner when an internal caller moves an Agent seat to another topic', async () => {
+    const previous = await open(admin, [agent])
+    await db.query('UPDATE chat.chat_members SET chat_id=$1 WHERE chat_id=$2 AND user_id=$3', [topic, previous, agent])
+    expect(await member(agent)).toBeTruthy()
+    expect(await member(owner)).toBeTruthy()
+    expect(await member(agent, previous)).toBeUndefined()
+    expect(await member(owner, previous)).toBeTruthy()
+  })
   it('keeps ordinary group admission restricted to members rather than auto-enrolling the owner there', async () => {
     const group = randomUUID()
     await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','Other group',$2)", [group, admin])
@@ -187,7 +195,7 @@ describe('Agent topic participation carries its eligible human owner', () => {
   it('does not backfill or remove an already-present historical orphan on no-op admission/departure', async () => {
     // Simulate a committed pre-release seat without disabling other sessions' triggers.
     await db.query("SET LOCAL session_replication_role='replica'")
-    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'member')", [topic, agent])
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role,joined_ingest_seq) VALUES($1,$2,'member',0)", [topic, agent])
     await db.query("SET LOCAL session_replication_role='origin'")
     const before = await member(agent)
     await asUser(owner)
@@ -201,5 +209,4 @@ describe('Agent topic participation carries its eligible human owner', () => {
     expect(await member(owner)).toBeUndefined()
     expect(await member(agent)).toEqual(before)
   })
-
 })

@@ -26,7 +26,7 @@ BEGIN
         IF v_source_kind IS DISTINCT FROM 'group' OR v_role IS NULL OR v_role NOT IN ('owner', 'admin') THEN
             RAISE EXCEPTION 'An Agent must be an owner/admin of the source group to delete a topic' USING ERRCODE = '42501';
         END IF;
-        IF convert_to(p_confirm_name, 'UTF8') IS DISTINCT FROM convert_to(v_topic.name, 'UTF8') THEN
+        IF p_confirm_name IS NULL OR convert_to(p_confirm_name, 'UTF8') IS DISTINCT FROM convert_to(v_topic.name, 'UTF8') THEN
             RAISE EXCEPTION 'Topic name confirmation must exactly match the current topic name, including case and whitespace'
                 USING ERRCODE = '22023';
         END IF;

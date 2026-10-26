@@ -45,3 +45,12 @@ Imported events are already `admitted`, never enter the delivery pump, and never
 This additive migration changes only the two existing tables (one historical-time field and one legacy-work marker) and adds a restricted RPC. It has been exercised on the isolated my-laptop fixture with 30 targeted database tests; actual desktop/server/phone trial acceptance remains separate.
 
 An imported work item whose last recorded event is older than 24 hours receives `failed` for each executor still lacking a terminal fact. Each inferred outcome keeps `origin=coordinator`, `reason_code=LEGACY_REPORT_MISSING`, a short reason and the original receipt it was based on. This creates no synthetic delivery or owner receipt. A late genuine executor result supersedes that inference normally. The coordinator device may be the current home or an owned former home evidenced by successful provisioning or a recorded move/retirement command.
+
+Delivery claims preserve per-work, per-recipient device/session order across runtimes. A later event cannot bypass an older pending retry or active lease. Admitted or abandoned predecessors do not block it; independent destinations can still be claimed concurrently. Delivery pumps must continue draining after a successful settlement. A coordinator inference that has been superseded by a genuine executor result must not produce an obsolete owner failure notice.
+
+
+## Reconciliation API additions
+
+The next release adds numeric `lease_remaining_ms` and `age_ms` to each claim. Both are computed by the database at claim return; consumers use a local monotonic elapsed duration only to deduct request/processing time, never to compare wall-clock dates across devices.
+
+`assistant_work_list` accepts optional `p_reconcile_only boolean = false`. Default list contents, cursors and access rules stay unchanged. Reconciliation mode filters before pagination: active work, undelivered terminal/question receipts, unnotified abandonment of those events, and trusted HOST_FAILURE notices. Ordinary progress alone does not keep completed work in the reconciliation set; already notified abandonment and inferred failures superseded by an executor terminal do not either. The old three-argument function is replaced with the defaulted four-argument signature in one transaction so PostgREST cannot see ambiguous overloads. This does not change the history signature or introduce a table.

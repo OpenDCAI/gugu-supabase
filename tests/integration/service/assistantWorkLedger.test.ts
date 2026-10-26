@@ -339,6 +339,9 @@ describe('account work ledger and its only delivery outbox', () => {
     const completed = report('completed',{ attachment_refs: [{ item_id: item }] })
     await commit(id,[completed],null,randomUUID(),workerInstance)
     expect((await list()).items[0]!.outcome).toBe('completed')
+    const older=(await claim()).events.find(row=>row.kind==='failed')!
+    expect(older.message_id).not.toBe(completed.message_id)
+    await settle(older,'assistant_admitted')
     expect((await claim()).events.find(row => row.message_id === completed.message_id)).toMatchObject({ attachment_refs: [{ item_id: item }] })
     await failure(() => commit(id,[report('cancelled')],null,randomUUID(),workerInstance), /terminal|conflict/i)
   })
@@ -375,9 +378,52 @@ describe('account work ledger and its only delivery outbox', () => {
     expect((await db.query("SELECT count(*)::int AS n FROM pg_policies WHERE schemaname='identity' AND tablename IN ('assistant_work','assistant_work_events')")).rows[0]!.n).toBe(0)
   })
 
+  it('returns server-computed lease and age budgets independently of a device wall clock',async()=>{
+    const id=randomUUID(),event=dispatch()
+    await commit(id,[event],task())
+    await db.query("UPDATE identity.assistant_work_events SET platform_received_at=clock_timestamp()-interval '25 hours' WHERE message_id=$1",[event.message_id])
+    const lease=(await claim()).events[0]!
+    expect(lease.lease_remaining_ms).toBeGreaterThan(59000)
+    expect(lease.lease_remaining_ms).toBeLessThanOrEqual(60000)
+    expect(lease.age_ms).toBeGreaterThanOrEqual(25*60*60*1000)
+    expect(lease.age_ms).toBeLessThan(25*60*60*1000+5000)
+  })
+  it('filters reconciliation work before paging and excludes ordinary progress and acknowledged abandonment',async()=>{
+    const active=randomUUID();await commit(active,[dispatch()],task())
+    async function finished(){
+      const id=randomUUID(),event=report()
+      await commit(id,[dispatch()],task());await commit(id,[event],null,randomUUID(),workerInstance)
+      return {id,event}
+    }
+    const done=await finished()
+    await db.query('UPDATE identity.assistant_work_events SET owner_delivered_at=now() WHERE message_id=$1',[done.event.message_id])
+    await commit(done.id,[report('progress')],null,randomUUID(),workerInstance)
+    const terminal=await finished()
+    const question=report('question');await commit(terminal.id,[question],null,randomUUID(),workerInstance)
+    const abandoned=await finished()
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='abandoned',abandoned_at=now(),abandoned_reason_code='DELIVERY_EXPIRED' WHERE message_id=$1",[abandoned.event.message_id])
+    const filtered=()=>as(owner,()=>call<{items:Work[];next_before:string|null}>('assistant_work_list',[assistant,null,100,true]))
+    expect((await filtered()).items.map(row=>row.work_id).sort()).toEqual([active,terminal.id,abandoned.id].sort())
+    await db.query("UPDATE identity.assistant_work_events SET owner_delivered_at=now() WHERE work_id=$1 AND kind<>'dispatch'",[terminal.id])
+    await db.query('UPDATE identity.assistant_work_events SET abandonment_notified_at=now() WHERE message_id=$1',[abandoned.event.message_id])
+    const page=await as(owner,()=>call<{items:Work[];next_before:string|null}>('assistant_work_list',[assistant,null,1,true]))
+    expect(page.items.map(row=>row.work_id)).toEqual([active]);expect(page.next_before).toBeNull()
+    expect((await list()).items).toHaveLength(4)
+  })
+
+  it('keeps later messages behind an older lease for the same work and seat, but not behind abandonment',async()=>{
+    const id=randomUUID(),first=dispatch(),second=dispatch()
+    await commit(id,[first,second],task())
+    const claimed=(await claim()).events
+    expect(claimed.map(row=>row.message_id)).toEqual([first.message_id])
+    expect((await claim(workerInstance)).events).toHaveLength(0)
+    await as(owner,()=>call('assistant_work_outbox_settle',[instance,claimed[0]!.message_id,claimed[0]!.lease_token,'abandoned','NETWORK',5,JSON.stringify({failure_observed:true})]))
+    expect((await claim(workerInstance)).events.map(row=>row.message_id)).toEqual([second.message_id])
+  })
+
   it('allows concurrent runtimes to claim each durable message at most once', async () => {
-    const id = randomUUID(), events = Array.from({ length: 8 },() => dispatch())
-    await commit(id,events,task())
+    const events = Array.from({ length: 8 },() => dispatch())
+    for(const event of events) await commit(randomUUID(),[event],task())
     await db.query('COMMIT')
     const other = new pg.Client({ connectionString: url }); await other.connect()
     try {
@@ -428,6 +474,8 @@ describe('account work ledger and its only delivery outbox', () => {
       await db.query("UPDATE identity.runtime_instances SET last_heartbeat_at=now()-interval '1 day' WHERE owner_user_id=$1",[owner])
       const read = await client.rpc('assistant_work_list',{ p_assistant: assistant })
       expect(read.error).toBeNull(); expect(read.data.items[0].work_id).toBe(id)
+      const scoped = await client.rpc('assistant_work_list',{ p_assistant: assistant,p_reconcile_only: true })
+      expect(scoped.error).toBeNull();expect(scoped.data.items[0].work_id).toBe(id)
       const record = await client.rpc('assistant_work_history',{ p_assistant: assistant,p_work_id: id })
       expect(record.error).toBeNull(); expect(record.data.events[0].content).toBe(event.content)
       expect((await client.from('assistant_work_events').update({ content: 'Forged' }).eq('message_id',event.message_id)).error?.code).toBe('42501')

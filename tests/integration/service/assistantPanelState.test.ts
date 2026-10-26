@@ -36,6 +36,7 @@ const snapshot = () => as(owner, () => call<Snapshot>('assistant_panel_snapshot'
 type PendingChange = { operation_id: string; status: string; payload: unknown; device_id: string }
 const pending = () => as(owner, () => call<{ revision: string; changes: PendingChange[]; notices: PendingChange[] }>('assistant_panel_pending',[agent,instance]))
 const ack = (id: string, error: string | null = null) => as(owner, () => call('assistant_panel_ack',[agent,instance,id,error]))
+const reject = (id: string, error: string) => as(owner, () => call('assistant_panel_reject',[agent,instance,id,error]))
 const admit = (revision: string) => as(owner, () => call<{ admitted: boolean; domain?: string; resourceKey?: string; errorCode?: string }>('assistant_panel_admit',[agent,instance,revision]))
 
 beforeAll(async () => {
@@ -100,6 +101,50 @@ async function moveHome() {
 }
 
 describe('durable assistant panel contract', () => {
+  it('settles an unapplicable change truthfully and releases later changes and turns', async () => {
+    const broken = await commit()
+    await ack(broken.operationId,'EACCES')
+    const body = await file()
+    const later = await commit({ domain: 'memory',key: 'later',data: { relativePath: 'later.md',title: 'Later' },body: body.id,hash: body.hash })
+    expect(await reject(broken.operationId,'EACCES')).toMatchObject({ status: 'failed',terminal: true })
+    const work = await pending()
+    expect(work.changes.map(c => c.operation_id)).toEqual([later.operationId])
+    expect(work.notices).toEqual([expect.objectContaining({ operation: 'notice',payload: { failure: expect.objectContaining({ operationId: broken.operationId,errorCode: 'EACCES',domain: 'personality',resourceKey: 'current' }) } })])
+    expect((await snapshot()).application).toContainEqual(expect.objectContaining({ status: 'failed',terminal: true,errorCode: 'EACCES' }))
+    await ack(later.operationId)
+    expect(await admit(work.revision)).toMatchObject({ admitted: true })
+    // Neither a lost response nor a late success can claim the rejected effect was applied.
+    expect(await reject(broken.operationId,'EACCES')).toMatchObject({ status: 'failed',terminal: true })
+    expect(await ack(broken.operationId)).toMatchObject({ status: 'failed',terminal: true })
+    expect((await pending()).notices).toHaveLength(1)
+    await ack(work.notices[0]!.operation_id)
+    expect((await pending()).notices).toHaveLength(0)
+    expect(await admit(work.revision)).toMatchObject({ admitted: true })
+  })
+
+  it('allows a new owner edit after a terminal failure and never resurrects a rejected deletion', async () => {
+    const broken = await commit()
+    await reject(broken.operationId,'PANEL_SCHEDULE_NOT_OWNED')
+    const newer = await commit({ revision: broken.revision,data: { text: 'New owner intent' } })
+    expect((await pending()).changes.map(c => c.operation_id)).toEqual([newer.operationId])
+    await ack(newer.operationId)
+    expect(await admit(newer.revision)).toMatchObject({ admitted: true })
+    const body = await file()
+    const saved = await commit({ domain: 'memory',key: 'removed',data: { relativePath: 'removed.md' },body: body.id,hash: body.hash,runtime: instance })
+    const removed = await commit({ domain: 'memory',key: 'removed',revision: saved.revision,operation: 'remove',data: {} })
+    await reject(removed.operationId,'EACCES')
+    expect(await admit(removed.revision)).toMatchObject({ admitted: true })
+    await failure(() => commit({ domain: 'memory',key: 'removed',revision: removed.revision,runtime: instance,data: { relativePath: 'removed.md' } }),/deleted/)
+    expect((await snapshot()).items.some(row => row.resource_key === 'removed')).toBe(false)
+  })
+
+  it('restricts terminal decisions to the leased home and keeps error details non-sensitive', async () => {
+    const broken = await commit()
+    await failure(() => as(stranger,() => call('assistant_panel_reject',[agent,instance,broken.operationId,'EACCES'])),/account|owner|available|instance/)
+    await failure(() => reject(broken.operationId,'permission denied at /private/secret'),/non-sensitive/)
+    expect((await pending()).changes).toHaveLength(1)
+  })
+
   it('reads an unprepared account without creating state, messages or device commands', async () => {
     expect(await snapshot()).toEqual({ version: 1,revision: '0',items: [],application: [] })
     expect((await db.query('SELECT count(*)::int AS n FROM identity.assistant_panel_items WHERE assistant_user_id=$1',[agent])).rows[0]!.n).toBe(0)

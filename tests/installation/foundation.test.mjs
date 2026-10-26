@@ -28,7 +28,40 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     assert.ok(topicRelease)
     const idleExpiryRelease = releases.find((release) => release.version.endsWith('_large_file_idle_expiry'))
     assert.ok(idleExpiryRelease)
+    const downloadLockRelease = releases.find((release) => release.version.endsWith('_file_download_lock_scope'))
+    assert.ok(downloadLockRelease)
     const releaseQuery = async (sql) => {
+      if (sql.includes(downloadLockRelease.sql)) {
+        const owner=randomUUID(),group=randomUUID(),ids=[randomUUID(),randomUUID(),randomUUID()]
+        await db.query("INSERT INTO identity.users(id,type,display_name) VALUES($1,'human','download upgrade fixture')",[owner])
+        await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','download upgrade',$2)",[group,owner])
+        await db.query("INSERT INTO chat.file_transfer_reservations(id,kind,account_id,chat_id,subject,bytes,actual_bytes,state,created_at,expires_at) VALUES($1,'download',$4,$5,'pending',100,130,'issued',now()-interval '40 days',now()-interval '1 day'),($2,'download',$4,$5,'settled',100,60,'settled',now()-interval '40 days',now()-interval '1 day'),($3,'download',$4,$5,'cancelled',100,0,'cancelled',now(),now())",[...ids,owner,group])
+        await db.query("INSERT INTO chat.file_transfer_observations(event_id,reservation_id,bytes,observed_at) VALUES($1,$3,40,now()-interval '39 days'),($2,$3,20,now())",[randomUUID(),randomUUID(),ids[1]])
+        const usage=async()=>Promise.all(['global','account','group'].map(async(scope)=>Number((await db.query(
+          'SELECT chat.file_transfer_usage($1,$2,$3) AS n',['download',scope,scope==='global'?'*':scope==='account'?owner:group])).rows[0].n)))
+        const before=await usage()
+        const original=(await db.query("SELECT pg_get_functiondef('chat.file_transfer_download_as(jsonb,text,uuid)'::regprocedure) AS sql")).rows[0].sql
+        const usageDefinition=(await db.query("SELECT pg_get_functiondef('chat.file_transfer_usage(text,text,text)'::regprocedure) AS sql")).rows[0].sql
+        const tables=await db.query("SELECT tablename FROM pg_tables WHERE schemaname='chat' ORDER BY tablename")
+        await t.test('download lock upgrade rolls back indexes and function changes',async()=>{
+          await query(sql.replace(/COMMIT;\s*$/, 'ROLLBACK;'))
+          assert.equal((await db.query("SELECT to_regclass('chat.file_transfer_observations_reservation') AS index")).rows[0].index,null)
+          assert.equal((await db.query("SELECT pg_get_functiondef('chat.file_transfer_download_as(jsonb,text,uuid)'::regprocedure) AS sql")).rows[0].sql,original)
+          assert.deepEqual(await usage(),before)
+        })
+        const result=await query(sql)
+        await t.test('download lock upgrade preserves the original ledger calculation and accounting tables',async()=>{
+          assert.deepEqual(await usage(),before)
+          assert.equal(before[1],150)
+          assert.equal((await db.query("SELECT pg_get_functiondef('chat.file_transfer_usage(text,text,text)'::regprocedure) AS sql")).rows[0].sql,usageDefinition)
+          assert.deepEqual((await db.query("SELECT tablename FROM pg_tables WHERE schemaname='chat' ORDER BY tablename")).rows,tables.rows)
+        })
+        await db.query('DELETE FROM chat.file_transfer_observations WHERE reservation_id=ANY($1::uuid[])',[ids])
+        await db.query('DELETE FROM chat.file_transfer_reservations WHERE id=ANY($1::uuid[])',[ids])
+        await db.query('DELETE FROM chat.chats WHERE id=$1',[group])
+        await db.query('DELETE FROM identity.users WHERE id=$1',[owner])
+        return result
+      }
       if (sql.includes(releases.find(release=>release.version.endsWith('_project_file_message_publication')).sql)) {
         await t.test('atomic publication rollback restores the old function and leaves no private schema',async()=>{
           await query(sql.replace(/COMMIT;\s*$/, 'ROLLBACK;'))

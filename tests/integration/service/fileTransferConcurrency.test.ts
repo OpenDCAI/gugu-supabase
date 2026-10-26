@@ -59,6 +59,7 @@ async function race(kind='download',sameId=false,chat:string|null=null,distinctA
     let waiting:unknown[]=[]
     const deadline=Date.now()+10000
     while(Date.now()<deadline) {
+      await db.query('SELECT pg_stat_clear_snapshot()')
       waiting=(await db.query("SELECT pid,wait_event FROM pg_stat_activity WHERE application_name='file-quota-contender' AND state='active' AND wait_event_type='Lock'")).rows
       if(waiting.length===clients.length) break
       await new Promise(resolve=>setTimeout(resolve,10))

@@ -7,13 +7,13 @@ export function ossDirectSigner(config:OssConfig):AttachmentObjectStorage['sign'
   const sdk=new OSS({accessKeyId:config.accessKeyId,accessKeySecret:config.accessKeySecret,bucket:config.bucket,
     region:'oss-'+config.region,endpoint:config.endpointPublic,secure:true,authorizationV4:true})
   return async(key,_image,signedAt,permit)=>{
-    if(!permit||permit.expiresSeconds!==60||!Number.isSafeInteger(permit.trafficBits)||permit.trafficBits<819200||permit.trafficBits>838860800) {
+    if(!permit||permit.expiresSeconds!==60||permit.trafficBits!==undefined&&(!Number.isSafeInteger(permit.trafficBits)||permit.trafficBits<819200||permit.trafficBits>838860800)) {
       throw new ObjectStorageError(503,'not_configured','Invalid origin download limits')
     }
     const deadline=signedAt.getTime()+permit.expiresSeconds*1000,remaining=Math.floor((deadline-Date.now())/1000)
     if(remaining<1) throw new ObjectStorageError(410,'expired','The download reservation has expired')
     const url=new URL(await sdk.signatureUrlV4('GET',Math.min(60,remaining),{queries:{
-      'x-oss-traffic-limit':String(permit.trafficBits),'gugu-download-id':permit.requestId,
+      ...(permit.trafficBits===undefined?{}:{'x-oss-traffic-limit':String(permit.trafficBits)}),'gugu-download-id':permit.requestId,
     }},objectKey(config,key)))
     const date=url.searchParams.get('x-oss-date')??''
     const expires=Date.parse(date.replace(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/,'$1-$2-$3T$4:$5:$6Z'))+Number(url.searchParams.get('x-oss-expires'))*1000

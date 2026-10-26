@@ -41,3 +41,16 @@ The following 24 unit cases initially failed because their RPC fixtures describe
 
 
 Deployment-wide quota fixtures run before concurrent object-writing suites. Their global cap includes pre-existing physical occupancy plus the exact original tested headroom: 80 or 1000 bytes. All success/refusal assertions remain, including rejection of the next 1 byte and the exact 120-byte usage increase. This preserves the boundary on repeat runs without deleting other fixtures or pretending their objects do not consume storage.
+
+
+## Optional per-link throttling
+
+| Changed test | Original protection | Updated expectation and preserved assertions |
+| --- | --- | --- |
+| `attachmentStorageConfig` | Existing OSS references use CDN, never Storage; actual edge lifetime controls expiry. | A rate declaration is absent; URLs and thumbnails still use CDN, and timestamp + edge TTL is exactly the original 60-second deadline. Missing TTL still refuses signing. |
+| `attachmentsOss` | Scope, immutable staging, one registration, exact ACL lookup, legacy links and collector ordering. | Default fixture omits the optional rate; every original assertion remains. |
+| `projectFileTransfer` | Key release follows authorized download reservation; temporary bytes use direct OSS. | Omitted rate does not block key release; signer still receives the original request ID and 60-second lifetime. Existing size/SHA/ACL and collector assertions remain. |
+| `fileTransferBudget`, `largeFileIdleExpiry`, `projectFileRevisions` | Atomic global/account/group budgets, real contention, retained holds, expiry, version/host ownership and read-only boundaries. | All three deployment fixtures omit the rate field; original assertions remain unchanged. No quota or concurrency assertion is removed or relaxed. |
+| Official SDK origin signer | Signed rate and attribution, remaining reservation lifetime, malformed input and expired capability refusal. | Existing configured-rate assertions remain. New no-rate case omits only the traffic query, retaining the same signed attribution/deadline. |
+
+The removed behavior is exclusively “no declared provider request rate means downloads must fail.” A deployment-wide policy now accepts that replay risk. New handler tests prove both optional states use the same reservation/signer and that invalid optional values, denied access and expiry still refuse before byte signing.

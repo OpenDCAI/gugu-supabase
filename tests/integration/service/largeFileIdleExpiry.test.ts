@@ -6,7 +6,7 @@ const settings = {
   inventory_ready:true, storage_global_bytes:100000, storage_account_bytes:100000, storage_group_bytes:100000,
   download_global_bytes:100000, download_account_bytes:100000, download_group_bytes:100000,
   upload_permit_seconds:120, sign_window_seconds:60, sign_account_count:100, sign_group_count:100,
-  file_max_bytes:10000, download_link_bits_per_second:819200,
+  file_max_bytes:10000,
   large_file_bytes:50, large_file_idle_seconds:30*86400, storage_warning_percent:80,
 }
 let db:pg.Client, owner:string, member:string, outsider:string, group:string

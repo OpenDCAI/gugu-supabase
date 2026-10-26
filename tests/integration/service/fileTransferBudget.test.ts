@@ -8,7 +8,7 @@ const settings = {
   download_global_bytes: 1000, download_account_bytes: 800, download_group_bytes: 700,
   upload_permit_seconds: 120,
   sign_window_seconds: 60, sign_account_count: 100, sign_group_count: 100,
-  file_max_bytes: 600, download_link_bits_per_second: 819200,
+  file_max_bytes: 600,
 }
 let db: pg.Client
 let baselineGlobalStorage: number
@@ -136,6 +136,7 @@ describe('atomic transfer budgets', () => {
     expect((await reject('SELECT chat.file_transfer_observe($1,$2,1,now())', ['forged', randomUUID()])).code).toBe('42501')
   })
   it('reserves once, rejects identity changes and does not partly consume denied scopes', async () => {
+    expect((await db.query('SELECT chat.file_transfer_settings() AS s')).rows[0].s).not.toHaveProperty('download_link_bits_per_second')
     const id = randomUUID()
     await reserve(600, 'download', owner, group, id, 'same')
     await reserve(600, 'download', owner, group, id, 'same')

@@ -22,6 +22,11 @@ Deno.test('official origin signer binds limits and cannot refresh an existing re
     assert(first.expiresAt===new Date(instant+30000).toISOString(),'the actual signature deadline matches the reservation')
     assert(q.get('x-oss-traffic-limit')==='819200'&&q.get('gugu-download-id')===permit.requestId,'throttle and attribution are signed')
     assert(first.thumbUrl===null&&/^[0-9a-f]{64}$/.test(q.get('x-oss-signature')??''),'ciphertext is never transformed')
+    const unlimited=await sign('temporary/资料/file name.bin',false,signedAt,{...permit,trafficBits:undefined})
+    const withoutRate=new URL(unlimited.url).searchParams
+    assert(!withoutRate.has('x-oss-traffic-limit'),'an absent declaration does not invent a provider limit')
+    assert(withoutRate.get('gugu-download-id')===permit.requestId,'unthrottled reads retain signed attribution')
+    assert(withoutRate.get('x-oss-expires')==='30'&&unlimited.expiresAt===first.expiresAt,'optional throttling cannot extend the reservation')
     for(const invalid of [{...permit,trafficBits:819199},{...permit,expiresSeconds:61}]) {
       let refused=false
       try{await sign('temporary/file',false,signedAt,invalid)}catch(error){refused=error instanceof ObjectStorageError&&error.status===503}

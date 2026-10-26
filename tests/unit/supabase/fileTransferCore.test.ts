@@ -1,6 +1,7 @@
-import { describe,expect,it } from 'vitest'
+import { describe,expect,it,vi } from 'vitest'
+import type { AttachmentsDeps } from '../../../supabase/functions/_shared/attachments-core'
 import { inspectFileStream } from '../../../supabase/functions/_shared/file-inspection'
-import { fileRef,handleFileResolve } from '../../../supabase/functions/_shared/file-transfer-core'
+import { fileRef,handleFileResolve,handleFileDownload } from '../../../supabase/functions/_shared/file-transfer-core'
 import { cdnSignedUrl } from '../../../supabase/functions/_shared/oss'
 
 describe('streamed file inspection',()=>{
@@ -67,4 +68,48 @@ describe('download input and signed throttles',()=>{
     expect(fileRef({message_id:'m'})).toEqual({message_id:'m'})
   })
 
+})
+
+
+describe('one download contract with optional provider throttling',()=>{
+  const request='11111111-1111-4111-8111-111111111111',at='2026-10-24T00:00:00Z'
+  function fixture(bucket='oss',settings:Record<string,unknown>={}) {
+    const userRpc=vi.fn<AttachmentsDeps['userRpc']>(async()=>({data:{status:'ready',bucket_id:bucket,object_name:'ab/object',
+      download_id:request,signed_at:at,expires_at:'2026-10-24T00:01:00Z',content_type:'application/octet-stream'},error:null}))
+    const sign=vi.fn(async()=>({url:'https://bytes.example/file',thumbUrl:null,expiresAt:'2026-10-24T00:01:00Z'}))
+    const storageSignedUrl=vi.fn(async()=> 'https://storage.example/file')
+    const deps={userRpc,serviceRpc:vi.fn(async()=>({data:settings,error:null})),objects:{sign},storageSignedUrl} as unknown as Parameters<typeof handleFileDownload>[0]
+    return {deps,userRpc,sign,storageSignedUrl}
+  }
+  it.each(['oss','workspace','temporary'])('signs %s without a rate declaration after the same ACL/reservation RPC',async bucket=>{
+    const f=fixture(bucket)
+    expect(await handleFileDownload(f.deps,'reader',{ref:{message_id:'m'},request_id:request})).toMatchObject({status:'ready'})
+    expect(f.userRpc).toHaveBeenCalledExactlyOnceWith('file_transfer_download_as',{p_ref:{message_id:'m'},p_as:'reader',p_id:request})
+    if(bucket==='workspace') {
+      expect(f.storageSignedUrl).toHaveBeenCalledExactlyOnceWith('workspace','ab/object',60,undefined)
+      expect(f.sign).not.toHaveBeenCalled()
+    }else {
+      expect(f.sign).toHaveBeenCalledExactlyOnceWith('ab/object',false,new Date(at),{requestId:request,expiresSeconds:60,...(bucket==='temporary'?{direct:true}:{})})
+      expect(f.storageSignedUrl).not.toHaveBeenCalled()
+    }
+  })
+  it('passes an optional valid rate through the same signer and rejects invalid declarations before provider signing',async()=>{
+    const f=fixture('oss',{download_link_bits_per_second:819200})
+    await handleFileDownload(f.deps,'reader',{ref:{message_id:'m'},request_id:request})
+    expect(f.sign).toHaveBeenCalledExactlyOnceWith('ab/object',false,new Date(at),{requestId:request,expiresSeconds:60,trafficBits:819200})
+    for(const rate of [null,0,819199,838860801,Infinity,'invalid']) {
+      const bad=fixture('oss',{download_link_bits_per_second:rate})
+      await expect(handleFileDownload(bad.deps,'reader',{ref:{message_id:'m'},request_id:request})).rejects.toMatchObject({status:503,code:'not_configured'})
+      expect(bad.sign).not.toHaveBeenCalled();expect(bad.storageSignedUrl).not.toHaveBeenCalled()
+    }
+  })
+  it('does not bypass denied or expired metadata when a rate is absent',async()=>{
+    const denied=fixture()
+    denied.userRpc.mockResolvedValueOnce({data:null,error:{hint:'file_transfer_denied',message:'denied'}})
+    await expect(handleFileDownload(denied.deps,'reader',{ref:{message_id:'m'},request_id:request})).rejects.toMatchObject({status:403})
+    expect(denied.sign).not.toHaveBeenCalled();expect(denied.deps.serviceRpc).not.toHaveBeenCalled()
+    const expired=fixture();expired.userRpc.mockResolvedValueOnce({data:{status:'expired'},error:null})
+    expect(await handleFileDownload(expired.deps,'reader',{ref:{message_id:'m'},request_id:request})).toEqual({status:'expired'})
+    expect(expired.sign).not.toHaveBeenCalled();expect(expired.deps.serviceRpc).not.toHaveBeenCalled()
+  })
 })

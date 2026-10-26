@@ -29,12 +29,12 @@ export async function handleFileDownload(deps:AttachmentsDeps,user:string,body:R
   }) as {status:string;bucket_id:string;object_name:string;download_id:string;signed_at:string;expires_at:string;content_type:string;transfer_id?:string}
   if (row.status!=='ready') return row
   const cfg=await call(deps.serviceRpc,'file_transfer_settings',{}) as Record<string,unknown>
-  const traffic=Number(cfg.download_link_bits_per_second)
-  if (!Number.isSafeInteger(traffic)||traffic<819200||traffic>838860800) throw new Refusal(503,'not_configured','Download rate is not configured')
+  const traffic=cfg.download_link_bits_per_second===undefined?undefined:Number(cfg.download_link_bits_per_second)
+  if (traffic!==undefined&&(!Number.isSafeInteger(traffic)||traffic<819200||traffic>838860800)) throw new Refusal(503,'not_configured','Download rate is not configured')
   try {
     const signed=row.bucket_id==='oss'||row.bucket_id==='temporary'
       ?await objectStorage(deps).sign(row.object_name,hasThumbnail(row.content_type),new Date(row.signed_at),{
-        requestId:row.download_id,expiresSeconds:60,trafficBits:traffic,...(row.bucket_id==='temporary'?{direct:true}:{}),
+        requestId:row.download_id,expiresSeconds:60,...(traffic===undefined?{}:{trafficBits:traffic}),...(row.bucket_id==='temporary'?{direct:true}:{}),
       })
       :{url:await deps.storageSignedUrl(row.bucket_id,row.object_name,60,traffic),thumbUrl:null}
     const key=row.transfer_id?await call(deps.serviceRpc,'file_temporary_key_for',{p_download:row.download_id,p_account:user}):undefined

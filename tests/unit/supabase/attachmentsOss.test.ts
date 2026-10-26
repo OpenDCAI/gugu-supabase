@@ -290,6 +290,12 @@ const pngBytes = () => {
 const commitBody = (extra: Record<string, unknown> = {}) => ({ staging_key: STAGING, message_id: 'm1', chat_id: 'c1', sender_user_id: USER, file_name: 'shot.png', ...extra })
 
 describe('managed authorization before bytes or signatures', () => {
+  it('asks a client that declares no size to update, before reserving or signing',async()=>{
+    const f=fakes()
+    await expect(handleUpload(f.deps,USER,{})).rejects.toMatchObject({status:426,code:'client_outdated',message:expect.stringMatching(/^Update Gugu to send files/)})
+    expect(f.controls).toEqual([])
+    expect(f.calls).toEqual([])
+  })
   it('refuses a provider lifetime mismatch before issuing an upload reservation or URL',async()=>{
     const f=fakes()
     const store=await import('../../../supabase/functions/_shared/attachment-object-storage')

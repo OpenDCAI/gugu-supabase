@@ -106,13 +106,17 @@ describe('human topic archival within the source conversation', () => {
   })
   it('removes archived topics from all listings and notifies nonparticipant source members', async () => {
     await db.query('DELETE FROM chat.account_revisions WHERE user_id=ANY($1::text[])', [[owner, creator, manager, reader]])
+    await db.query('DELETE FROM realtime.messages WHERE topic=ANY($1::text[])', [[owner, creator, manager, reader].map((id) => `gugu:user:${id}:events`)])
     await archive(creator)
     for (const account of [creator, owner, manager, reader]) {
       await asUser(account)
       expect((await db.query('SELECT * FROM chat.list_topics_of_chat($1)', [source])).rows).toEqual([])
       await db.query('RESET ROLE')
       expect((await db.query(`SELECT user_id FROM chat.account_revisions WHERE user_id=$1 AND event='chat_changed'
-        AND resource_key->>'topic_of_source_chat'=$2`, [account, source])).rows).toHaveLength(1)
+        AND resource_key->>'chat_id'=$2`, [account, source])).rows).toHaveLength(1)
+      expect((await db.query(`SELECT payload FROM realtime.messages WHERE topic=$1 AND event='chat_changed'
+        AND payload->>'topic_of_source_chat'=$2`, [`gugu:user:${account}:events`, source])).rows)
+        .toEqual([{ payload: expect.objectContaining({ chat: expect.objectContaining({ id: topic, status: 'archived' }) }) }])
     }
   })
   it('does not grant anonymous execution', async () => {

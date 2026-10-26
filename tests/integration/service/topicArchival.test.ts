@@ -10,9 +10,9 @@ async function asUser(account: string) {
   await db.query('SET LOCAL ROLE authenticated')
   await db.query("SELECT set_config('request.jwt.claims',$1,true)", [JSON.stringify({ sub: account, role: 'authenticated' })])
 }
-async function archive(account: string, actor = account, id = topic) {
+async function archive(account: string, actor = account, id = topic, confirmName: string | null = null) {
   await asUser(account)
-  const result = await db.query('SELECT chat.archive_topic_as($1,$2) AS receipt', [id, actor])
+  const result = await db.query('SELECT chat.archive_topic_as($1,$2,$3) AS receipt', [id, actor, confirmName])
   await db.query('RESET ROLE')
   return result.rows[0].receipt
 }
@@ -94,7 +94,7 @@ describe('human topic archival within the source conversation', () => {
   })
   it('denies an Agent creator but permits its human owner', async () => {
     await db.query('UPDATE chat.chats SET creator_user_id=$1 WHERE id=$2', [agent, topic])
-    expect(await denied(() => archive(creator, agent))).toContain('Only a person')
+    expect(await denied(() => archive(creator, agent, topic, 'Topic'))).toContain('owner/admin of the source group')
     expect(await archive(creator)).toEqual({ chat_id: topic, status: 'archived' })
   })
   it('does not accept a group or widen the group-only archival RPC', async () => {
@@ -120,6 +120,28 @@ describe('human topic archival within the source conversation', () => {
     }
   })
   it('does not grant anonymous execution', async () => {
-    expect((await db.query("SELECT has_function_privilege('anon','chat.archive_topic_as(text,text)','execute') AS allowed")).rows[0].allowed).toBe(false)
+    expect((await db.query("SELECT has_function_privilege('anon','chat.archive_topic_as(text,text,text)','execute') AS allowed")).rows[0].allowed).toBe(false)
+  })
+  it('allows a source-group Agent admin with the exact current name, without a topic seat', async () => {
+    await db.query("UPDATE chat.chat_members SET role='admin' WHERE chat_id=$1 AND user_id=$2", [source, agent])
+    expect(await archive(creator, agent, topic, 'Topic')).toEqual({ chat_id: topic, status: 'archived' })
+  })
+  it.each([null, '', 'topic', 'Topic ', ' Topic', 'Old name'])('rejects an Agent admin confirmation %j without archiving', async (name) => {
+    await db.query("UPDATE chat.chat_members SET role='admin' WHERE chat_id=$1 AND user_id=$2", [source, agent])
+    expect(await denied(() => archive(creator, agent, topic, name))).toContain('exactly match the current topic name')
+    expect(await topicState()).toBe('active')
+  })
+  it('rejects a stale confirmation after rename and preserves exact Unicode characters', async () => {
+    await db.query("UPDATE chat.chat_members SET role='admin' WHERE chat_id=$1 AND user_id=$2", [source, agent])
+    await db.query('UPDATE chat.chats SET name=$1 WHERE id=$2', ['话题 e\u0301', topic])
+    for (const name of ['Topic', '话题 é']) {
+      expect(await denied(() => archive(creator, agent, topic, name))).toContain('exactly match the current topic name')
+    }
+    expect(await archive(creator, agent, topic, '话题 e\u0301')).toEqual({ chat_id: topic, status: 'archived' })
+  })
+  it('denies a non-manager Agent even with the exact name and a human source-owner token', async () => {
+    await db.query('UPDATE identity.users SET owner_user_id=$1 WHERE id=$2', [owner, agent])
+    expect(await denied(() => archive(owner, agent, topic, 'Topic'))).toContain('owner/admin of the source group')
+    expect(await topicState()).toBe('active')
   })
 })

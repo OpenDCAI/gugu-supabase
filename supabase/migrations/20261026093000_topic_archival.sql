@@ -1,17 +1,16 @@
 -- Topics are streams inside a source conversation. Group archival remains group-only.
 SET LOCAL lock_timeout = '5s';
 
-CREATE FUNCTION chat.archive_topic_as(p_chat_id TEXT, p_as_user_id TEXT)
+CREATE FUNCTION chat.archive_topic_as(p_chat_id TEXT, p_as_user_id TEXT, p_confirm_name TEXT DEFAULT NULL)
 RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
 DECLARE
     v_actor TEXT := chat.require_group_actor(p_as_user_id);
     v_topic chat.chats%ROWTYPE;
     v_role TEXT;
     v_source_kind TEXT;
+    v_actor_type TEXT;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM identity.users WHERE id = v_actor AND type = 'human') THEN
-        RAISE EXCEPTION 'Only a person can delete a topic' USING ERRCODE = '42501';
-    END IF;
+    SELECT type INTO v_actor_type FROM identity.users WHERE id = v_actor;
     -- Lock the source before the topic, as source membership removal does.
     -- Keep membership/role and source status stable until archival commits.
     SELECT m.role, s.kind INTO v_role, v_source_kind
@@ -23,7 +22,15 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Topic not found' USING ERRCODE = '22023';
     END IF;
-    IF v_role IS NULL OR NOT (
+    IF v_actor_type = 'agent' THEN
+        IF v_source_kind IS DISTINCT FROM 'group' OR v_role IS NULL OR v_role NOT IN ('owner', 'admin') THEN
+            RAISE EXCEPTION 'An Agent must be an owner/admin of the source group to delete a topic' USING ERRCODE = '42501';
+        END IF;
+        IF convert_to(p_confirm_name, 'UTF8') IS DISTINCT FROM convert_to(v_topic.name, 'UTF8') THEN
+            RAISE EXCEPTION 'Topic name confirmation must exactly match the current topic name, including case and whitespace'
+                USING ERRCODE = '22023';
+        END IF;
+    ELSIF v_actor_type IS DISTINCT FROM 'human' OR v_role IS NULL OR NOT (
         (v_source_kind = 'group' AND v_role IN ('owner', 'admin'))
         OR EXISTS (SELECT 1 FROM identity.users creator WHERE creator.id = v_topic.creator_user_id
                    AND (creator.id = v_actor OR (creator.type = 'agent' AND creator.owner_user_id = v_actor)))
@@ -35,8 +42,8 @@ BEGIN
     RETURN jsonb_build_object('chat_id', p_chat_id, 'status', 'archived');
 END;
 $$;
-REVOKE ALL ON FUNCTION chat.archive_topic_as(TEXT, TEXT) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION chat.archive_topic_as(TEXT, TEXT) TO authenticated;
+REVOKE ALL ON FUNCTION chat.archive_topic_as(TEXT, TEXT, TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION chat.archive_topic_as(TEXT, TEXT, TEXT) TO authenticated;
 
 -- Reuse the existing source-member notification path for archival, including
 -- readers who have never joined the topic's participant list.

@@ -92,3 +92,5 @@ BEGIN
     ORDER BY t.last_message_at DESC NULLS LAST, t.created_at DESC;
 END;
 $$;
+REVOKE ALL ON FUNCTION chat.list_topics_of_chat(TEXT, TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION chat.list_topics_of_chat(TEXT, TEXT) TO authenticated, service_role;

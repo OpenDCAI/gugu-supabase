@@ -63,6 +63,14 @@ describe('project local metadata, exact references and read-only host ownership'
     expect((await fails(POLICY,[group,otherDevice,'root',false,true,'7d'])).hint).toBe('file_transfer_denied')
     expect((await fails(POLICY,[group,device,'unbound',false,true,'7d'])).hint).toBe('file_transfer_denied')
   })
+  it('admits an image upload to a project chat that keeps files local, and still refuses other files',async()=>{
+    await user(member)
+    const PREPARE='SELECT chat.file_managed_upload_prepare($1,$2,$3,$4) AS r'
+    expect((await fails(PREPARE,[group,member,123,null])).hint).toBe('file_transfer_denied')
+    expect((await fails(PREPARE,[group,member,123,'application/pdf'])).hint).toBe('file_transfer_denied')
+    expect((await db.query(PREPARE,[group,member,123,'image/png'])).rows[0].r).toMatchObject({chat_id:group})
+    expect((await db.query(PREPARE,[group,member,123,'IMAGE/JPEG'])).rows[0].r).toMatchObject({chat_id:group})
+  })
   it('publishes immutable device/project/path/SHA metadata, without a cloud blob, URL, key or absolute root',async()=>{
     expect(await publish()).toMatchObject({item_id:item,version:1,sha256:sha,size_bytes:123})
     const local=await resolve()

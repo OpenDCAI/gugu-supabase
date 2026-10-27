@@ -64,8 +64,11 @@ describe('incoming document copies retain the original caller-JWT attachment tra
     const host = machine(svc.url, token), page = openPage(host, item, 0)
     compactAware(page); await page.synced
     try {
-      const result = await replace(item, next.key)
+      const message = randomUUID(), result = await replace(item, next.key, { p_message_id: message })
       expect(result.ready.status).toBe(200); expect(result.error).toBeNull()
+      const replay = await replace(item, next.key, { p_message_id: message })
+      expect(replay.ready.status).toBe(200); expect(replay.error).toBeNull()
+      expect((await fx.admin.query("SELECT document->'prepared' ? 'state' AS state FROM chat.file_blob_uploads WHERE staging_key=$1", [next.key])).rows[0].state).toBe(false)
       expect(await waitFor(() => page.events.closed?.reason === 'compacted:1')).toBeGreaterThanOrEqual(0)
       const reopened = openPage(host, item, 1); await reopened.synced
       try {
@@ -127,6 +130,18 @@ describe('incoming document copies retain the original caller-JWT attachment tra
       expect((await getFile(svc.url, token, item)).body.text).toBe('# original')
     } finally { page.close(); host.socket.destroy() }
   }, 60_000)
+  it('the database refuses an expired preparation even before the file service cancellation arrives', async () => {
+    const { item } = await initial(), next = await upload('# too late')
+    const host = machine(svc.url, token), page = openPage(host, item, 0), seen = compactAware(page)
+    await page.synced
+    try {
+      expect((await stage(item, next.key)).status).toBe(200)
+      await fx.admin.query("UPDATE chat.file_blob_uploads SET document=jsonb_set(document,'{prepared,expires}',to_jsonb(clock_timestamp()-interval '1 second')) WHERE staging_key=$1", [next.key])
+      expect((await caller.rpc('attachment_commit', args(item, next.key))).error?.hint).toBe('workspace_version_conflict')
+      await stage(item, next.key, true)
+      await resumeSeen(item, next.key, seen)
+    } finally { page.close(); host.socket.destroy() }
+  })
   it('the same incoming bytes do not create another version; JSON collaborative text retains its identity', async () => {
     const { item } = await initial('{"text":{"$text":"before"}}', 'application/json')
     const next = await upload('{"text":"after"}', 'application/json')

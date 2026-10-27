@@ -1,7 +1,7 @@
 -- Explicit App data ownership is presentation metadata; access remains membership-based.
 
 DROP FUNCTION chat.workspace_get_as(text, text);
-CREATE FUNCTION chat.workspace_get_as(p_item_id text, p_as_user_id text) RETURNS TABLE(id uuid, chat_id text, kind text, filename text, content_type text, size_bytes bigint, pointer text, source_message_ids text[], created_by text, version integer, created_at timestamp with time zone, updated_at timestamp with time zone, inline_text text, epoch integer, parent_id uuid, system_role text, path text, metadata jsonb)
+CREATE FUNCTION chat.workspace_get_as(p_item_id text, p_as_user_id text) RETURNS TABLE(id uuid, chat_id text, kind text, filename text, content_type text, size_bytes bigint, pointer text, source_message_ids text[], created_by text, version integer, created_at timestamp with time zone, updated_at timestamp with time zone, inline_text text, epoch integer, parent_id uuid, system_role text, path text, updated_by text, metadata jsonb)
     LANGUAGE plpgsql STABLE SECURITY DEFINER
     SET search_path TO ''
     AS $$
@@ -13,14 +13,14 @@ BEGIN
     RETURN QUERY
     SELECT v_item.id, v_item.chat_id, v_item.kind, v_item.filename, v_item.content_type, v_item.size_bytes, chat.file_blob_pointer(v_item.blob_id),
            v_item.source_message_ids, v_item.created_by, v_item.version, v_item.created_at, v_item.updated_at,
-           v_item.inline_text, v_item.epoch, v_item.parent_id, v_item.system_role, chat.workspace_path_of(v_item.id), v_item.metadata;
+           v_item.inline_text, v_item.epoch, v_item.parent_id, v_item.system_role, chat.workspace_path_of(v_item.id), v_item.updated_by, v_item.metadata;
 END;
 $$;
 REVOKE ALL ON FUNCTION chat.workspace_get_as(text, text) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION chat.workspace_get_as(text, text) TO authenticated;
 
 DROP FUNCTION chat.workspace_list_as(text, text, integer, integer, text, text, text, boolean);
-CREATE FUNCTION chat.workspace_list_as(p_chat_id text, p_as_user_id text, p_offset integer DEFAULT 0, p_limit integer DEFAULT NULL::integer, p_name text DEFAULT NULL::text, p_kind text DEFAULT NULL::text, p_folder text DEFAULT NULL::text, p_exact boolean DEFAULT false) RETURNS TABLE(id uuid, chat_id text, kind text, filename text, content_type text, size_bytes bigint, pointer text, source_message_ids text[], created_by text, version integer, created_at timestamp with time zone, updated_at timestamp with time zone, total bigint, parent_id uuid, system_role text, path text, metadata jsonb)
+CREATE FUNCTION chat.workspace_list_as(p_chat_id text, p_as_user_id text, p_offset integer DEFAULT 0, p_limit integer DEFAULT NULL::integer, p_name text DEFAULT NULL::text, p_kind text DEFAULT NULL::text, p_folder text DEFAULT NULL::text, p_exact boolean DEFAULT false) RETURNS TABLE(id uuid, chat_id text, kind text, filename text, content_type text, size_bytes bigint, pointer text, source_message_ids text[], created_by text, version integer, created_at timestamp with time zone, updated_at timestamp with time zone, total bigint, parent_id uuid, system_role text, path text, updated_by text, metadata jsonb)
     LANGUAGE plpgsql SECURITY DEFINER
     SET search_path TO ''
     AS $$
@@ -39,7 +39,7 @@ BEGIN
     IF p_kind IS NOT NULL AND p_kind NOT IN ('document', 'file', 'folder') THEN
         RAISE EXCEPTION 'workspace_list: kind must be document, file or folder, got %', p_kind;
     END IF;
-    PERFORM chat.workspace_require_room_member(p_chat_id, v_actor);
+    p_chat_id := chat.workspace_require_room_member(p_chat_id, v_actor);
     IF NOT v_all THEN
         v_parent := chat.workspace_folder_for(p_chat_id, p_folder, v_actor, false);
     END IF;
@@ -56,7 +56,7 @@ BEGIN
     )
     SELECT w.id, w.chat_id, w.kind, w.filename, w.content_type, w.size_bytes, chat.file_blob_pointer(w.blob_id),
            w.source_message_ids, w.created_by, w.version, w.created_at, w.updated_at,
-           count(*) OVER (), w.parent_id, w.system_role, t.item_path, w.metadata
+           count(*) OVER (), w.parent_id, w.system_role, t.item_path, w.updated_by, w.metadata
       FROM chat.workspace_items w
       JOIN tree t ON t.item_id = w.id
      WHERE w.chat_id = p_chat_id
@@ -74,7 +74,7 @@ REVOKE ALL ON FUNCTION chat.workspace_list_as(text, text, integer, integer, text
 GRANT EXECUTE ON FUNCTION chat.workspace_list_as(text, text, integer, integer, text, text, text, boolean) TO authenticated;
 
 DROP FUNCTION chat.workspace_search(text, text[], integer, text);
-CREATE FUNCTION chat.workspace_search(p_query text DEFAULT NULL::text, p_suffixes text[] DEFAULT NULL::text[], p_limit integer DEFAULT 50, p_as_user_id text DEFAULT NULL::text) RETURNS TABLE(id uuid, chat_id text, kind text, filename text, content_type text, size_bytes bigint, pointer text, source_message_ids text[], created_by text, version integer, created_at timestamp with time zone, updated_at timestamp with time zone, parent_id uuid, system_role text, path text, epoch integer, chat_name text, chat_kind text, metadata jsonb)
+CREATE FUNCTION chat.workspace_search(p_query text DEFAULT NULL::text, p_suffixes text[] DEFAULT NULL::text[], p_limit integer DEFAULT 50, p_as_user_id text DEFAULT NULL::text) RETURNS TABLE(id uuid, chat_id text, kind text, filename text, content_type text, size_bytes bigint, pointer text, source_message_ids text[], created_by text, version integer, created_at timestamp with time zone, updated_at timestamp with time zone, parent_id uuid, system_role text, path text, epoch integer, chat_name text, chat_kind text, updated_by text, metadata jsonb)
     LANGUAGE plpgsql STABLE SECURITY DEFINER
     SET search_path TO ''
     AS $_$
@@ -89,7 +89,7 @@ BEGIN
     RETURN QUERY
     SELECT w.id, w.chat_id, w.kind, w.filename, w.content_type, w.size_bytes, chat.file_blob_pointer(w.blob_id),
            w.source_message_ids, w.created_by, w.version, w.created_at, w.updated_at,
-           w.parent_id, w.system_role, p.item_path, w.epoch, c.name, c.kind, w.metadata
+           w.parent_id, w.system_role, p.item_path, w.epoch, c.name, c.kind, w.updated_by, w.metadata
       FROM chat.workspace_placed_for(v_actor) p
       JOIN chat.workspace_items w ON w.id = p.item_id
       JOIN chat.chats c ON c.id = w.chat_id
@@ -105,7 +105,7 @@ REVOKE ALL ON FUNCTION chat.workspace_search(text, text[], integer, text) FROM P
 GRANT EXECUTE ON FUNCTION chat.workspace_search(text, text[], integer, text) TO authenticated;
 
 DROP FUNCTION chat.workspace_recent(integer, text);
-CREATE FUNCTION chat.workspace_recent(p_limit integer DEFAULT 50, p_as_user_id text DEFAULT NULL::text) RETURNS TABLE(id uuid, chat_id text, kind text, filename text, content_type text, size_bytes bigint, pointer text, source_message_ids text[], created_by text, version integer, created_at timestamp with time zone, updated_at timestamp with time zone, parent_id uuid, system_role text, path text, epoch integer, chat_name text, chat_kind text, opened_at timestamp with time zone, metadata jsonb)
+CREATE FUNCTION chat.workspace_recent(p_limit integer DEFAULT 50, p_as_user_id text DEFAULT NULL::text) RETURNS TABLE(id uuid, chat_id text, kind text, filename text, content_type text, size_bytes bigint, pointer text, source_message_ids text[], created_by text, version integer, created_at timestamp with time zone, updated_at timestamp with time zone, parent_id uuid, system_role text, path text, epoch integer, chat_name text, chat_kind text, opened_at timestamp with time zone, updated_by text, metadata jsonb)
     LANGUAGE plpgsql STABLE SECURITY DEFINER
     SET search_path TO ''
     AS $$
@@ -118,7 +118,7 @@ BEGIN
     RETURN QUERY
     SELECT w.id, w.chat_id, w.kind, w.filename, w.content_type, w.size_bytes, chat.file_blob_pointer(w.blob_id),
            w.source_message_ids, w.created_by, w.version, w.created_at, w.updated_at,
-           w.parent_id, w.system_role, p.item_path, w.epoch, c.name, c.kind, o.opened_at, w.metadata
+           w.parent_id, w.system_role, p.item_path, w.epoch, c.name, c.kind, o.opened_at, w.updated_by, w.metadata
       FROM chat.workspace_item_opens o
       JOIN chat.workspace_items w ON w.id = o.item_id
       JOIN chat.workspace_placed_for(v_actor) p ON p.item_id = w.id

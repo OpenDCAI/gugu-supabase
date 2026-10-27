@@ -53,6 +53,8 @@ export interface AttachmentsDeps {
   log(stage: string, extra?: Record<string, unknown>): void
   /** 撞上正在回收的 blob 时,重试之间等多久(测试里给 0)。 */
   retryDelayMs?: number
+  /** Drain/finish an inspected incoming replacement, using the original caller's authorization. */
+  documentReplacement?(item: string, actor: string, body: { key: string; expected: number; finish: boolean }): Promise<void>
 }
 
 export function objectStorage(deps: AttachmentsDeps): AttachmentObjectStorage {
@@ -114,6 +116,18 @@ export async function call(rpc: Rpc, fn: string, args: Record<string, unknown>):
   const { data, error } = await rpc(fn, args)
   if (error) throw refusalFromDb(error)
   return data
+}
+
+async function writeFile(deps: AttachmentsDeps, fn: string, args: Record<string, unknown>) {
+  const item = args.p_item_id as string | undefined
+  const actor = (args.p_sender_user_id ?? args.p_as_user_id) as string
+  const entry = item ? await call(deps.userRpc, 'workspace_get_as', { p_item_id: item, p_as_user_id: actor }) as { kind: string }[] : []
+  if (entry[0]?.kind !== 'document') return await call(deps.userRpc, fn, args)
+  if (!deps.documentReplacement) throw new Refusal(503, 'not_configured', 'Document replacement requires the file service')
+  const body = { key: args.p_staging_key as string, expected: args.p_expected_version as number, finish: false }
+  await deps.documentReplacement!(item!, actor, body)
+  try { return await call(deps.userRpc, fn, args) }
+  finally { await deps.documentReplacement!(item!, actor, { ...body, finish: true }).catch(() => deps.log('replacement_finish_failed', { item })) }
 }
 
 const str = (body: Record<string, unknown>, key: string, required = true): string | null => {
@@ -226,7 +240,7 @@ export async function handleCommit(deps: AttachmentsDeps, userId: string, body: 
     ...(itemId != null ? { p_item_id: itemId, p_expected_version: int(body, 'expected_version') } : {}),
   }
   await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name')!)
-  const rows = (await call(deps.userRpc, 'attachment_commit', commitArgs)) as unknown[]
+  const rows = (await writeFile(deps, 'attachment_commit', commitArgs)) as unknown[]
   return rows[0] ?? null
 }
 
@@ -253,7 +267,7 @@ export async function handlePlace(deps: AttachmentsDeps, userId: string, body: R
         },
       }
   await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name', false) ?? '')
-  const rows = (await call(deps.userRpc, args.fn, args.args)) as unknown[]
+  const rows = (await writeFile(deps, args.fn, args.args)) as unknown[]
   return rows[0] ?? null
 }
 

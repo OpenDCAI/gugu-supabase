@@ -44,6 +44,7 @@ import { createOpenFiles, readHead } from '@gugu/files-core/open-files'
 import { colorFor } from '@gugu/files-core/presence'
 import { errorFields } from './log.mjs'
 import { createRounds } from './rounds.mjs'
+import { replaceIncoming } from './replacement.mjs'
 
 const NAME = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})@(0|[1-9]\d{0,8})$/i
 
@@ -699,7 +700,7 @@ export function createFileService(config, { log, pool: givenPool }) {
     for (const [name, value] of Object.entries(CORS_HEADERS)) res.setHeader(name, value)
     const url = new URL(req.url ?? '/', 'http://files')
     // 对外口没有前缀(nginx 剥掉了 /files/):路径段不是文件 id 的一律 404,不先验令牌 —— /stats、/healthz 在这里不存在。
-    const m = /^\/([^/]+)(\/edit)?$/.exec(url.pathname)
+    const m = /^\/([^/]+)(\/edit|\/replace)?$/.exec(url.pathname)
     if (!m || !isUuid(m[1])) return send(res, 404, { error: 'not-found' })
     // 预检不带凭证(浏览器就是这么发的),只回答「这条路能怎么调」。
     if (req.method === 'OPTIONS') {
@@ -743,6 +744,8 @@ export function createFileService(config, { log, pool: givenPool }) {
         if (error instanceof Denied) throw error
         throw new Denied('bad-request', 400)
       }
+      if (m[2] === '/replace') return send(res, 200, await replaceIncoming({ pool, files: openFiles, hp: hp(), itemId, identity, grant, body,
+        open: () => openDirect(itemId, grant, { userId: identity.userId, actorId: grant.actorId, chatId: grant.chatId, itemId, via: 'http' }) }))
       if (typeof body?.old !== 'string' || typeof body?.new !== 'string') throw new Denied('bad-request', 400)
       if (body.old === '') throw new Denied('empty-old', 400)
 

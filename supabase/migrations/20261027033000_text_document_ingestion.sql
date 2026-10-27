@@ -121,11 +121,72 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path='' AS $$
 $$;
 REVOKE ALL ON FUNCTION chat.workspace_document_payload(uuid,integer) FROM PUBLIC,anon,authenticated,service_role,gugu_files;
 
+-- One-use authorization on the existing upload receipt; only the verified file service may prepare it.
+CREATE FUNCTION chat.files_replace_stage(p_item uuid,p_user text,p_actor text,p_key text,p_expected integer,p_prepared jsonb DEFAULT NULL,p_finish boolean DEFAULT false)
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
+DECLARE w chat.workspace_items%ROWTYPE; u chat.file_blob_uploads%ROWTYPE; base text;
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM chat.files_authorize(p_item,p_user,p_actor)) THEN RAISE EXCEPTION 'File not found' USING HINT='file_transfer_denied'; END IF;
+    SELECT * INTO w FROM chat.workspace_items WHERE id=p_item FOR UPDATE;
+    SELECT * INTO u FROM chat.file_blob_uploads WHERE staging_key=p_key FOR UPDATE;
+    IF u.uploader IS DISTINCT FROM p_user OR w.kind<>'document' OR u.document IS NULL THEN RAISE EXCEPTION 'Verified text upload required' USING HINT='file_place_invalid'; END IF;
+    IF p_finish THEN
+        IF u.document->'prepared'->>'item' IS DISTINCT FROM p_item::text OR u.document->'prepared'->>'actor' IS DISTINCT FROM p_actor THEN RAISE EXCEPTION 'Replacement receipt changed'; END IF;
+        IF u.item_id IS NULL THEN UPDATE chat.file_blob_uploads SET document=document-'prepared' WHERE staging_key=p_key;
+        ELSIF u.item_id IS DISTINCT FROM p_item THEN RAISE EXCEPTION 'Upload already used'; END IF;
+        RETURN jsonb_build_object('epoch',CASE WHEN u.item_id=p_item THEN (u.document->'prepared'->>'epoch')::integer+1 ELSE NULL END);
+    END IF;
+    IF u.item_id=p_item THEN RETURN jsonb_build_object('committed',true); END IF;
+    IF u.item_id IS NOT NULL OR u.expires_at<=clock_timestamp() OR w.version IS DISTINCT FROM p_expected THEN RAISE EXCEPTION 'File version changed' USING HINT='workspace_version_conflict'; END IF;
+    SELECT inline_text INTO base FROM chat.workspace_item_versions WHERE item_id=p_item AND blob_id=chat.workspace_version_blob(p_item,p_expected) ORDER BY n DESC LIMIT 1;
+    IF base IS NULL THEN RAISE EXCEPTION 'The referenced version has no text projection' USING HINT='workspace_version_conflict'; END IF;
+    IF p_prepared IS NOT NULL THEN
+        IF (p_prepared->>'epoch')::integer IS DISTINCT FROM w.epoch OR jsonb_typeof(p_prepared->'state') IS DISTINCT FROM 'string'
+           OR jsonb_typeof(p_prepared->'text') IS DISTINCT FROM 'string' OR octet_length(p_prepared->>'text')>1048576 THEN RAISE EXCEPTION 'Document changed' USING HINT='workspace_version_conflict'; END IF;
+        UPDATE chat.file_blob_uploads SET document=jsonb_set(document,'{prepared}',p_prepared||jsonb_build_object('item',p_item,'actor',p_actor,'expected',p_expected,'expires',clock_timestamp()+interval '30 seconds')) WHERE staging_key=p_key;
+    END IF;
+    RETURN jsonb_build_object('epoch',w.epoch,'text',base,'document',u.document);
+END $$;
+REVOKE ALL ON FUNCTION chat.files_replace_stage(uuid,text,text,text,integer,jsonb,boolean) FROM PUBLIC,anon,authenticated,service_role;
+GRANT EXECUTE ON FUNCTION chat.files_replace_stage(uuid,text,text,text,integer,jsonb,boolean) TO gugu_files;
+
 -- Amend only existing ingestion/message guards; retain their membership, version and envelope checks.
 DO $text_ingest$
 DECLARE r record; definition text;
 BEGIN
     FOR r IN SELECT * FROM (VALUES
+        ('chat.file_replace_as(text,text,text,integer)',
+         $old$        IF v_item.kind <> 'file' THEN
+$old$,
+         $new$        IF v_item.kind='document' AND (v_upload.document->'prepared'->>'item' IS DISTINCT FROM v_item.id::text
+           OR v_upload.document->'prepared'->>'actor' IS DISTINCT FROM v_actor
+           OR (v_upload.document->'prepared'->>'expected')::integer IS DISTINCT FROM p_expected_version
+           OR (v_upload.document->'prepared'->>'epoch')::integer IS DISTINCT FROM v_item.epoch
+           OR (v_upload.document->'prepared'->>'expires')::timestamptz<=clock_timestamp()) THEN
+            RAISE EXCEPTION 'Document replacement is not prepared or has expired' USING HINT='workspace_version_conflict';
+        END IF;
+        IF v_item.kind NOT IN ('file','document') THEN
+$new$),
+        ('chat.file_replace_as(text,text,text,integer)',
+         $old$        IF v_upload.blob_id = v_item.blob_id THEN
+$old$,
+         $new$        IF v_item.kind='file' AND v_upload.blob_id = v_item.blob_id THEN
+$new$),
+        ('chat.file_replace_as(text,text,text,integer)',
+         $old$        v_next := v_item.version + 1;
+$old$,
+         $new$        v_next := CASE WHEN v_item.kind='document' AND v_upload.blob_id=chat.workspace_version_blob(v_item.id,v_item.version) THEN v_item.version
+            ELSE GREATEST(v_item.version,(SELECT COALESCE(max(n),0) FROM chat.workspace_item_versions WHERE item_id=v_item.id))+1 END;
+$new$),
+        ('chat.file_replace_as(text,text,text,integer)',
+         $old$        VALUES (v_item.id, v_next, v_blob.id, v_blob.content_type, v_blob.size_bytes, v_actor);
+$old$,
+         $new$        VALUES (v_item.id, v_next, v_blob.id, v_blob.content_type, v_blob.size_bytes, v_actor) ON CONFLICT(item_id,n) DO NOTHING;
+        IF v_item.kind='document' THEN
+            UPDATE chat.workspace_item_versions SET inline_text=v_upload.document->>'text' WHERE item_id=v_item.id AND n=v_next;
+            UPDATE chat.workspace_items SET ystate=decode(v_upload.document->'prepared'->>'state','hex'),inline_text=v_upload.document->'prepared'->>'text',epoch=epoch+1 WHERE id=v_item.id;
+        END IF;
+$new$),
         ('chat.files_record_version(uuid,text,text)',
          $old$       AND v.n NOT IN (SELECT k.n FROM chat.workspace_item_versions k WHERE k.item_id = p_item_id ORDER BY k.n DESC LIMIT v_keep);
 $old$,

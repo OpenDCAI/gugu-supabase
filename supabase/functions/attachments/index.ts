@@ -76,6 +76,14 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
     return publicStorageUrl(data.signedUrl,url)
   }
   return {
+    documentReplacement: async (item, actor, body) => {
+      const base = (env('GUGU_FILES_URL') || `${env('GUGU_PUBLIC_SUPABASE_URL') || url}/files`).replace(/\/$/, '')
+      const response = await fetch(`${base}/${item}/replace`, { method: 'POST',
+        headers: { Authorization: authorization, 'X-Gugu-As-Agent': actor, 'content-type': 'application/json' },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(35_000) })
+      const answer = await response.json()
+      if (!response.ok) throw new Refusal(response.status, answer.error ?? 'replacement_failed', 'The document changed or could not be replaced')
+    },
     textFiles: { maxBytes: WORKSPACE_TEXT_MAX_BYTES, classify: workspaceUploadKind },
     objects: storage.kind === 'oss'
       ? ossObjectStorage({ oss: storage.oss, cdn: storage.cdn, directSign:ossDirectSigner(storage.oss),fetch: (input, init) => fetch(input, init) })

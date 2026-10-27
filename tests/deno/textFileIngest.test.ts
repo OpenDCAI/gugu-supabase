@@ -127,3 +127,24 @@ Deno.test('old-data conversion resumes from its last completed cursor and repeat
   const repeated = await handleDocumentImport(f.deps, {})
   assert(repeated.imported === 0 && imported.size === 21, 'repeating an already completed conversion changes nothing')
 })
+
+Deno.test('incoming copies drain before the original caller transaction and always finish after success or message failure', async () => {
+  for (const rejected of [false, true]) {
+    const f = fixture(encode(text)), order: string[] = []
+    const original = f.deps.userRpc
+    f.deps.userRpc = async (fn, args) => {
+      if (fn === 'workspace_get_as') return { data: [{ kind: 'document' }], error: null }
+      if (fn === 'attachment_commit') {
+        order.push('caller transaction')
+        if (rejected) return { data: null, error: { message: 'recipient is not a member', hint: 'file_transfer_denied' } }
+      }
+      return await original(fn, args)
+    }
+    f.deps.documentReplacement = async (_item, _actor, body) => { order.push(body.finish ? 'finish' : 'drain') }
+    let failed = false
+    try { await handleCommit(f.deps, user, { staging_key: key, file_name: 'document.md', chat_id: 'group', sender_user_id: user,
+      message_id: 'message', item_id: user, expected_version: 1 }) } catch { failed = true }
+    assert(failed === rejected, 'original transaction outcome is preserved')
+    assert(order.join(',') === 'drain,caller transaction,finish', 'success and failure both release the one existing drain')
+  }
+})

@@ -59,6 +59,15 @@ async function resumeSeen(item: string, key: string, seen: { resume: number }) {
 }
 
 describe('incoming document copies retain the original caller-JWT attachment transaction', () => {
+  it('a non-member cannot send a document reference as a message', async () => {
+    const { item } = await initial()
+    await fx.admin.query('BEGIN; SET LOCAL ROLE authenticated')
+    try {
+      await fx.admin.query("SELECT set_config('request.jwt.claims',$1,true)", [JSON.stringify({ sub: outsider, role: 'authenticated' })])
+      await expect(fx.admin.query('SELECT * FROM chat.attachment_share($1,1,$2,$3,$4)', [item, randomUUID(), group, outsider]))
+        .rejects.toMatchObject({ hint: 'workspace_not_member' })
+    } finally { await fx.admin.query('ROLLBACK') }
+  })
   it('commits the next body and reopens the mounted editor; the old generation cannot overwrite it', async () => {
     const { item, original } = await initial(), next = await upload('# next')
     const host = machine(svc.url, token), page = openPage(host, item, 0)

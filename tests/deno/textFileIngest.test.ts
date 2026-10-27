@@ -1,7 +1,6 @@
-import { WORKSPACE_TEXT_MAX_BYTES, workspaceUploadKind } from 'https://raw.githubusercontent.com/OpenDCAI/gugu/fa542adee2b424a515b12a3e2b10bbf93c43d452/packages/core/src/shared/workspaceUpload.mjs'
 import { handleCommit, handlePlace, Refusal, type AttachmentsDeps } from '../../supabase/functions/_shared/attachments-core.ts'
 import { inspectFileStream } from '../../supabase/functions/_shared/file-inspection.ts'
-import { handleDocumentImport } from '../../supabase/functions/_shared/document-import-core.ts'
+import { handleDocumentImport, WORKSPACE_TEXT_MAX_BYTES, workspaceUploadKind } from '../../supabase/functions/_shared/document-import-core.ts'
 
 const assert = (ok: unknown, message: string) => { if (!ok) throw new Error(message) }
 const user = '11111111-1111-4111-8111-111111111111'
@@ -59,6 +58,41 @@ Deno.test('binary, malformed UTF-8/JSON and over-limit text keep the original bi
     await handlePlace(f.deps, user, { staging_key: key, chat_id: 'group', file_name: name, content_type: type })
     assert(f.calls.find(c => c.fn === 'file_managed_upload_registered')!.args.p_document === null, name)
     assert(f.calls.some(c => c.fn === 'file_place_as'), `${name} still uses ordinary file placement`)
+  }
+})
+
+Deno.test('a formatted JSON attachment stays a file for human, agent and folder uploads', async () => {
+  for (const entry of ['human', 'agent', 'folder']) {
+    const f = fixture(encode('{\n  "text": "keep these exact bytes"\n}\n'))
+    const body = { staging_key: key, file_name: 'formatted.json', content_type: 'application/json', chat_id: 'group', sender_user_id: entry === 'agent' ? 'agent' : user }
+    if (entry === 'folder') await handlePlace(f.deps, user, body)
+    else await handleCommit(f.deps, user, { ...body, message_id: 'message' })
+    assert(f.calls.find(c => c.fn === 'file_managed_upload_registered')!.args.p_document === null, `${entry} retains the JSON blob instead of creating a document`)
+    assert(f.calls.filter(c => c.fn === 'file_blob_register').length === 1, 'the original inspected blob is still registered')
+  }
+})
+
+Deno.test('a mixed import honors content_types without converting JSON or stalling its cursor', async () => {
+  for (const types of [['text/markdown', 'text/plain'], ['text/plain'], ['application/json']]) {
+    const f = fixture(encode(text)), imported: string[] = []
+    const rows = ['md', 'txt', 'json'].map((suffix, n) => ({ id: `00000000-0000-4000-8000-${String(n + 1).padStart(12, '0')}`,
+      version: 1, blob_id: 'blob', filename: `file.${suffix}`, content_type: 'application/octet-stream', bucket_id: 'oss',
+      object_name: suffix, size_bytes: suffix === 'json' ? encode('{\n  "x": 1\n}\n').length : encode(text).length, sha256: null }))
+    const inspect = f.deps.objects!.inspect!
+    f.deps.objects!.inspect = async (object, limit, retain) => object === 'json'
+      ? { ...await inspectFileStream(new Response(encode('{\n  "x": 1\n}\n')).body!, limit, retain), etag: '"immutable"' }
+      : inspect(object, limit, retain)
+    f.deps.serviceRpc = async (fn, args) => {
+      f.calls.push({ fn, args })
+      if (fn === 'workspace_document_import_candidates') return { data: rows.filter(row => row.id > String(args.p_after ?? '')), error: null }
+      imported.push(String(args.p_item)); return { data: true, error: null }
+    }
+    const result = await handleDocumentImport(f.deps, { content_types: types })
+    const expected = types.includes('text/markdown') ? [rows[0].id, rows[1].id] : types.includes('text/plain') ? [rows[1].id] : []
+    assert(JSON.stringify(imported) === JSON.stringify(expected), 'only allowed Markdown/plain-text items reach the existing import RPC')
+    assert(result.scanned === 3 && result.imported === expected.length && result.after === rows[2].id && result.done, 'the cursor advances past excluded JSON')
+    const next = await handleDocumentImport(f.deps, { after: result.after, content_types: types })
+    assert(next.scanned === 0 && next.imported === 0 && next.done, 'resumption does not get stuck on an excluded type')
   }
 })
 

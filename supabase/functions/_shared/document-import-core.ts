@@ -1,9 +1,21 @@
 import { type AttachmentsDeps, call, objectStorage, Refusal } from './attachments-core.ts'
 import { inspectFileStream } from './file-inspection.ts'
+import { WORKSPACE_TEXT_MAX_BYTES, workspaceUploadKind as classifyWorkspaceUpload } from 'https://raw.githubusercontent.com/OpenDCAI/gugu/fa542adee2b424a515b12a3e2b10bbf93c43d452/packages/core/src/shared/workspaceUpload.mjs'
+
+export { WORKSPACE_TEXT_MAX_BYTES }
+export function workspaceUploadKind(...args: Parameters<typeof classifyWorkspaceUpload>) {
+  const kind = classifyWorkspaceUpload(...args)
+  return kind.kind === 'document' && !['text/markdown', 'text/plain'].includes(kind.contentType)
+    ? { kind: 'file' as const, why: 'Only Markdown and plain text attachments are documents' } : kind
+}
 
 /** Service-only, resumable migration. Existing items and their immutable byte versions keep their identities. */
 export async function handleDocumentImport(deps: AttachmentsDeps, body: Record<string, unknown>) {
   const after = body.after ?? null
+  const types = body.content_types
+  if (types !== undefined && (!Array.isArray(types) || !types.length || types.some(type => typeof type !== 'string'))) {
+    throw new Refusal(400, 'invalid', 'content_types must be a nonempty array of MIME types')
+  }
   if (after !== null && (typeof after !== 'string' || !/^[0-9a-f-]{36}$/i.test(after))) {
     throw new Refusal(400, 'invalid', 'after must be an item UUID')
   }
@@ -28,7 +40,7 @@ export async function handleDocumentImport(deps: AttachmentsDeps, body: Record<s
       throw new Refusal(409, 'source_changed', 'Stored bytes do not match the version being imported')
     }
     const document = deps.textFiles.classify(row.filename, row.content_type, read.bytes)
-    if (document.kind !== 'document') continue
+    if (document.kind !== 'document' || types && !types.includes(document.contentType)) continue
     if (await call(deps.serviceRpc, 'workspace_import_document', {
       p_item: row.id, p_version: row.version, p_blob: row.blob_id,
       p_document: { text: document.text, content_type: document.contentType },

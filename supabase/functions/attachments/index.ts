@@ -1,7 +1,6 @@
 // Community attachments: bytes in the project's Supabase Storage by default, or Alibaba Cloud OSS + CDN when every OSS
 // variable is set (see ../_shared/attachment-storage-config.ts). User/RLS and GC authorization are enforced below.
 import { createClient } from 'npm:@supabase/supabase-js@2.110.9'
-import { WORKSPACE_TEXT_MAX_BYTES, workspaceUploadKind } from 'https://raw.githubusercontent.com/OpenDCAI/gugu/fa542adee2b424a515b12a3e2b10bbf93c43d452/packages/core/src/shared/workspaceUpload.mjs'
 import {
   type AttachmentsDeps,
   handleCommit,
@@ -21,7 +20,7 @@ import { type AttachmentStorageConfig, attachmentStorageConfig, StorageConfigErr
 import { handleUsageImport,handleStorageInventory,handleFileResolve } from '../_shared/file-transfer-core.ts'
 import { handleProjectFiles } from '../_shared/project-file-transfer-core.ts'
 import { ossDirectSigner } from '../_shared/oss-direct-url.ts'
-import { handleDocumentImport } from '../_shared/document-import-core.ts'
+import { handleDocumentImport, WORKSPACE_TEXT_MAX_BYTES, workspaceUploadKind } from '../_shared/document-import-core.ts'
 
 const env = (key: string): string => Deno.env.get(key)?.trim() ?? ''
 

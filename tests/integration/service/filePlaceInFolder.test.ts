@@ -349,3 +349,85 @@ describe('权限', () => {
     ])
   })
 })
+
+describe('text bytes use the shared document editor', () => {
+  async function textUpload(text: string, type='text/markdown') {
+    const u=await upload(member,text,type,Buffer.byteLength(text))
+    // The service-only registration retains the canonical classifier result, never a caller-supplied type tag.
+    await asOwner()
+    await database.query('UPDATE chat.file_blob_uploads SET document=$2::jsonb WHERE staging_key=$1',
+      [u.key,JSON.stringify({text,content_type:type})])
+    return u
+  }
+
+  it('folder upload preserves item, original bytes and permissions while opening as a document',async()=>{
+    const group=await newGroup(owner,[member])
+    const text='# 原始正文\n'+ '正文超过嗅探前缀。'.repeat(100)
+    const u=await textUpload(text)
+    const placed=await place(member,u.key,group,'中文.md')
+    await asOwner()
+    const row=(await database.query<{kind:string;inline_text:string;blob_id:string;version:number}>(
+      'SELECT kind,inline_text,blob_id,version FROM chat.workspace_items WHERE id=$1',[placed.id])).rows[0]!
+    expect(row).toEqual({kind:'document',inline_text:text,blob_id:u.blob,version:1})
+    const history=(await database.query('SELECT n,blob_id,inline_text FROM chat.workspace_item_versions WHERE item_id=$1',[placed.id])).rows
+    expect(history).toEqual([{n:1,blob_id:u.blob,inline_text:text}])
+    expect((await place(member,u.key,group,'中文.md')).id).toBe(placed.id)
+    await asUser(outsider)
+    expect(await fails('SELECT * FROM chat.workspace_get_as($1,$2)',[placed.id,outsider])).toMatch(/not found|not.*member/i)
+  })
+
+  it('a chat attachment gets the same document and keeps its pinned original version through edits',async()=>{
+    const group=await newGroup(owner,[member])
+    const text='# original\n'
+    const u=await textUpload(text)
+    const message=randomUUID()
+    await asUser(member)
+    const sent=(await database.query<{file_item_id:string;file_version:number}>(
+      'SELECT * FROM chat.attachment_commit($1,$2,$3,$4,$5)',[u.key,message,group,member,'说明.md'])).rows[0]!
+    await asOwner()
+    expect((await database.query('SELECT kind,inline_text FROM chat.workspace_items WHERE id=$1',[sent.file_item_id])).rows[0])
+      .toEqual({kind:'document',inline_text:text})
+    expect(sent.file_version).toBe(1)
+    await asUser(outsider)
+    expect(await fails('SELECT * FROM chat.attachment_share($1,1,$2,$3,$4)',[sent.file_item_id,randomUUID(),group,outsider]))
+      .toMatch(/not.*member|not found|not.*chat|denied/i)
+    await asOwner()
+    expect((await database.query('SELECT chat.files_record_version($1,$2,$3) AS recorded',[sent.file_item_id,text,member])).rows[0])
+      .toEqual({recorded:false})
+    for(let n=2;n<=55;n++) await database.query('SELECT chat.files_record_version($1,$2,$3)',[sent.file_item_id,'# edited '+n,member])
+    expect((await database.query('SELECT chat.workspace_version_blob($1,1) AS blob',[sent.file_item_id])).rows[0]).toEqual({blob:u.blob})
+    expect((await database.query('SELECT chat.workspace_version_blob($1,55) AS blob',[sent.file_item_id])).rows[0]).toEqual({blob:null})
+    expect((await database.query('SELECT inline_text FROM chat.workspace_item_versions WHERE item_id=$1 AND n=1',[sent.file_item_id])).rows[0])
+      .toEqual({inline_text:text})
+  })
+
+  it('old stored text converts in place with CAS; callers cannot forge the conversion',async()=>{
+    const group=await newGroup(owner,[member])
+    const text='# old text\n'
+    const u=await upload(member,text,'text/markdown',Buffer.byteLength(text))
+    const placed=await place(member,u.key,group,'old.md')
+    await asUser(member)
+    expect(await fails('SELECT chat.workspace_import_document($1,1,$2,$3::jsonb)',[placed.id,u.blob,JSON.stringify({text,content_type:'text/markdown'})]))
+      .toMatch(/permission denied/)
+    await asServiceRole()
+    expect(await fails('SELECT chat.workspace_import_document($1,2,$2,$3::jsonb)',[placed.id,u.blob,JSON.stringify({text,content_type:'text/markdown'})]))
+      .toMatch(/version_conflict/)
+    expect((await database.query('SELECT chat.workspace_import_document($1,1,$2,$3::jsonb) AS imported',
+      [placed.id,u.blob,JSON.stringify({text,content_type:'text/markdown'})])).rows[0]).toEqual({imported:true})
+    expect((await database.query('SELECT chat.workspace_import_document($1,1,$2,$3::jsonb) AS imported',
+      [placed.id,u.blob,JSON.stringify({text,content_type:'text/markdown'})])).rows[0]).toEqual({imported:false})
+    await asOwner()
+    expect((await database.query('SELECT id,kind,created_by,parent_id FROM chat.workspace_items WHERE id=$1',[placed.id])).rows[0])
+      .toEqual({id:placed.id,kind:'document',created_by:member,parent_id:null})
+  })
+
+  it('real binary uploads keep their binary type and original bytes',async()=>{
+    const group=await newGroup(owner,[member])
+    const u=await upload(member,'binary-pdf','application/pdf',123)
+    const placed=await place(member,u.key,group,'real.pdf')
+    expect((await item(placed.id)).kind).toBe('file')
+    await asOwner()
+    expect((await database.query('SELECT inline_text FROM chat.workspace_items WHERE id=$1',[placed.id])).rows[0])
+      .toEqual({inline_text:null})
+  })
+})

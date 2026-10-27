@@ -535,6 +535,10 @@
       "integrity": "sha512-LKYU1iAXJXUgAXn9URjiu+MWhyUXHsvfp7mcuYm9dSUKK0/CjtrUwFAxD82/mCWbtLsGjFIad0wIsod4zrTAEQ=="
     }
   },
+  "remote": {
+    "https://raw.githubusercontent.com/OpenDCAI/gugu/fa542adee2b424a515b12a3e2b10bbf93c43d452/packages/core/src/shared/imageMime.mjs": "93a8124a2985942a0874ec1db1aab00ae1151061a37b84550b2117722bfc0ae1",
+    "https://raw.githubusercontent.com/OpenDCAI/gugu/fa542adee2b424a515b12a3e2b10bbf93c43d452/packages/core/src/shared/workspaceUpload.mjs": "d6808205fffc0bda2e79942bb0a0a298bacff51b8eaa3fa62f7bd4dc4bd9a3c1"
+  },
   "workspace": {
     "packageJson": {
       "dependencies": [

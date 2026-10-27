@@ -64,10 +64,14 @@ describe('project local metadata, exact references and read-only host ownership'
     expect((await fails(POLICY,[group,device,'unbound',false,true,'7d'])).hint).toBe('file_transfer_denied')
   })
   it('admits an image upload to a project chat that keeps files local, and still refuses other files',async()=>{
+    // prepare reads the global transfer settings before its policy guard; the transaction rolls this back.
+    await service()
+    await db.query("INSERT INTO chat.file_transfer_limits(scope,scope_id,settings) VALUES('global','*',$1) ON CONFLICT(scope,scope_id) DO UPDATE SET settings=chat.file_transfer_limits.settings||EXCLUDED.settings",
+      [{inventory_ready:true,file_max_bytes:1000,upload_permit_seconds:120}])
     await user(member)
     const PREPARE='SELECT chat.file_managed_upload_prepare($1,$2,$3,$4) AS r'
-    expect((await fails(PREPARE,[group,member,123,null])).hint).toBe('file_transfer_denied')
-    expect((await fails(PREPARE,[group,member,123,'application/pdf'])).hint).toBe('file_transfer_denied')
+    expect(await fails(PREPARE,[group,member,123,null])).toMatchObject({hint:'file_transfer_denied',message:'Project files are not uploaded proactively'})
+    expect(await fails(PREPARE,[group,member,123,'application/pdf'])).toMatchObject({hint:'file_transfer_denied',message:'Project files are not uploaded proactively'})
     expect((await db.query(PREPARE,[group,member,123,'image/png'])).rows[0].r).toMatchObject({chat_id:group})
     expect((await db.query(PREPARE,[group,member,123,'IMAGE/JPEG'])).rows[0].r).toMatchObject({chat_id:group})
   })

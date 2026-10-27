@@ -1,7 +1,24 @@
 -- 车道 devices-row-refresh(10-27 实测):客户端每收到一次 device_changed 就把账号下全部设备行和全部设备项目整份重读。
 -- 心跳带出来的 device_changed 是「那一台的设备行变了」,项目上报带出来的是「那一台的项目变了」,两者同名、同一个 resource_key,
--- 客户端分不出该读哪一样。项目这一条在 resource_key 里加上 kind='projects';设备行那一条(publish_device_revision)不变。
--- 客户端据此只读变了的那一样、只读那一台。只加一个键,旧客户端照旧当作 device_changed 整份重读。
+-- 客户端分不出该读哪一样。两条各在 resource_key 里加一个 kind:项目上报是 'projects',设备行触发器是 'row'。
+-- 客户端据此只读变了的那一样、只读那一台;不带 kind(本迁移之前落的行)就当两样都可能变了。只加一个键,旧客户端照旧整份重读。
+
+CREATE OR REPLACE FUNCTION identity.publish_device_revision() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'identity', 'chat', 'public', 'pg_catalog'
+    AS $$
+DECLARE
+    device_row identity.gugu_devices%ROWTYPE := COALESCE(NEW, OLD);
+BEGIN
+    PERFORM chat.publish_user_revision(
+      device_row.user_id::text,
+      'device_changed',
+      jsonb_build_object('device_id', device_row.device_id, 'kind', 'row'),
+      TG_OP = 'DELETE'
+    );
+    RETURN COALESCE(NEW, OLD);
+END;
+$$;
 
 CREATE OR REPLACE FUNCTION identity.publish_device_projects(p_device_id text, p_projects jsonb) RETURNS boolean
     LANGUAGE plpgsql SECURITY DEFINER

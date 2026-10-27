@@ -84,10 +84,10 @@ async function read(asWho: string): Promise<Row[]> {
     FROM identity.device_projects ORDER BY device_id, local_project_id`)
   return rows
 }
-/** device_changed revisions for one device: the projects ones carry kind='projects', the device row's own carry no kind. */
+/** device_changed revisions for one device: the projects ones carry kind='projects', the device row's own kind='row'. */
 async function deviceRevisions(owner: string, deviceId: string, kind: 'projects' | 'row' = 'projects'): Promise<number> {
   await asService()
-  const key = kind === 'projects' ? `jsonb_build_object('device_id', $2::text, 'kind', 'projects')` : `jsonb_build_object('device_id', $2::text)`
+  const key = kind === 'projects' ? `jsonb_build_object('device_id', $2::text, 'kind', 'projects')` : `jsonb_build_object('device_id', $2::text, 'kind', 'row')`
   const { rows } = await database.query<{ n: string }>(`SELECT count(*) AS n FROM chat.account_revisions
     WHERE user_id = $1 AND event = 'device_changed' AND resource_key = ${key}`, [owner, deviceId])
   return Number(rows[0]!.n)

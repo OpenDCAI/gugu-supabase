@@ -113,14 +113,6 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION chat.set_workspace_item_updated_at() FROM PUBLIC,anon,authenticated,service_role,gugu_files;
 
-CREATE FUNCTION chat.workspace_document_payload(p_item uuid,p_version integer) RETURNS jsonb
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path='' AS $$
-    SELECT jsonb_build_object('text',v.inline_text,'content_type',v.content_type)
-    FROM chat.workspace_item_versions v JOIN chat.workspace_items w ON w.id=v.item_id
-    WHERE v.item_id=p_item AND v.n=p_version AND w.kind='document' AND v.inline_text IS NOT NULL AND v.blob_id IS NOT NULL
-$$;
-REVOKE ALL ON FUNCTION chat.workspace_document_payload(uuid,integer) FROM PUBLIC,anon,authenticated,service_role,gugu_files;
-
 -- One-use authorization on the existing upload receipt; only the verified file service may prepare it.
 CREATE FUNCTION chat.files_replace_stage(p_item uuid,p_user text,p_actor text,p_key text,p_expected integer,p_prepared jsonb DEFAULT NULL,p_finish boolean DEFAULT false)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
@@ -149,6 +141,16 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION chat.files_replace_stage(uuid,text,text,text,integer,jsonb,boolean) FROM PUBLIC,anon,authenticated,service_role;
 GRANT EXECUTE ON FUNCTION chat.files_replace_stage(uuid,text,text,text,integer,jsonb,boolean) TO gugu_files;
+
+-- Recheck at COMMIT too: a transaction that passed the initial guard may have waited past expiry.
+CREATE FUNCTION chat.files_replace_deadline() RETURNS trigger LANGUAGE plpgsql SET search_path='' AS $$
+BEGIN
+    IF (NEW.document->'prepared'->>'expires')::timestamptz<=clock_timestamp() THEN RAISE EXCEPTION 'Document replacement expired before commit' USING HINT='workspace_version_conflict'; END IF;
+    RETURN NULL;
+END $$;
+REVOKE ALL ON FUNCTION chat.files_replace_deadline() FROM PUBLIC,anon,authenticated,service_role,gugu_files;
+CREATE CONSTRAINT TRIGGER files_replace_deadline AFTER UPDATE ON chat.file_blob_uploads DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW WHEN(OLD.item_id IS NULL AND NEW.item_id IS NOT NULL AND NEW.document ? 'prepared') EXECUTE FUNCTION chat.files_replace_deadline();
 
 -- Amend only existing ingestion/message guards; retain their membership, version and envelope checks.
 DO $text_ingest$
@@ -250,9 +252,8 @@ $new$),
     RETURN QUERY SELECT v_placed.id, v_placed.version, chat.workspace_version_envelope(v_placed.id, v_placed.version), NULL::UUID;
 $old$,
          $new$    v_placed := chat.attachment_item_for(p_chat_id, v_blob, v_item.filename, p_sender_user_id, p_message_id);
-    IF chat.workspace_document_payload(v_item.id,v_version) IS NOT NULL THEN
-        PERFORM chat.workspace_import_document(v_placed.id,v_placed.version,v_blob,chat.workspace_document_payload(v_item.id,v_version));
-    END IF;
+    PERFORM chat.workspace_import_document(v_placed.id,v_placed.version,v_blob,jsonb_build_object('text',v.inline_text,'content_type',v.content_type))
+      FROM chat.workspace_item_versions v WHERE v.item_id=v_item.id AND v.n=v_version AND v_item.kind='document' AND v.inline_text IS NOT NULL AND v.blob_id IS NOT NULL;
     RETURN QUERY SELECT v_placed.id, v_placed.version, chat.workspace_version_envelope(v_placed.id, v_placed.version), NULL::UUID;
 $new$),
         ('chat.attachment_place_forward(text,text,text,text,boolean)',
@@ -260,9 +261,8 @@ $new$),
     RETURN QUERY SELECT v_item.id, v_item.version, chat.workspace_version_envelope(v_item.id, v_item.version), NULL::UUID;
 $old$,
          $new$    v_item := chat.attachment_item_for(p_chat_id, v_blob_id, v_name, p_sender_user_id, p_message_id);
-    IF chat.workspace_document_payload(v_source_item.id,v_source.file_version) IS NOT NULL THEN
-        PERFORM chat.workspace_import_document(v_item.id,v_item.version,v_blob_id,chat.workspace_document_payload(v_source_item.id,v_source.file_version));
-    END IF;
+    PERFORM chat.workspace_import_document(v_item.id,v_item.version,v_blob_id,jsonb_build_object('text',v.inline_text,'content_type',v.content_type))
+      FROM chat.workspace_item_versions v WHERE v.item_id=v_source_item.id AND v.n=v_source.file_version AND v_source_item.kind='document' AND v.inline_text IS NOT NULL AND v.blob_id IS NOT NULL;
     RETURN QUERY SELECT v_item.id, v_item.version, chat.workspace_version_envelope(v_item.id, v_item.version), NULL::UUID;
 $new$) ) AS patches(signature,old_body,new_body) LOOP
         SELECT pg_get_functiondef(r.signature::regprocedure) INTO definition;

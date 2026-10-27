@@ -159,4 +159,22 @@ describe('incoming document copies retain the original caller-JWT attachment tra
       } finally { reopened.close() }
     } finally { page.close(); host.socket.destroy() }
   })
+  it('a transaction admitted before expiry cannot commit after expiry', async () => {
+    const { item } = await initial(), next = await upload('# delayed transaction')
+    const host = machine(svc.url, token), page = openPage(host, item, 0), seen = compactAware(page)
+    await page.synced
+    try {
+      expect((await stage(item, next.key)).status).toBe(200)
+      await fx.admin.query("UPDATE chat.file_blob_uploads SET document=jsonb_set(document,'{prepared,expires}',to_jsonb(clock_timestamp()+interval '5 seconds')) WHERE staging_key=$1", [next.key])
+      await fx.admin.query('BEGIN; SET LOCAL ROLE authenticated')
+      await fx.admin.query("SELECT set_config('request.jwt.claims',$1,true)", [JSON.stringify({ sub: user, role: 'authenticated' })])
+      await fx.admin.query('SELECT * FROM chat.attachment_commit($1,$2,$3,$4,$5,$6,NULL,NULL,false,false,NULL,NULL,$7,1)', [next.key, randomUUID(), group, user, 'document.md', [], item])
+      await fx.admin.query('RESET ROLE')
+      await fx.admin.query("SELECT pg_sleep(GREATEST(0,EXTRACT(EPOCH FROM (document->'prepared'->>'expires')::timestamptz-clock_timestamp()))+0.01) FROM chat.file_blob_uploads WHERE staging_key=$1", [next.key])
+      await expect(fx.admin.query('COMMIT')).rejects.toMatchObject({ hint: 'workspace_version_conflict' })
+      await stage(item, next.key, true)
+      await resumeSeen(item, next.key, seen)
+      expect((await getFile(svc.url, token, item)).body.text).toBe('# original')
+    } finally { await fx.admin.query('ROLLBACK'); page.close(); host.socket.destroy() }
+  }, 20_000)
 })

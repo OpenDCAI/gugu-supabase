@@ -29,10 +29,10 @@ BEGIN
     IF u.blob_id IS NULL THEN
         UPDATE chat.file_transfer_storage SET state='ready' WHERE bucket_id=b.bucket_id AND object_name=b.object_name;
     END IF;
-    IF receipt.item_id IS NOT NULL AND receipt.document IS DISTINCT FROM p_document THEN
+    IF receipt.item_id IS NOT NULL AND receipt.document-'prepared' IS DISTINCT FROM p_document THEN
         RAISE EXCEPTION 'Committed upload classification cannot change' USING HINT='file_transfer_conflict';
     END IF;
-    UPDATE chat.file_blob_uploads SET document=p_document WHERE staging_key=p_key;
+    UPDATE chat.file_blob_uploads SET document=CASE WHEN receipt.document-'prepared' IS NOT DISTINCT FROM p_document THEN receipt.document ELSE p_document END WHERE staging_key=p_key;
     IF u.blob_id IS NULL THEN
         UPDATE chat.file_transfer_storage_refs SET expired_at=NULL,last_download_at=NULL,retention_started_at=now()
           WHERE storage_id=(SELECT id FROM chat.file_transfer_storage WHERE blob_id=b.id)

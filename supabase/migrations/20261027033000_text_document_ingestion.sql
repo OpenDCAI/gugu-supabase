@@ -127,7 +127,7 @@ RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
 DECLARE w chat.workspace_items%ROWTYPE; u chat.file_blob_uploads%ROWTYPE; base text;
 BEGIN
     IF NOT EXISTS(SELECT 1 FROM chat.files_authorize(p_item,p_user,p_actor)) THEN RAISE EXCEPTION 'File not found' USING HINT='file_transfer_denied'; END IF;
-    SELECT * INTO w FROM chat.workspace_items WHERE id=p_item FOR UPDATE;
+    SELECT * INTO w FROM chat.workspace_items WHERE id=p_item;
     SELECT * INTO u FROM chat.file_blob_uploads WHERE staging_key=p_key FOR UPDATE;
     IF u.uploader IS DISTINCT FROM p_user OR w.kind<>'document' OR u.document IS NULL THEN RAISE EXCEPTION 'Verified text upload required' USING HINT='file_place_invalid'; END IF;
     IF p_finish THEN
@@ -180,12 +180,21 @@ $old$,
 $new$),
         ('chat.file_replace_as(text,text,text,integer)',
          $old$        VALUES (v_item.id, v_next, v_blob.id, v_blob.content_type, v_blob.size_bytes, v_actor);
+        UPDATE chat.workspace_items w
+           SET blob_id = v_blob.id, size_bytes = v_blob.size_bytes, content_type = v_blob.content_type, version = v_next, updated_by = v_actor
+         WHERE w.id = v_item.id;
+        UPDATE chat.file_blob_uploads u SET item_id = v_item.id, item_version = v_next WHERE u.staging_key = p_staging_key;
 $old$,
          $new$        VALUES (v_item.id, v_next, v_blob.id, v_blob.content_type, v_blob.size_bytes, v_actor) ON CONFLICT(item_id,n) DO NOTHING;
         IF v_item.kind='document' THEN
             UPDATE chat.workspace_item_versions SET inline_text=v_upload.document->>'text' WHERE item_id=v_item.id AND n=v_next;
-            UPDATE chat.workspace_items SET ystate=decode(v_upload.document->'prepared'->>'state','hex'),inline_text=v_upload.document->'prepared'->>'text',epoch=epoch+1 WHERE id=v_item.id;
+            UPDATE chat.workspace_items w SET ystate=decode(v_upload.document->'prepared'->>'state','hex'),inline_text=v_upload.document->'prepared'->>'text',epoch=w.epoch+1 WHERE w.id=v_item.id;
         END IF;
+        UPDATE chat.workspace_items w SET blob_id=v_blob.id,version=v_next,updated_by=v_actor,
+            content_type=CASE WHEN v_item.kind='document' THEN v_upload.document->>'content_type' ELSE v_blob.content_type END,
+            size_bytes=CASE WHEN v_item.kind='document' THEN octet_length(v_upload.document->'prepared'->>'text') ELSE v_blob.size_bytes END WHERE w.id=v_item.id;
+        UPDATE chat.file_blob_uploads u SET item_id=v_item.id,item_version=v_next,
+            document=CASE WHEN v_item.kind='document' THEN jsonb_set(u.document,'{prepared}',u.document->'prepared'-'state'-'text') ELSE u.document END WHERE u.staging_key=p_staging_key;
 $new$),
         ('chat.files_record_version(uuid,text,text)',
          $old$       AND v.n NOT IN (SELECT k.n FROM chat.workspace_item_versions k WHERE k.item_id = p_item_id ORDER BY k.n DESC LIMIT v_keep);
@@ -264,7 +273,7 @@ $new$) ) AS patches(signature,old_body,new_body) LOOP
         EXECUTE replace(definition,r.old_body,r.new_body);
     END LOOP;
 END $text_ingest$;
-GRANT EXECUTE ON FUNCTION chat.file_place_as(text,text,text,text,text,text[]),
+GRANT EXECUTE ON FUNCTION chat.file_replace_as(text,text,text,integer),chat.file_place_as(text,text,text,text,text,text[]),
     chat.attachment_place(text,text,text,text,text,boolean),
     chat.attachment_place_share(uuid,integer,text,text,text),
     chat.attachment_place_forward(text,text,text,text,boolean) TO authenticated;

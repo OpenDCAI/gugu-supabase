@@ -113,3 +113,71 @@ describe('shared workspace metadata', () => {
     expect((await database.query('SELECT metadata FROM chat.workspace_items WHERE id=$1', [item])).rows).toEqual([{ metadata: { document } }])
   })
 })
+
+
+describe('explicit App data', () => {
+  const mark = async (identity: unknown = app) => (await database.query<{ metadata: Record<string, unknown> }>(
+    'SELECT chat.workspace_mark_app_data_as($1,$2,$3::jsonb) AS metadata', [item, owner, JSON.stringify(identity)])).rows[0]!.metadata
+
+  it('authorizes then marks only app, preserving document, content and history', async () => {
+    await setNamespace('document', document)
+    const before = (await database.query('SELECT inline_text,version,updated_at FROM chat.workspace_items WHERE id=$1', [item])).rows[0]
+    await asUser(owner)
+    expect(await mark()).toEqual({ app, document })
+    expect(await mark()).toEqual({ app, document })
+    await database.query('RESET ROLE')
+    expect((await database.query('SELECT inline_text,version,updated_at FROM chat.workspace_items WHERE id=$1', [item])).rows[0]).toEqual(before)
+    await setNamespace('document', { epoch: 4 })
+    expect((await database.query('SELECT metadata FROM chat.workspace_items WHERE id=$1', [item])).rows[0]).toEqual({ metadata: { app, document: { epoch: 4 } } })
+  })
+
+  it('returns marked files unfiltered through get, list, search and recent after rename and move', async () => {
+    await asUser(owner)
+    await mark()
+    const chat = (await database.query<{ chat_id: string }>('SELECT chat_id FROM chat.workspace_get_as($1,$2)', [item, owner])).rows[0]!.chat_id
+    await database.query('SELECT id FROM chat.workspace_move_as($1,$2,$3,$4)', [item, owner, 'Archive', 'renamed.txt'])
+    await database.query('SELECT chat.workspace_note_open($1)', [item])
+    for (const [sql,args] of [
+      ['SELECT metadata FROM chat.workspace_get_as($1,$2)', [item, owner]],
+      ['SELECT metadata FROM chat.workspace_list_as($1,$2)', [chat, owner]],
+      ['SELECT metadata FROM chat.workspace_search($1,NULL,50,$2)', ['renamed', owner]],
+      ['SELECT metadata FROM chat.workspace_recent(50,$1)', [owner]],
+    ] as const) {
+      const rows = (await database.query<{ metadata: Record<string, unknown> }>(sql, [...args])).rows
+      expect(rows.some(row => JSON.stringify(row.metadata) === JSON.stringify({ app }))).toBe(true)
+    }
+  })
+
+  it('creates data with its marker in one transaction and leaves ordinary documents unmarked', async () => {
+    await asUser(owner)
+    const chat = (await database.query<{ chat_id: string }>('SELECT chat_id FROM chat.workspace_get_as($1,$2)', [item, owner])).rows[0]!.chat_id
+    const created = (await database.query<{ entry: { metadata: unknown; id: string } }>(
+      'SELECT chat.workspace_create_app_document_as($1,$2,$3,$4::jsonb,$5,$6) AS entry',
+      [chat, owner, 'Board data', JSON.stringify(app), '{}', 'application/json'])).rows[0]!.entry
+    expect(created.metadata).toEqual({ app })
+    expect((await database.query('SELECT metadata FROM chat.workspace_get_as($1,$2)', [item, owner])).rows[0]).toEqual({ metadata: {} })
+    expect(await failure('SELECT chat.workspace_create_app_document_as($1,$2,$3,$4::jsonb)', [chat, owner, 'Invalid data', '{}'])).toMatch(/App identity/)
+    expect((await database.query('SELECT filename FROM chat.workspace_list_as($1,$2)', [chat, owner])).rows.map(row => row.filename)).not.toContain('Invalid data')
+  })
+
+  it('refuses malformed markers, folders and replacing another App identity', async () => {
+    await asUser(owner)
+    for (const identity of [null, [], {}, { publisher: '', id: 'kanban' }, { publisher: 'gugu', id: 'kanban', hidden: true }]) {
+      expect(await failure('SELECT chat.workspace_mark_app_data_as($1,$2,$3::jsonb)', [item, owner, JSON.stringify(identity)])).toMatch(/App identity/)
+    }
+    await mark()
+    expect(await failure('SELECT chat.workspace_mark_app_data_as($1,$2,$3::jsonb)', [item, owner, JSON.stringify({ publisher: 'gugu', id: 'other' })])).toMatch(/another App/)
+    const chat = (await database.query<{ chat_id: string }>('SELECT chat_id FROM chat.workspace_get_as($1,$2)', [item, owner])).rows[0]!.chat_id
+    const folder = (await database.query<{ id: string }>('SELECT id FROM chat.workspace_mkdir_as($1,$2,$3)', [chat, owner, 'Folder'])).rows[0]!.id
+    expect(await failure('SELECT chat.workspace_mark_app_data_as($1,$2,$3::jsonb)', [folder, owner, JSON.stringify(app)])).toMatch(/folder cannot/)
+  })
+
+  it('does not let a nonmember or an impersonated actor mark or create data', async () => {
+    const outsider = randomUUID()
+    await asUser(outsider)
+    expect(await failure('SELECT chat.workspace_mark_app_data_as($1,$2,$3::jsonb)', [item, outsider, JSON.stringify(app)])).toMatch(/not found/)
+    expect(await failure('SELECT chat.workspace_mark_app_data_as($1,$2,$3::jsonb)', [item, owner, JSON.stringify(app)])).toMatch(/not owned|not allowed|not yours|cannot|actor/i)
+    await database.query('RESET ROLE')
+    expect((await database.query('SELECT metadata FROM chat.workspace_items WHERE id=$1', [item])).rows[0]).toEqual({ metadata: {} })
+  })
+})

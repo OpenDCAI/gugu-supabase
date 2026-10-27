@@ -166,7 +166,8 @@ async function issueUpload(deps: AttachmentsDeps, userId: string, body: Record<s
   // Clients from before the budget release send an empty body; they cannot upload here, so tell their person to update.
   if (!declared) throw new Refusal(426,'client_outdated','Update Gugu to send files (this version does not declare the file size)')
   const chat=str(body,'chat_id',false),actor=str(body,'as',false)??userId
-  const prepared=await call(deps.userRpc,'file_managed_upload_prepare',{p_chat:chat,p_as:actor,p_bytes:declared}) as {
+  const contentType=str(body,'content_type',false)
+  const prepared=await call(deps.userRpc,'file_managed_upload_prepare',{p_chat:chat,p_as:actor,p_bytes:declared,p_content_type:contentType}) as {
     max_bytes:number;permit_seconds:number
   }
   const store=objectStorage(deps)
@@ -181,7 +182,7 @@ async function issueUpload(deps: AttachmentsDeps, userId: string, body: Record<s
     throw new Refusal(503,'not_configured','The upload provider size ceiling and lifetime must match deployment policy')
   }
   const permit=await call(deps.userRpc,'file_managed_upload_as',{
-    p_id:id,p_chat:chat,p_as:actor,p_bytes:bounds.maxBytes,
+    p_id:id,p_chat:chat,p_as:actor,p_bytes:bounds.maxBytes,p_content_type:contentType,
   }) as { staging_key:string; signed_at:string; expires_at:string; max_bytes:number }
   const seconds=(Date.parse(permit.expires_at)-Date.parse(permit.signed_at))/1000
   const form=await store.upload(permit.staging_key,new Date(permit.signed_at),{maxBytes:Number(permit.max_bytes),expiresSeconds:seconds})

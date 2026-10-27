@@ -129,16 +129,16 @@ Deno.test('old OSS and legacy storage files migrate in place through the same cl
   }
 })
 
-Deno.test('old-data conversion refuses mismatched stored bytes before changing the item', async () => {
+Deno.test('old-data conversion skips mismatched stored bytes without changing the item', async () => {
   const f = fixture(encode(text))
   f.deps.serviceRpc = async (fn, args) => {
     f.calls.push({ fn, args })
     return { data: [{ id: user, version: 7, blob_id: 'blob', filename: 'old.md', bucket_id: 'oss',
       object_name: 'old', size_bytes: 1, sha256: null }], error: null }
   }
-  let refused = false
-  try { await handleDocumentImport(f.deps, {}) } catch (error) { refused = (error as { code?: string }).code === 'source_changed' }
-  assert(refused && !f.calls.some(c => c.fn === 'workspace_import_document'), 'immutable source is checked before conversion')
+  const result = await handleDocumentImport(f.deps, {})
+  assert(result.skipped.length === 1 && result.skipped[0].code === 'source_changed' && result.skipped[0].id === user, 'the mismatch is recorded')
+  assert(!f.calls.some(c => c.fn === 'workspace_import_document'), 'immutable source is checked before conversion')
 })
 
 Deno.test('old-data conversion resumes from its last completed cursor and repeated conversion is harmless', async () => {
@@ -162,14 +162,13 @@ Deno.test('old-data conversion resumes from its last completed cursor and repeat
   assert(repeated.imported === 0 && imported.size === 21, 'repeating an already completed conversion changes nothing')
 })
 
-Deno.test('a refused import identifies the bad item and after=item resumes beyond it', async () => {
-  for (const code of ['source_changed', 'source_unavailable', 'not_configured']) {
+Deno.test('an unreadable item is recorded and passed over; the batch goes on to the next one', async () => {
+  for (const code of ['source_changed', 'source_unavailable']) {
     const f = fixture(encode(text)), bad = '00000000-0000-4000-8000-000000000001'
     const good = '00000000-0000-4000-8000-000000000002'
     const rows = [bad, good].map(id => ({ id, version: 1, blob_id: 'blob', filename: 'old.md',
-      content_type: 'text/markdown', bucket_id: id === bad && code !== 'source_unavailable' ? 'oss' : 'workspace',
-      object_name: id, size_bytes: id === bad && code === 'source_changed' ? 1 : encode(text).length, sha256: null }))
-    if (code === 'not_configured') f.deps.objects!.inspect = undefined
+      content_type: 'text/markdown', bucket_id: 'workspace', object_name: id,
+      size_bytes: id === bad && code === 'source_changed' ? 1 : encode(text).length, sha256: null }))
     f.deps.storageSignedUrl = async (_bucket, object) => `https://legacy.invalid/${object}`
     f.deps.fetch = async url => String(url).endsWith(bad) && code === 'source_unavailable'
       ? new Response(null, { status: 503 }) : new Response(encode(text))
@@ -178,14 +177,51 @@ Deno.test('a refused import identifies the bad item and after=item resumes beyon
       return { data: fn === 'workspace_document_import_candidates'
         ? rows.filter(row => row.id > String(args.p_after ?? '')) : true, error: null }
     }
-    let caught: unknown
-    try { await handleDocumentImport(f.deps, {}) } catch (error) { caught = error }
-    assert(caught instanceof Refusal && caught.code === code && caught.message.includes(bad), 'the original refusal includes its item id')
-    assert(!f.calls.some(c => c.fn === 'workspace_import_document'), 'the refused item was not changed')
-    const resumed = await handleDocumentImport(f.deps, { after: bad })
-    assert(resumed.scanned === 1 && resumed.imported === 1 && resumed.after === good && resumed.done, 'an explicitly approved skip reaches the following item')
-    assert(f.calls.find(c => c.fn === 'workspace_import_document')!.args.p_item === good, 'only the following item is imported')
+    const result = await handleDocumentImport(f.deps, {})
+    assert(result.skipped.length === 1 && result.skipped[0].id === bad && result.skipped[0].code === code
+      && result.skipped[0].message.includes(bad), `${code}: the bad item is recorded with its id`)
+    assert(result.imported === 1 && result.after === good && result.done, `${code}: the following item is still imported`)
+    const writes = f.calls.filter(c => c.fn === 'workspace_import_document')
+    assert(writes.length === 1 && writes[0].args.p_item === good, `${code}: the bad item was not changed`)
   }
+})
+
+Deno.test('a configuration refusal still stops the batch, naming the item it stopped at', async () => {
+  const f = fixture(encode(text)), id = '00000000-0000-4000-8000-000000000001'
+  f.deps.objects!.inspect = undefined
+  f.deps.serviceRpc = async (fn, args) => {
+    f.calls.push({ fn, args })
+    return { data: fn === 'workspace_document_import_candidates' ? [{ id, version: 1, blob_id: 'blob', filename: 'old.md',
+      content_type: 'text/markdown', bucket_id: 'oss', object_name: 'o', size_bytes: encode(text).length, sha256: null }] : true, error: null }
+  }
+  let caught: unknown
+  try { await handleDocumentImport(f.deps, {}) } catch (error) { caught = error }
+  assert(caught instanceof Refusal && caught.code === 'not_configured' && caught.message.includes(id), 'not passed over')
+  assert(!f.calls.some(c => c.fn === 'workspace_import_document'), 'nothing written')
+})
+
+Deno.test('a dry run reads and classifies every row like a run, lists each decision and writes nothing', async () => {
+  const f = fixture(encode(text))
+  const ids = ['00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002',
+    '00000000-0000-4000-8000-000000000003', '00000000-0000-4000-8000-000000000004']
+  const rows = [['笔记.md', text], ['data.json', '{"a":1}'], ['gone.txt', text], ['bin.dat', '\u0000\u00ff']].map(([filename, body], n) =>
+    ({ id: ids[n], version: 1, blob_id: 'blob', filename, content_type: 'application/octet-stream', bucket_id: 'workspace',
+      object_name: ids[n], size_bytes: encode(body).length, sha256: null, body }))
+  f.deps.storageSignedUrl = async (_bucket, object) => `https://legacy.invalid/${object}`
+  f.deps.fetch = async url => {
+    const row = rows.find(r => String(url).endsWith(r.id))!
+    return row.filename === 'gone.txt' ? new Response(null, { status: 404 }) : new Response(encode(row.body))
+  }
+  f.deps.serviceRpc = async (fn, args) => {
+    f.calls.push({ fn, args })
+    return { data: fn === 'workspace_document_import_candidates' ? rows : true, error: null }
+  }
+  const result = await handleDocumentImport(f.deps, { dry_run: true })
+  assert(result.dry_run && result.imported === 0 && !f.calls.some(c => c.fn === 'workspace_import_document'), 'nothing written')
+  const decisions = Object.fromEntries(result.items!.map(item => [item.filename, item.decision]))
+  assert(JSON.stringify(decisions) === JSON.stringify({ '笔记.md': 'import', 'data.json': 'keep_file', 'gone.txt': 'skip', 'bin.dat': 'keep_file' }),
+    `each row's decision: ${JSON.stringify(decisions)}`)
+  assert(result.skipped.length === 1 && result.skipped[0].code === 'source_unavailable', 'the unreadable row is the skipped one')
 })
 
 Deno.test('incoming copies drain before the original caller transaction and always finish after success or message failure', async () => {

@@ -14,8 +14,8 @@ const SKIPPED_READS = new Set(['source_unavailable', 'source_changed'])
 
 /**
  * Service-only, resumable migration. Existing items and their immutable byte versions keep their identities. A row whose
- * stored bytes cannot be read is returned in `skipped` and passed over; anything else still stops the batch. `dry_run`
- * reads and classifies exactly as a run does and writes nothing: each row's decision comes back in `items`.
+ * stored bytes cannot be read is returned in `skipped` and passed over; anything else still stops the batch. Each row's
+ * decision comes back in `items`; `dry_run` reads and classifies exactly as a run does and writes nothing.
  */
 export async function handleDocumentImport(deps: AttachmentsDeps, body: Record<string, unknown>) {
   const after = body.after ?? null
@@ -53,9 +53,13 @@ export async function handleDocumentImport(deps: AttachmentsDeps, body: Record<s
         throw new Refusal(409, 'source_changed', 'Stored bytes do not match the version being imported')
       }
     } catch (error) {
-      if (!(error instanceof Refusal) || !SKIPPED_READS.has(error.code)) throw error
-      skipped.push({ id: row.id, code: error.code, message: `item ${row.id}: ${error.message}` })
-      decided('skip', error.code)
+      // Signing an object that is gone, or the network failing on its bytes, is a read failure too; a configuration
+      // refusal is not, and stops the batch.
+      const refusal = error instanceof Refusal ? error
+        : new Refusal(502, 'source_unavailable', `Stored bytes could not be read: ${error instanceof Error ? error.message : String(error)}`)
+      if (!SKIPPED_READS.has(refusal.code)) throw refusal
+      skipped.push({ id: row.id, code: refusal.code, message: `item ${row.id}: ${refusal.message}` })
+      decided('skip', refusal.code)
       continue
     }
     const document = deps.textFiles.classify(row.filename, row.content_type, read.bytes)
@@ -73,5 +77,5 @@ export async function handleDocumentImport(deps: AttachmentsDeps, body: Record<s
     if (error instanceof Refusal) error.message = `item ${row.id}: ${error.message}`
     throw error
   }
-  return { scanned: rows.length, imported, skipped, ...(dryRun ? { dry_run: true, items } : {}), after: rows.at(-1)?.id ?? after, done: rows.length < 20 }
+  return { scanned: rows.length, imported, skipped, items, dry_run: dryRun, after: rows.at(-1)?.id ?? after, done: rows.length < 20 }
 }

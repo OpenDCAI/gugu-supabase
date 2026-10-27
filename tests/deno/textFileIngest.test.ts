@@ -163,15 +163,22 @@ Deno.test('old-data conversion resumes from its last completed cursor and repeat
 })
 
 Deno.test('an unreadable item is recorded and passed over; the batch goes on to the next one', async () => {
-  for (const code of ['source_changed', 'source_unavailable']) {
+  for (const [code, how] of [['source_changed', 'size'], ['source_unavailable', 'status'], ['source_unavailable', 'unsigned'], ['source_unavailable', 'network']]) {
     const f = fixture(encode(text)), bad = '00000000-0000-4000-8000-000000000001'
     const good = '00000000-0000-4000-8000-000000000002'
     const rows = [bad, good].map(id => ({ id, version: 1, blob_id: 'blob', filename: 'old.md',
       content_type: 'text/markdown', bucket_id: 'workspace', object_name: id,
-      size_bytes: id === bad && code === 'source_changed' ? 1 : encode(text).length, sha256: null }))
-    f.deps.storageSignedUrl = async (_bucket, object) => `https://legacy.invalid/${object}`
-    f.deps.fetch = async url => String(url).endsWith(bad) && code === 'source_unavailable'
-      ? new Response(null, { status: 503 }) : new Response(encode(text))
+      size_bytes: id === bad && how === 'size' ? 1 : encode(text).length, sha256: null }))
+    f.deps.storageSignedUrl = async (_bucket, object) => {
+      // A Storage object that is gone cannot even be signed (`signStorage` throws a plain Error).
+      if (object === bad && how === 'unsigned') throw new Error('Could not sign a managed Storage download')
+      return `https://legacy.invalid/${object}`
+    }
+    f.deps.fetch = async url => {
+      if (!String(url).endsWith(bad)) return new Response(encode(text))
+      if (how === 'network') throw new TypeError('error sending request')
+      return how === 'status' ? new Response(null, { status: 503 }) : new Response(encode(text))
+    }
     f.deps.serviceRpc = async (fn, args) => {
       f.calls.push({ fn, args })
       return { data: fn === 'workspace_document_import_candidates'
@@ -179,10 +186,10 @@ Deno.test('an unreadable item is recorded and passed over; the batch goes on to 
     }
     const result = await handleDocumentImport(f.deps, {})
     assert(result.skipped.length === 1 && result.skipped[0].id === bad && result.skipped[0].code === code
-      && result.skipped[0].message.includes(bad), `${code}: the bad item is recorded with its id`)
-    assert(result.imported === 1 && result.after === good && result.done, `${code}: the following item is still imported`)
+      && result.skipped[0].message.includes(bad), `${how}: the bad item is recorded with its id`)
+    assert(result.imported === 1 && result.after === good && result.done, `${how}: the following item is still imported`)
     const writes = f.calls.filter(c => c.fn === 'workspace_import_document')
-    assert(writes.length === 1 && writes[0].args.p_item === good, `${code}: the bad item was not changed`)
+    assert(writes.length === 1 && writes[0].args.p_item === good, `${how}: the bad item was not changed`)
   }
 })
 
@@ -218,7 +225,7 @@ Deno.test('a dry run reads and classifies every row like a run, lists each decis
   }
   const result = await handleDocumentImport(f.deps, { dry_run: true })
   assert(result.dry_run && result.imported === 0 && !f.calls.some(c => c.fn === 'workspace_import_document'), 'nothing written')
-  const decisions = Object.fromEntries(result.items!.map(item => [item.filename, item.decision]))
+  const decisions = Object.fromEntries(result.items.map(item => [item.filename, item.decision]))
   assert(JSON.stringify(decisions) === JSON.stringify({ '笔记.md': 'import', 'data.json': 'keep_file', 'gone.txt': 'skip', 'bin.dat': 'keep_file' }),
     `each row's decision: ${JSON.stringify(decisions)}`)
   assert(result.skipped.length === 1 && result.skipped[0].code === 'source_unavailable', 'the unreadable row is the skipped one')

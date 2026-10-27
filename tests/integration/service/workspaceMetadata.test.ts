@@ -144,7 +144,7 @@ describe('explicit App data', () => {
       ['SELECT metadata FROM chat.workspace_recent(50,$1)', [owner]],
     ] as const) {
       const rows = (await database.query<{ metadata: Record<string, unknown> }>(sql, [...args])).rows
-      expect(rows.some(row => JSON.stringify(row.metadata) === JSON.stringify({ app }))).toBe(true)
+      expect(rows.map(row => row.metadata), sql).toContainEqual({ app })
     }
   })
 

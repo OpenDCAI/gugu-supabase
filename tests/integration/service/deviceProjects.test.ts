@@ -84,10 +84,12 @@ async function read(asWho: string): Promise<Row[]> {
     FROM identity.device_projects ORDER BY device_id, local_project_id`)
   return rows
 }
-async function deviceRevisions(owner: string, deviceId: string): Promise<number> {
+/** device_changed revisions for one device: the projects ones carry kind='projects', the device row's own carry no kind. */
+async function deviceRevisions(owner: string, deviceId: string, kind: 'projects' | 'row' = 'projects'): Promise<number> {
   await asService()
+  const key = kind === 'projects' ? `jsonb_build_object('device_id', $2::text, 'kind', 'projects')` : `jsonb_build_object('device_id', $2::text)`
   const { rows } = await database.query<{ n: string }>(`SELECT count(*) AS n FROM chat.account_revisions
-    WHERE user_id = $1 AND event = 'device_changed' AND resource_key = jsonb_build_object('device_id', $2::text)`, [owner, deviceId])
+    WHERE user_id = $1 AND event = 'device_changed' AND resource_key = ${key}`, [owner, deviceId])
   return Number(rows[0]!.n)
 }
 
@@ -170,6 +172,18 @@ describe('identity.publish_device_projects', () => {
     const folder: Folder = { workspace_id: 'x', kind: 'attached', path: '/srv/x', attached_at: null }
     expect(await publish(owner, laptop, [project('a', [folder])])).toBe(true)
     expect(await deviceRevisions(owner, laptop)).toBe(before + 2)
+  })
+
+  it('tells a projects change apart from a change of the device row itself, so a client reads only the one that changed', async () => {
+    const owner = await account()
+    const laptop = await device(owner)
+    const rowBefore = await deviceRevisions(owner, laptop, 'row')
+    expect(await publish(owner, laptop, [project('a')])).toBe(true)
+    expect(await deviceRevisions(owner, laptop, 'row')).toBe(rowBefore)
+    await asService()
+    await database.query(`UPDATE identity.gugu_devices SET session_digest = '[{"x":1}]'::jsonb WHERE device_id = $1`, [laptop])
+    expect(await deviceRevisions(owner, laptop, 'row')).toBe(rowBefore + 1)
+    expect(await deviceRevisions(owner, laptop, 'projects')).toBe(1)
   })
 
   it('records a project without group_representative as not the representative', async () => {

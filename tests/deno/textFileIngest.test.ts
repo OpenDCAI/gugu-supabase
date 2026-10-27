@@ -1,5 +1,5 @@
 import { WORKSPACE_TEXT_MAX_BYTES, workspaceUploadKind } from 'https://raw.githubusercontent.com/OpenDCAI/gugu/fa542adee2b424a515b12a3e2b10bbf93c43d452/packages/core/src/shared/workspaceUpload.mjs'
-import { handleCommit, handlePlace, type AttachmentsDeps } from '../../supabase/functions/_shared/attachments-core.ts'
+import { handleCommit, handlePlace, Refusal, type AttachmentsDeps } from '../../supabase/functions/_shared/attachments-core.ts'
 import { inspectFileStream } from '../../supabase/functions/_shared/file-inspection.ts'
 import { handleDocumentImport } from '../../supabase/functions/_shared/document-import-core.ts'
 
@@ -126,6 +126,32 @@ Deno.test('old-data conversion resumes from its last completed cursor and repeat
   assert(resumed.scanned === 1 && resumed.imported === 1 && resumed.done, 'resume processes the remaining file')
   const repeated = await handleDocumentImport(f.deps, {})
   assert(repeated.imported === 0 && imported.size === 21, 'repeating an already completed conversion changes nothing')
+})
+
+Deno.test('a refused import identifies the bad item and after=item resumes beyond it', async () => {
+  for (const code of ['source_changed', 'source_unavailable', 'not_configured']) {
+    const f = fixture(encode(text)), bad = '00000000-0000-4000-8000-000000000001'
+    const good = '00000000-0000-4000-8000-000000000002'
+    const rows = [bad, good].map(id => ({ id, version: 1, blob_id: 'blob', filename: 'old.md',
+      content_type: 'text/markdown', bucket_id: id === bad && code !== 'source_unavailable' ? 'oss' : 'workspace',
+      object_name: id, size_bytes: id === bad && code === 'source_changed' ? 1 : encode(text).length, sha256: null }))
+    if (code === 'not_configured') f.deps.objects!.inspect = undefined
+    f.deps.storageSignedUrl = async (_bucket, object) => `https://legacy.invalid/${object}`
+    f.deps.fetch = async url => String(url).endsWith(bad) && code === 'source_unavailable'
+      ? new Response(null, { status: 503 }) : new Response(encode(text))
+    f.deps.serviceRpc = async (fn, args) => {
+      f.calls.push({ fn, args })
+      return { data: fn === 'workspace_document_import_candidates'
+        ? rows.filter(row => row.id > String(args.p_after ?? '')) : true, error: null }
+    }
+    let caught: unknown
+    try { await handleDocumentImport(f.deps, {}) } catch (error) { caught = error }
+    assert(caught instanceof Refusal && caught.code === code && caught.message.includes(bad), 'the original refusal includes its item id')
+    assert(!f.calls.some(c => c.fn === 'workspace_import_document'), 'the refused item was not changed')
+    const resumed = await handleDocumentImport(f.deps, { after: bad })
+    assert(resumed.scanned === 1 && resumed.imported === 1 && resumed.after === good && resumed.done, 'an explicitly approved skip reaches the following item')
+    assert(f.calls.find(c => c.fn === 'workspace_import_document')!.args.p_item === good, 'only the following item is imported')
+  }
 })
 
 Deno.test('incoming copies drain before the original caller transaction and always finish after success or message failure', async () => {

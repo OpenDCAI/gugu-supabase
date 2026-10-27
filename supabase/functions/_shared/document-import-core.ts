@@ -12,7 +12,7 @@ export async function handleDocumentImport(deps: AttachmentsDeps, body: Record<s
     bucket_id: string; object_name: string; size_bytes: number | string; sha256: string | null
   }[]
   let imported = 0
-  for (const row of rows) {
+  for (const row of rows) try {
     let read
     if (row.bucket_id === 'oss') {
       const store = objectStorage(deps)
@@ -33,6 +33,9 @@ export async function handleDocumentImport(deps: AttachmentsDeps, body: Record<s
       p_item: row.id, p_version: row.version, p_blob: row.blob_id,
       p_document: { text: document.text, content_type: document.contentType },
     })) imported++
+  } catch (error) {
+    if (error instanceof Refusal) error.message = `item ${row.id}: ${error.message}`
+    throw error
   }
   return { scanned: rows.length, imported, after: rows.at(-1)?.id ?? after, done: rows.length < 20 }
 }

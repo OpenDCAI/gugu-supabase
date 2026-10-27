@@ -39,11 +39,12 @@ import {
   isUuid,
   offeredProtocols,
 } from './auth.mjs'
-import { InvalidJson, applyEdit, buildDoc, isJson, parseJsonObject, readText, rebuildDoc, sameContent, withoutMarks } from '@gugu/files-core/content'
+import { InvalidJson, applyEdit, buildDoc, isJson, parseJsonObject, readFileText, readText, rebuildDoc, sameContent, withoutMarks } from '@gugu/files-core/content'
 import { createOpenFiles, readHead } from '@gugu/files-core/open-files'
 import { colorFor } from '@gugu/files-core/presence'
 import { errorFields } from './log.mjs'
 import { createRounds } from './rounds.mjs'
+import { publicationOperation, publicationRpc, publishDocument } from './publication.mjs'
 
 const NAME = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})@(0|[1-9]\d{0,8})$/i
 
@@ -169,11 +170,19 @@ export function createFileService(config, { log, pool: givenPool }) {
     read: (itemId) => {
       for (const [name, info] of docs) {
         const doc = info.itemId === itemId && !info.deleted ? hp().documents.get(name) : undefined
-        if (doc) return readText(doc, info.contentType)
+        if (doc) return readFileText(doc, info.contentType)
       }
       return pool
-        .query("SELECT inline_text FROM chat.workspace_items WHERE id = $1::uuid AND kind = 'document'", [itemId])
-        .then(({ rows }) => rows[0]?.inline_text ?? null)
+        .query("SELECT inline_text,ystate,content_type FROM chat.workspace_items WHERE id = $1::uuid AND kind = 'document'", [itemId])
+        .then(({ rows }) => {
+          const row = rows[0]
+          if (!row) return null
+          const doc = row.ystate ? new Y.Doc() : buildDoc(row.content_type, row.inline_text)
+          try {
+            if (row.ystate) Y.applyUpdate(doc, row.ystate)
+            return readFileText(doc, row.content_type)
+          } finally { doc.destroy() }
+        })
     },
     onError: (itemId, error) => {
       stats.versions.errors++
@@ -220,7 +229,7 @@ export function createFileService(config, { log, pool: givenPool }) {
       }
     }
     try {
-      rounds.before(info.itemId, { id: who.actorId, agent: who.actorId !== who.userId }, () => readText(document, info.contentType), changes)
+      rounds.before(info.itemId, { id: who.actorId, agent: who.actorId !== who.userId }, () => readFileText(document, info.contentType), changes)
     } catch (error) {
       stats.versions.errors++
       log.error('history: the round before this change could not be read', { itemId: info.itemId, ...errorFields(error) })
@@ -717,6 +726,19 @@ export function createFileService(config, { log, pool: givenPool }) {
       if (grant.kind !== 'document') throw new Denied('not-a-document', 409)
 
       if (!isEdit) {
+        if (url.searchParams.get('format') === 'file') {
+          const live = hp().documents.get(`${itemId}@${grant.epoch}`)
+          const { rows } = await pool.query('SELECT version,filename,inline_text,ystate FROM chat.workspace_items WHERE id=$1::uuid AND epoch=$2', [itemId, grant.epoch])
+          if (!rows[0]) throw new Denied('version-conflict', 409)
+          let copy
+          try {
+            if (!live) {
+              copy = rows[0].ystate ? new Y.Doc() : buildDoc(grant.contentType, rows[0].inline_text)
+              if (rows[0].ystate) Y.applyUpdate(copy, rows[0].ystate)
+            }
+            return send(res, 200, { text: readFileText(live ?? copy, grant.contentType), version: rows[0].version, name: rows[0].filename, contentType: grant.contentType })
+          } finally { copy?.destroy() }
+        }
         const live = hp().documents.get(`${itemId}@${grant.epoch}`)
         let text
         if (live) text = readText(live, grant.contentType, { pretty: true })
@@ -743,8 +765,9 @@ export function createFileService(config, { log, pool: givenPool }) {
         if (error instanceof Denied) throw error
         throw new Denied('bad-request', 400)
       }
-      if (typeof body?.old !== 'string' || typeof body?.new !== 'string') throw new Denied('bad-request', 400)
-      if (body.old === '') throw new Denied('empty-old', 400)
+      const publication = body?.publication ? publicationOperation(itemId, body, grant.actorId) : null
+      if (!publication && (typeof body?.old !== 'string' || typeof body?.new !== 'string')) throw new Denied('bad-request', 400)
+      if (!publication && body.old === '') throw new Denied('empty-old', 400)
 
       let g = grant
       let reauthorize = false
@@ -781,6 +804,14 @@ export function createFileService(config, { log, pool: givenPool }) {
               let edited = { status: 500, body: { error: 'internal' } }
               const info = docs.get(`${itemId}@${g.epoch}`)
               const live = hp().documents.get(`${itemId}@${g.epoch}`)
+              if (publication) {
+                if (!info || !live) throw new Denied('unavailable', 503)
+                await rounds.settled(itemId)
+                const response = await publishDocument({ pool, files: openFiles, document: live, name: `${itemId}@${g.epoch}`,
+                  itemId, identity, grant: g, operation: publication,
+                  commit: (operation) => publicationRpc(config, header(req.headers, 'authorization'), operation) })
+                return { status: 200, body: { result: response } }
+              }
               if (info && live) roundBefore(info, { actorId: g.actorId, userId: identity.userId }, live)
               await dc.transact((doc) => {
                 edited = applyEdit(doc, g.contentType, body.old, body.new, maxBytes)

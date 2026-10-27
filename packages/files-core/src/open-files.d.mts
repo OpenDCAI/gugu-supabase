@@ -47,6 +47,8 @@ export interface OpenFiles<Extra extends { contentType: string }> {
     size: { stateBytes: number; textBytes: number },
     persist: (fresh: Y.Doc) => Promise<number>,
   ): boolean
+  /** Drain existing providers and publish a typed copy as a new generation; failure resumes them. */
+  swapGeneration(name: string, document: any, persist: (fresh: Y.Doc) => Promise<number>): Promise<number>
   frozen(name: string): boolean
   settled(name: string): Promise<void>
   readonly hooks: {

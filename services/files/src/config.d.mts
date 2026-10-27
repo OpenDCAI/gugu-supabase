@@ -13,6 +13,8 @@ export interface FilesConfig {
   jwksUrl: string | null
   jwtSecret: Uint8Array | null
   jwtIssuer: string | null
+  supabaseUrl?: string | null
+  anonKey?: string | null
   timeoutMs: number
   debounceMs: number
   maxDebounceMs: number

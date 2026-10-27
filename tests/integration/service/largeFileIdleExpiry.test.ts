@@ -262,7 +262,7 @@ describe('non-project idle expiry, not quota eviction',()=>{
     const rules=[
       ['chat.file_transfer_download_as(jsonb,text,uuid)',true],
       ['chat.attachment_place_forward(text,text,text,text,boolean)',true],
-      ['chat.file_managed_upload_registered(text,text)',false],
+      ['chat.file_managed_upload_registered(text,text,jsonb)',false],
       ['chat.file_blob_register(text,text,text,bigint,text,integer,integer)',false],
       ['chat.file_blob_gc_claim(integer,integer)',false],
       ['chat.file_blob_gc_finish(uuid,uuid)',false],

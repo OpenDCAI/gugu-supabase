@@ -10,6 +10,7 @@ export function utf8Length(s: string): number
 export function parseJsonObject(text: string): Record<string, unknown>
 export function buildDoc(contentType: string, text: string | null): Y.Doc
 export function readText(doc: Y.Doc, contentType: string, options?: { pretty?: boolean }): string
+export function readFileText(doc: Y.Doc, contentType: string): string
 export function applyJson(ymap: Y.Map<unknown>, obj: Record<string, unknown>): void
 export function spliceText(ytext: Y.Text, next: string): void
 export function rebuildDoc(source: Y.Doc, contentType: string): Y.Doc

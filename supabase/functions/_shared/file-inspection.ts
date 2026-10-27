@@ -1,12 +1,13 @@
 import { createHash } from 'node:crypto'
 import { ObjectStorageError } from './object-storage.ts'
 
-/** Hash while consuming a bounded stream; retain only a sniffing prefix, not the entire file. */
-export async function inspectFileStream(body: ReadableStream<Uint8Array>, limit: number) {
+/** Hash the full bounded stream, retaining only the bytes the caller needs to inspect. */
+export async function inspectFileStream(body: ReadableStream<Uint8Array>, limit: number, retainBytes = 512) {
   if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('Invalid inspection limit')
+  if (!Number.isSafeInteger(retainBytes) || retainBytes < 512) throw new Error('Invalid inspection prefix size')
   const reader = body.getReader()
   const hash = createHash('sha256')
-  const prefix = new Uint8Array(512)
+  const prefix = new Uint8Array(Math.min(limit, retainBytes))
   let sizeBytes = 0
   try {
     for (;;) {

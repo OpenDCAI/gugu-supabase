@@ -45,6 +45,7 @@ JSON 的并发(F43,`src/concurrent.mjs`):map 的键是地址,两端同时第一�
 | `FILES_JWKS_URL` / `FILES_JWT_SECRET_FILE` | 至少一个 | GoTrue 的 JWKS;HS256 密钥文件(可缺) |
 | `FILES_JWT_ISSUER` | 不核 | 给了就核 `iss` |
 | `FILES_HOST` / `FILES_PORT` | `127.0.0.1` / `18320` | 对外口;容器里设 `0.0.0.0`,宿主只发布到回环 |
+| `FILES_SUPABASE_URL` / `FILES_SUPABASE_ANON_KEY` | unset | Public Data API origin and public API key for publishing document revisions with the original caller JWT. Never configure a service-role key here. |
 | `FILES_ADMIN_HOST` / `FILES_ADMIN_PORT` | `127.0.0.1` / `18321` | 内部口 |
 | `FILES_TIMEOUT_MS` | 30000 | 连接心跳超时 |
 | `FILES_DEBOUNCE_MS` / `FILES_MAX_DEBOUNCE_MS` | 1000 / 5000 | 存盘去抖 |

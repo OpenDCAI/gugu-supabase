@@ -81,24 +81,25 @@ export function createOpenFiles({ maxBytes, limits: rates, log, stats, compactio
   // ── 热压缩(F71) ───────────────────────────────────────────────────────────
   /**
    * @typedef {{ phase: 'draining' | 'swapping', waiting: Set<any>, timer: ReturnType<typeof setTimeout>, startedAt: number,
-   *   document: any, persist: (fresh: Y.Doc) => Promise<number>, done: Promise<void>, resolve: () => void }} Hot
+   *   document: any, persist: (fresh: Y.Doc) => Promise<number>, reason: 'compaction' | 'publication',
+   *   done: Promise<{ epoch?: number, error?: unknown }>, resolve: (result: { epoch?: number, error?: unknown }) => void }} Hot
    */
   const say = (/** @type {any} */ connection, /** @type {object} */ message) => connection.sendStateless(JSON.stringify(message))
-  const finish = (/** @type {{ hot: Hot | null }} */ info) => {
+  const finish = (/** @type {{ hot: Hot | null }} */ info, /** @type {{ epoch?: number, error?: unknown }} */ result) => {
     const hot = info.hot
     if (!hot) return
     clearTimeout(hot.timer)
     info.hot = null
-    hot.resolve()
+    hot.resolve(result)
   }
   /** 排空没完成(超时、存储写不进):这一轮作废,所有页面恢复发送。换代绝不在没排空时发生。 */
-  const abort = (/** @type {string} */ name, /** @type {any} */ info, /** @type {string} */ why) => {
+  const abort = (/** @type {string} */ name, /** @type {any} */ info, /** @type {unknown} */ error) => {
     const hot = info.hot
     if (!hot) return
     for (const c of hot.document.getConnections()) say(c, { t: 'resume' })
-    if (stats.compactAborted !== undefined) stats.compactAborted++
-    log.warn('hot compaction aborted', { doc: name, why, waiting: hot.waiting.size })
-    finish(info)
+    if (hot.reason === 'compaction' && stats.compactAborted !== undefined) stats.compactAborted++
+    log.warn('document generation aborted', { doc: name, reason: hot.reason, why: String(error), waiting: hot.waiting.size })
+    finish(info, { error })
   }
   /** 等排空的连接里去掉已经走了的;都排空了就换代。 */
   const drainedCheck = (/** @type {string} */ name) => {
@@ -123,18 +124,38 @@ export function createOpenFiles({ maxBytes, limits: rates, log, stats, compactio
       epoch = await hot.persist(fresh)
     } catch (error) {
       hot.phase = 'draining'
-      abort(name, info, `persist-failed: ${/** @type {Error} */ (error)?.message ?? error}`)
+      abort(name, info, error)
       return
     } finally {
       fresh.destroy()
     }
     info.compacted = true
-    if (stats.hotCompactions !== undefined) stats.hotCompactions++
+    if (hot.reason === 'compaction' && stats.hotCompactions !== undefined) stats.hotCompactions++
     const connections = hot.document.getConnections()
-    ;(log.info ?? log.warn)('hot-compacted', { doc: name, from: before, to: after, epoch, pausedMs: Date.now() - hot.startedAt, connections: connections.length })
+    ;(log.info ?? log.warn)('document-generation', { doc: name, reason: hot.reason, from: before, to: after, epoch, pausedMs: Date.now() - hot.startedAt, connections: connections.length })
     // 页面按这个原因重开到新代号,补上自己暂停期间的改动。
     for (const c of connections) c.close({ code: 4409, reason: `compacted:${epoch}` })
-    finish(info)
+    finish(info, { epoch })
+  }
+  /** Shared drain/freeze/swap for compaction and an authorized external publication. */
+  const startSwap = (/** @type {string} */ name, /** @type {any} */ document,
+    /** @type {(fresh: Y.Doc) => Promise<number>} */ persist, /** @type {'compaction' | 'publication'} */ reason) => {
+    const info = docs.get(name)
+    if (!info || info.hot || info.compacted || !compaction) throw new Error('generation-unavailable')
+    const connections = document.getConnections()
+    const now = Date.now()
+    info.hotAt = now
+    /** @type {(result: { epoch?: number, error?: unknown }) => void} */
+    let resolve = () => {}
+    const done = new Promise((r) => (resolve = r))
+    info.hot = {
+      phase: 'draining', waiting: new Set(connections),
+      timer: setTimeout(() => abort(name, info, new Error('drain-timeout')), compaction.drainMs),
+      startedAt: now, document, persist, reason, done, resolve,
+    }
+    for (const c of connections) say(c, { t: 'compact' })
+    drainedCheck(name)
+    return done
   }
   /** @type {WeakMap<object, ReturnType<typeof connectionLimits>>} */
   const limits = new WeakMap()
@@ -200,22 +221,14 @@ export function createOpenFiles({ maxBytes, limits: rates, log, stats, compactio
       const connections = document.getConnections()
       // 没人开着:卸载时的冷压缩会管。
       if (connections.length === 0) return false
-      info.hotAt = now
-      /** @type {() => void} */
-      let resolve = () => {}
-      const done = new Promise((r) => (resolve = /** @type {() => void} */ (r)))
-      info.hot = {
-        phase: 'draining',
-        waiting: new Set(connections),
-        timer: setTimeout(() => abort(name, info, 'drain-timeout'), compaction.drainMs),
-        startedAt: now,
-        document,
-        persist,
-        done,
-        resolve,
-      }
-      for (const c of connections) say(c, { t: 'compact' })
+      void startSwap(name, document, persist, 'compaction')
       return true
+    },
+    /** The callback works on a frozen, typed copy; a failed transaction resumes the unchanged live document. */
+    async swapGeneration(/** @type {string} */ name, /** @type {any} */ document, /** @type {(fresh: Y.Doc) => Promise<number>} */ persist) {
+      const result = await startSwap(name, document, persist, 'publication')
+      if (result.error) throw result.error
+      return /** @type {number} */ (result.epoch)
     },
     /** 这个文件正在换代:新的内容一律挡(agent 的 HTTP edit 要等 `settled` 以后在新代号上做)。 */
     frozen(/** @type {string} */ name) {
@@ -224,7 +237,7 @@ export function createOpenFiles({ maxBytes, limits: rates, log, stats, compactio
     },
     /** 这一轮热压缩结束(成或不成)。没有在压就立刻结束。 */
     settled(/** @type {string} */ name) {
-      return docs.get(name)?.hot?.done ?? Promise.resolve()
+      return docs.get(name)?.hot?.done.then(() => {}) ?? Promise.resolve()
     },
 
     /**

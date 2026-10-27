@@ -23,7 +23,7 @@ jobs:
         with:
           deno-version: v2.6.4
       - run: pnpm check:functions
-      - run: deno test --allow-env --allow-sys tests/deno/ossDirectUrl.test.ts
+      - run: deno test --allow-env --allow-sys tests/deno/ossDirectUrl.test.ts tests/deno/textFileIngest.test.ts
   integration:
     runs-on: ubuntu-24.04
     timeout-minutes: 25

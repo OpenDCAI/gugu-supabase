@@ -157,6 +157,7 @@ function fakes(opts: {
   const registerErrors = [...(opts.registerErrors ?? [])]
   const controls: {as:'user'|'service';fn:string;args:Record<string,unknown>}[]=[]
   const deps: AttachmentsDeps = {
+    textFiles: { maxBytes: 1024 * 1024, classify: () => ({ kind: 'file', why: 'binary fixture' }) },
     oss: OSS,
     cdn: CDN,
     fetch: async (url, init) => {
@@ -201,6 +202,7 @@ function fakes(opts: {
     },
     userRpc: async (fn, args) => {
       order.push('user:' + fn)
+      if (fn === 'workspace_get_as') return { data: [{ kind: 'file' }], error: null }
       if (fn==='file_managed_upload_prepare') { controls.push({as:'user',fn,args});return {data:{max_bytes:MAX_ATTACHMENT_BYTES,permit_seconds:900},error:null} }
       if (fn==='file_managed_upload_scope') { controls.push({as:'user',fn,args});return {data:null,error:null} }
       if (fn==='file_managed_upload_as') {

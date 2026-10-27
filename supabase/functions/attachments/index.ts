@@ -1,9 +1,12 @@
 // Community attachments: bytes in the project's Supabase Storage by default, or Alibaba Cloud OSS + CDN when every OSS
 // variable is set (see ../_shared/attachment-storage-config.ts). User/RLS and GC authorization are enforced below.
 import { createClient } from 'npm:@supabase/supabase-js@2.110.9'
+// One text rule for cloud uploads, local files and App data; no separately published package or copied type table.
+import { WORKSPACE_TEXT_MAX_BYTES, workspaceUploadKind } from 'https://raw.githubusercontent.com/OpenDCAI/gugu/fa542adee2b424a515b12a3e2b10bbf93c43d452/packages/core/src/shared/workspaceUpload.mjs'
 import {
   type AttachmentsDeps,
   handleCommit,
+  handleShare,
   handleSessionCommit,
   handleSessionUrls,
   handleSessionRevoke,
@@ -20,6 +23,7 @@ import { type AttachmentStorageConfig, attachmentStorageConfig, StorageConfigErr
 import { handleUsageImport,handleStorageInventory,handleFileResolve } from '../_shared/file-transfer-core.ts'
 import { handleProjectFiles } from '../_shared/project-file-transfer-core.ts'
 import { ossDirectSigner } from '../_shared/oss-direct-url.ts'
+import { handleDocumentImport } from '../_shared/document-import-core.ts'
 
 const env = (key: string): string => Deno.env.get(key)?.trim() ?? ''
 
@@ -74,6 +78,7 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
     return publicStorageUrl(data.signedUrl,url)
   }
   return {
+    textFiles: { maxBytes: WORKSPACE_TEXT_MAX_BYTES, classify: workspaceUploadKind },
     objects: storage.kind === 'oss'
       ? ossObjectStorage({ oss: storage.oss, cdn: storage.cdn, directSign:ossDirectSigner(storage.oss),fetch: (input, init) => fetch(input, init) })
       : supabaseObjectStorage({
@@ -90,6 +95,23 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
     userRpc: async (fn, args) => {
       const { data, error } = await asUser.rpc(fn, args)
       return { data, error: error ? { message: error.message, hint: error.hint, code: error.code } : null }
+    },
+    publishDocument: async (itemId, operation, actor) => {
+      const base = (env('GUGU_FILES_URL') || `${env('GUGU_PUBLIC_SUPABASE_URL') || url}/files`).replace(/\/$/, '')
+      const response = await fetch(`${base}/${encodeURIComponent(itemId)}/edit`, {
+        method: 'POST', headers: { Authorization: authorization, 'X-Gugu-As-Agent': actor, 'content-type': 'application/json' },
+        body: JSON.stringify({ publication: operation }), signal: AbortSignal.timeout(45_000),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Refusal(response.status, result.error ?? 'failed', result.message ?? 'Document publication failed')
+      return result.result
+    },
+    readDocument: async (itemId, actor) => {
+      const base = (env('GUGU_FILES_URL') || `${env('GUGU_PUBLIC_SUPABASE_URL') || url}/files`).replace(/\/$/, '')
+      const response = await fetch(`${base}/${encodeURIComponent(itemId)}?format=file`, { headers: { Authorization: authorization, 'X-Gugu-As-Agent': actor }, signal: AbortSignal.timeout(30_000) })
+      const result = await response.json()
+      if (!response.ok) throw new Refusal(response.status, result.error ?? 'failed', 'Could not export the document')
+      return result
     },
     serviceRpc: async (fn, args) => {
       const { data, error } = await asService.rpc(fn, args)
@@ -126,11 +148,12 @@ Deno.serve(async (request) => {
   const authorization = request.headers.get('Authorization') ?? ''
   try {
     const deps = depsFor(authorization, storage)
-    if (route === 'usage-import'||route==='storage-inventory') {
+    if (route === 'usage-import'||route==='storage-inventory'||route==='document-import') {
       if (!sameSecret(authorization.replace(/^Bearer\s+/i,''),env('SUPABASE_SERVICE_ROLE_KEY'))) {
         return json({error:'denied',message:'Usage ingestion is restricted to the service'},401)
       }
       const body=await request.json()
+      if (route === 'document-import') return json(await handleDocumentImport(deps, body))
       return json(await (route==='usage-import'?handleUsageImport(deps.serviceRpc,body):handleStorageInventory(deps.serviceRpc,body)))
     }
     if (route === 'gc') {
@@ -172,6 +195,8 @@ Deno.serve(async (request) => {
         return json(await handleSessionUrls(deps, who.user.id, body))
       case 'commit':
         return json({ message: await handleCommit(deps, who.user.id, body) })
+      case 'share':
+        return json({ message: await handleShare(deps, who.user.id, body) })
       case 'place':
         return json({ item: await handlePlace(deps, who.user.id, body) })
       case 'forward':

@@ -119,6 +119,15 @@ export function readText(doc, contentType, { pretty = false } = {}) {
   return pretty ? JSON.stringify(value, null, 2) : JSON.stringify(value)
 }
 
+/** File bytes retain the existing {$text: …} representation, so opening a copy keeps its text types. */
+export function readFileText(doc, contentType) {
+  if (!isJson(contentType)) return readText(doc, contentType)
+  const value = (v) => v instanceof Y.Text ? { $text: v.toString() }
+    : v instanceof Y.Map ? Object.fromEntries([...v.entries()].map(([k, x]) => [k, value(x)]))
+      : v instanceof Y.Array ? v.toArray().map(value) : v
+  return JSON.stringify(value(doc.getMap('root')))
+}
+
 /**
  * 在 ytext 的 at 处把 before 换成 after:只换真正不同的那一段 —— 前后相同的字不删不插,
  * 别人同时在旁边打的字、光标都不受影响;也不把一个代理对(emoji 等)从中间劈开。

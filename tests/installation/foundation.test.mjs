@@ -216,6 +216,15 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
         assert.equal((await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS allowed", ['chat.'+signature])).rows[0].allowed, false)
       }
     })
+    await t.test('workspace metadata is an object and its atomic helper has no API grants', async () => {
+      const column = (await db.query("SELECT is_nullable,column_default,data_type FROM information_schema.columns WHERE table_schema='chat' AND table_name='workspace_items' AND column_name='metadata'")).rows[0]
+      assert.equal(column.is_nullable, 'NO')
+      assert.equal(column.data_type, 'jsonb')
+      assert.equal(column.column_default, "'{}'::jsonb")
+      for (const role of ['anon','authenticated','service_role','gugu_files']) {
+        assert.equal((await db.query("SELECT has_function_privilege($1,'chat.workspace_set_metadata(uuid,text,jsonb)','EXECUTE') AS allowed", [role])).rows[0].allowed, false)
+      }
+    })
     await db.query('BEGIN')
     try {
       await db.query('CREATE FUNCTION public.foundation_acl_probe() RETURNS integer LANGUAGE sql AS $$SELECT 1$$')

@@ -16,7 +16,7 @@ BEGIN
            v_item.inline_text, v_item.epoch, v_item.parent_id, v_item.system_role, chat.workspace_path_of(v_item.id), v_item.updated_by, v_item.metadata;
 END;
 $$;
-REVOKE ALL ON FUNCTION chat.workspace_get_as(text, text) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION chat.workspace_get_as(text, text) FROM PUBLIC, anon, service_role;
 GRANT EXECUTE ON FUNCTION chat.workspace_get_as(text, text) TO authenticated;
 
 DROP FUNCTION chat.workspace_list_as(text, text, integer, integer, text, text, text, boolean);
@@ -70,7 +70,7 @@ BEGIN
      LIMIT p_limit;
 END;
 $$;
-REVOKE ALL ON FUNCTION chat.workspace_list_as(text, text, integer, integer, text, text, text, boolean) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION chat.workspace_list_as(text, text, integer, integer, text, text, text, boolean) FROM PUBLIC, anon, service_role;
 GRANT EXECUTE ON FUNCTION chat.workspace_list_as(text, text, integer, integer, text, text, text, boolean) TO authenticated;
 
 DROP FUNCTION chat.workspace_search(text, text[], integer, text);
@@ -101,7 +101,7 @@ BEGIN
      LIMIT COALESCE(p_limit, 50);
 END;
 $_$;
-REVOKE ALL ON FUNCTION chat.workspace_search(text, text[], integer, text) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION chat.workspace_search(text, text[], integer, text) FROM PUBLIC, anon, service_role;
 GRANT EXECUTE ON FUNCTION chat.workspace_search(text, text[], integer, text) TO authenticated;
 
 DROP FUNCTION chat.workspace_recent(integer, text);
@@ -128,7 +128,7 @@ BEGIN
      LIMIT COALESCE(p_limit, 50);
 END;
 $$;
-REVOKE ALL ON FUNCTION chat.workspace_recent(integer, text) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION chat.workspace_recent(integer, text) FROM PUBLIC, anon, service_role;
 GRANT EXECUTE ON FUNCTION chat.workspace_recent(integer, text) TO authenticated;
 
 -- A feature-specific door authorizes the actor before invoking the closed namespace helper.
@@ -156,7 +156,7 @@ BEGIN
     RETURN chat.workspace_set_metadata(v_item.id, 'app', p_app);
 END;
 $$;
-REVOKE ALL ON FUNCTION chat.workspace_mark_app_data_as(text,text,jsonb) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION chat.workspace_mark_app_data_as(text,text,jsonb) FROM PUBLIC, anon, service_role;
 GRANT EXECUTE ON FUNCTION chat.workspace_mark_app_data_as(text,text,jsonb) TO authenticated;
 
 -- The new entry and its marker commit together. Existing creation and naming rules stay single-source.
@@ -175,7 +175,7 @@ BEGIN
     RETURN to_jsonb(v_created) || jsonb_build_object('metadata',v_metadata);
 END;
 $$;
-REVOKE ALL ON FUNCTION chat.workspace_create_app_document_as(text,text,text,jsonb,text,text,text[],text) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION chat.workspace_create_app_document_as(text,text,text,jsonb,text,text,text[],text) FROM PUBLIC, anon, service_role;
 GRANT EXECUTE ON FUNCTION chat.workspace_create_app_document_as(text,text,text,jsonb,text,text,text[],text) TO authenticated;
 
 NOTIFY pgrst, 'reload schema';

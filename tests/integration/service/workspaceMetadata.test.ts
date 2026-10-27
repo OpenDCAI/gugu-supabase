@@ -116,6 +116,21 @@ describe('shared workspace metadata', () => {
 
 
 describe('explicit App data', () => {
+  it('keeps all six feature API functions closed to service_role', async () => {
+    for (const signature of [
+      'chat.workspace_get_as(text,text)',
+      'chat.workspace_list_as(text,text,integer,integer,text,text,text,boolean)',
+      'chat.workspace_search(text,text[],integer,text)',
+      'chat.workspace_recent(integer,text)',
+      'chat.workspace_mark_app_data_as(text,text,jsonb)',
+      'chat.workspace_create_app_document_as(text,text,text,jsonb,text,text,text[],text)',
+    ]) {
+      const { rows } = await database.query<{ allowed: boolean }>(
+        "SELECT has_function_privilege('service_role',$1,'EXECUTE') AS allowed", [signature])
+      expect(rows[0]!.allowed, signature).toBe(false)
+    }
+  })
+
   const mark = async (identity: unknown = app) => (await database.query<{ metadata: Record<string, unknown> }>(
     'SELECT chat.workspace_mark_app_data_as($1,$2,$3::jsonb) AS metadata', [item, owner, JSON.stringify(identity)])).rows[0]!.metadata
 

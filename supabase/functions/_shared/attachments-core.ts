@@ -31,6 +31,12 @@ export interface DbError {
 export type Rpc = (fn: string, args: Record<string, unknown>) => Promise<{ data: unknown; error: DbError | null }>
 
 export interface AttachmentsDeps {
+  /** The same classifier used for local files and App data, pinned by the Edge entry point. */
+  textFiles: {
+    maxBytes: number
+    classify(name: string, contentType: string | null, bytes: Uint8Array):
+      { kind: 'document'; text: string; contentType: string } | { kind: 'file'; why: string }
+  }
   objects?: AttachmentObjectStorage
   oss?: OssConfig
   cdn?: CdnConfig
@@ -47,6 +53,8 @@ export interface AttachmentsDeps {
   log(stage: string, extra?: Record<string, unknown>): void
   /** 撞上正在回收的 blob 时,重试之间等多久(测试里给 0)。 */
   retryDelayMs?: number
+  /** Drain/finish an inspected incoming replacement, using the original caller's authorization. */
+  documentReplacement?(item: string, actor: string, body: { key: string; expected: number; finish: boolean }): Promise<void>
 }
 
 export function objectStorage(deps: AttachmentsDeps): AttachmentObjectStorage {
@@ -108,6 +116,18 @@ export async function call(rpc: Rpc, fn: string, args: Record<string, unknown>):
   const { data, error } = await rpc(fn, args)
   if (error) throw refusalFromDb(error)
   return data
+}
+
+async function writeFile(deps: AttachmentsDeps, fn: string, args: Record<string, unknown>) {
+  const item = args.p_item_id as string | undefined
+  const actor = (args.p_sender_user_id ?? args.p_as_user_id) as string
+  const entry = item ? await call(deps.userRpc, 'workspace_get_as', { p_item_id: item, p_as_user_id: actor }) as { kind: string }[] : []
+  if (entry[0]?.kind !== 'document') return await call(deps.userRpc, fn, args)
+  if (!deps.documentReplacement) throw new Refusal(503, 'not_configured', 'Document replacement requires the file service')
+  const body = { key: args.p_staging_key as string, expected: args.p_expected_version as number, finish: false }
+  await deps.documentReplacement!(item!, actor, body)
+  try { return await call(deps.userRpc, fn, args) }
+  finally { await deps.documentReplacement!(item!, actor, { ...body, finish: true }).catch(() => deps.log('replacement_finish_failed', { item })) }
 }
 
 const str = (body: Record<string, unknown>, key: string, required = true): string | null => {
@@ -196,7 +216,7 @@ export async function handleCommit(deps: AttachmentsDeps, userId: string, body: 
       p_request_id: str(body, 'request_id'),
       p_caption: str(body, 'caption', false),
     }
-    await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false))
+    await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name')!)
     return await call(deps.userRpc, 'send_friend_file_as_owner', ownerArgs)
   }
   const caption = str(body, 'caption', false)
@@ -219,8 +239,8 @@ export async function handleCommit(deps: AttachmentsDeps, userId: string, body: 
     // 这份字节是群文件夹里一个文件的下一版(item_id + 它基于的 expected_version);同上,不给就不带这两个键。
     ...(itemId != null ? { p_item_id: itemId, p_expected_version: int(body, 'expected_version') } : {}),
   }
-  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false))
-  const rows = (await call(deps.userRpc, 'attachment_commit', commitArgs)) as unknown[]
+  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name')!)
+  const rows = (await writeFile(deps, 'attachment_commit', commitArgs)) as unknown[]
   return rows[0] ?? null
 }
 
@@ -246,8 +266,8 @@ export async function handlePlace(deps: AttachmentsDeps, userId: string, body: R
           p_source_message_ids: strings(body, 'source_message_ids'),
         },
       }
-  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false))
-  const rows = (await call(deps.userRpc, args.fn, args.args)) as unknown[]
+  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name', false) ?? '')
+  const rows = (await writeFile(deps, args.fn, args.args)) as unknown[]
   return rows[0] ?? null
 }
 
@@ -258,13 +278,13 @@ function stagingOf(body: Record<string, unknown>, userId: string): string {
 }
 
 /** 暂存的字节:算哈希、存进 OSS 的最终位置、登记成 blob(提交和放进文件夹共用)。暂存已经没了 ⇒ 交给库认上一次的登记。 */
-async function registerStaged(deps: AttachmentsDeps, userId: string, stagingKey: string, declaredType: string | null) {
+async function registerStaged(deps: AttachmentsDeps, userId: string, stagingKey: string, declaredType: string | null, fileName: string) {
   const permit=await call(deps.serviceRpc,'file_managed_upload_for',{p_key:stagingKey,p_user:userId}) as { max_bytes:number }
   const store=objectStorage(deps)
   let read: InspectedObject | null = null
   try {
     if (!store.inspect) throw new Refusal(503,'not_configured','Object inspection is not configured')
-    read=await store.inspect(stagingKey,Number(permit.max_bytes))
+    read=await store.inspect(stagingKey,Number(permit.max_bytes),deps.textFiles.maxBytes + 1)
   } catch (error) {
     if (error instanceof ObjectStorageError && error.status === 413) throw new Refusal(413, 'too_large', 'file exceeds its upload reservation')
     // 暂存对象没了:要么没传上来,要么上一次已经登记过、删了暂存(重试)—— 交给库认那次登记。
@@ -273,6 +293,10 @@ async function registerStaged(deps: AttachmentsDeps, userId: string, stagingKey:
   if (read) {
     const { bytes, etag, sizeBytes } = read
     if (sizeBytes === 0) throw new Refusal(400, 'invalid', 'an attachment has at least one byte')
+    if (bytes.length < Math.min(sizeBytes, deps.textFiles.maxBytes + 1)) {
+      throw new Refusal(503, 'not_configured', 'Object inspection did not retain the complete bounded text')
+    }
+    const document = deps.textFiles.classify(fileName, declaredType, bytes.subarray(0, deps.textFiles.maxBytes + 1))
     const sha = read.sha256
     const type = blobType(declaredType, bytes)
     const finalKey = `${sha.slice(0, 2)}/${sha}`
@@ -310,7 +334,8 @@ async function registerStaged(deps: AttachmentsDeps, userId: string, stagingKey:
     // 新建的一行:复制和登记之间,回收可能把同一个 sha 的旧 blob 整个收完(连对象一起删了)。这时上传登记已经引用着
     // 新的一行,回收领不走它 —— 删暂存之前看一眼,对象不在就再复制一次。
     if (created && !(await objectStorage(deps).exists(finalKey))) await copy()
-    await call(deps.serviceRpc,'file_managed_upload_registered',{p_key:stagingKey,p_user:userId})
+    await call(deps.serviceRpc,'file_managed_upload_registered',{p_key:stagingKey,p_user:userId,
+      p_document:document.kind === 'document' ? {text:document.text,content_type:document.contentType} : null})
     // Keep staging immutable until the permit closes: an early delete would let the same policy recreate it.
     // Cleanup retains the reservation until terminal upload evidence and physical deletion are confirmed.
   }
@@ -362,7 +387,7 @@ export async function handleForward(deps: AttachmentsDeps, userId: string, body:
     await call(deps.userRpc,'file_managed_upload_as',{p_id:messageId,p_chat:str(body,'chat_id'),
       p_as:str(body,'sender_user_id'),p_bytes:bytes.length})
     await objectStorage(deps).put(stagingKey, bytes)
-    await registerStaged(deps, userId, stagingKey, legacy.content_type)
+    await registerStaged(deps, userId, stagingKey, legacy.content_type, legacy.file_name)
     rows = await forward(stagingKey)
   }
   return rows[0] ?? null
@@ -425,7 +450,7 @@ export async function handleSessionCommit(deps: AttachmentsDeps, userId: string,
     p_sender_user_id: str(body, 'sender_user_id'), p_sender_session_id: str(body, 'sender_session_id'),
     p_recipient_user_ids: strings(body, 'recipient_user_ids'), p_file_name: str(body, 'file_name'),
   }
-  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false))
+  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name')!)
   const rows = await call(deps.userRpc, 'session_attachment_commit', args) as unknown[]
   if (!rows?.[0]) throw new Refusal(500, 'failed', 'session attachment commit returned no receipt')
   return rows[0]

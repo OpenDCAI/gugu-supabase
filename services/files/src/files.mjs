@@ -19,7 +19,7 @@
 //   · 通知:成员移出 ⇒ 断开这个人在该群所有文件上的连接(removed-from-group);文件删除 ⇒ 断开(deleted)、卸载、不再存盘。
 //     LISTEN 连接断过就把所有开着的连接重核一遍(断线期间的通知收不到)。
 //
-// 两个端口:对外口只有 /:id、/:id/edit 与 WebSocket(nginx 的 /files/ 剥掉前缀后转到这里);
+// 两个端口:对外口只有 /:id、/:id/edit、/:id/replace 与 WebSocket(nginx 的 /files/ 剥掉前缀后转到这里);
 // 内部口只有 /healthz 与 /stats,只绑回环、❌ 经 nginx 暴露。
 
 import http from 'node:http'
@@ -44,6 +44,7 @@ import { createOpenFiles, readHead } from '@gugu/files-core/open-files'
 import { colorFor } from '@gugu/files-core/presence'
 import { errorFields } from './log.mjs'
 import { createRounds } from './rounds.mjs'
+import { replaceIncoming } from './replacement.mjs'
 
 const NAME = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})@(0|[1-9]\d{0,8})$/i
 
@@ -699,7 +700,7 @@ export function createFileService(config, { log, pool: givenPool }) {
     for (const [name, value] of Object.entries(CORS_HEADERS)) res.setHeader(name, value)
     const url = new URL(req.url ?? '/', 'http://files')
     // 对外口没有前缀(nginx 剥掉了 /files/):路径段不是文件 id 的一律 404,不先验令牌 —— /stats、/healthz 在这里不存在。
-    const m = /^\/([^/]+)(\/edit)?$/.exec(url.pathname)
+    const m = /^\/([^/]+)(\/edit|\/replace)?$/.exec(url.pathname)
     if (!m || !isUuid(m[1])) return send(res, 404, { error: 'not-found' })
     // 预检不带凭证(浏览器就是这么发的),只回答「这条路能怎么调」。
     if (req.method === 'OPTIONS') {
@@ -743,6 +744,8 @@ export function createFileService(config, { log, pool: givenPool }) {
         if (error instanceof Denied) throw error
         throw new Denied('bad-request', 400)
       }
+      if (m[2] === '/replace') return send(res, 200, await replaceIncoming({ pool, files: openFiles, hp: hp(), itemId, identity, grant, body,
+        open: () => openDirect(itemId, grant, { userId: identity.userId, actorId: grant.actorId, chatId: grant.chatId, itemId, via: 'http' }) }))
       if (typeof body?.old !== 'string' || typeof body?.new !== 'string') throw new Denied('bad-request', 400)
       if (body.old === '') throw new Denied('empty-old', 400)
 

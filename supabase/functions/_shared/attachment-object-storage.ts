@@ -18,13 +18,13 @@ export function ossObjectStorage(config: { oss: OssConfig; cdn: CdnConfig; fetch
     },
     upload: (key, date, limits) => postObjectForm(oss, { key, date, maxBytes: limits?.maxBytes ?? MAX_ATTACHMENT_BYTES,
       expiresInSeconds: limits?.expiresSeconds }),
-    inspect: async (key, limit) => {
+    inspect: async (key, limit, retainBytes) => {
       const res=await ossRequest(oss,fetch,{method:'GET',key,internal:true,headers:{'Accept-Encoding':'identity'}})
       if (!res.ok || !res.body || !res.headers.get('etag')) {
         await res.body?.cancel()
         throw new ObjectStorageError(res.status,null,'Could not inspect the reserved object')
       }
-      return { ...await inspectFileStream(res.body,limit),etag:res.headers.get('etag') }
+      return { ...await inspectFileStream(res.body,limit,retainBytes),etag:res.headers.get('etag') }
     },
     read: (key, limit) => ossGetBytes(oss, fetch, key, { internal: true, limit }),
     promote: async (source, destination, read, headers) => {

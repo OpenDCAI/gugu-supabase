@@ -21,6 +21,18 @@ describe('streamed file inspection',()=>{
     await expect(inspectFileStream(input,10)).rejects.toMatchObject({status:413})
     expect(cancelled).toBe(true)
   })
+  it('retains a complete text or an over-limit sentinel without changing the full-stream hash',async()=>{
+    const text=new TextEncoder().encode('# 正文\n'+ 'abc\n'.repeat(500))
+    const stream=()=>new ReadableStream<Uint8Array>({start(c){
+      c.enqueue(text.subarray(0,511));c.enqueue(text.subarray(511,514));c.enqueue(text.subarray(514));c.close()
+    }})
+    const complete=await inspectFileStream(stream(),text.length,text.length+1)
+    expect(complete.bytes).toEqual(text)
+    const bounded=await inspectFileStream(stream(),text.length,1025)
+    expect(bounded.bytes).toEqual(text.subarray(0,1025))
+    expect(bounded.sha256).toBe(complete.sha256)
+    expect(bounded.sizeBytes).toBe(text.length)
+  })
 })
 describe('download input and signed throttles',()=>{
   it('metadata display calls only the read-only RPC and never invokes a provider or signing RPC',async()=>{

@@ -232,7 +232,7 @@ describe('按引用发(chat.attachment_share)', () => {
     expect(await itemCount(group)).toBe(before)
   })
 
-  it('另一个会话的文件(发送者读得到):这里的「附件」里一个指向同一份字节的条目;读不到的拒;文本文件、文件夹拒', async () => {
+  it('另一个会话的文件(发送者读得到):这里的「附件」里一个指向同一份字节的条目;读不到的拒;未发布字节的文本文件需先快照、文件夹拒', async () => {
     const source = await newGroup(owner, [member])
     const target = await newGroup(member, [owner])
     const sent = await commit(owner, (await upload(owner, `x-${randomUUID()}`, 'application/pdf', 400)).key, randomUUID(), source, owner, 'report.pdf')
@@ -248,7 +248,8 @@ describe('按引用发(chat.attachment_share)', () => {
     const { rows: [text] } = await database.query<{ id: string }>(
       `INSERT INTO chat.workspace_items (chat_id, kind, filename, content_type, inline_text, created_by) VALUES ($1,'document','notes.md','text/markdown','hi',$2) RETURNING id`, [source, owner])
     await asUser(owner)
-    expect(await fails(SHARE, [text!.id, null, randomUUID(), source, owner, []])).toMatch(/hint: file_place_invalid/)
+    // This document has no immutable byte version to share; document kind alone is no longer a refusal.
+    expect(await fails(SHARE, [text!.id, null, randomUUID(), source, owner, []])).toMatch(/hint: attachment_source_gone/)
     await asOwner()
   })
 })

@@ -17,7 +17,7 @@ export interface UploadPlan {
 export interface AttachmentObjectStorage {
   uploadBounds(requestedBytes: number, requestedSeconds: number): Promise<{maxBytes:number;expiresSeconds:number}>
   upload(key: string, now: Date, limits?: { maxBytes: number; expiresSeconds: number }): Promise<UploadPlan>
-  inspect?(key: string, limit: number): Promise<InspectedObject>
+  inspect?(key: string, limit: number, retainBytes?: number): Promise<InspectedObject>
   read(key: string, limit: number): Promise<ReadObject>
   promote(source: string, destination: string, read: ReadObject, headers: Record<string, string>): Promise<void>
   put(key: string, bytes: Uint8Array): Promise<void>

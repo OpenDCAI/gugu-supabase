@@ -313,7 +313,7 @@ describe('temporary generations reuse managed budgets and private key issuance',
     await service();await db.query('SELECT * FROM chat.file_blob_register($1,$2,$3,128,$4)',[owner,permit.staging_key,cipherSha,type])
     await db.query('SELECT chat.file_managed_upload_registered($1,$2)',[permit.staging_key,owner])
     await user();await db.query(POLICY,[group,device,'root',false,true,'7d'])
-    expect((await fails('SELECT * FROM chat.file_replace_as($1,$2,$3,1)',[permit.staging_key,item,owner])).hint).toBe('file_transfer_read_only')
+    const rejected=await fails('SELECT * FROM chat.file_replace_as($1,$2,$3,1)',[permit.staging_key,item,owner]);expect(rejected.hint,rejected.message).toBe('file_transfer_read_only')
     await db.query(POLICY,[group,device,'root',true,true,'7d'])
     await db.query('SELECT * FROM chat.file_replace_as($1,$2,$3,1)',[permit.staging_key,item,owner])
     expect(await resolve()).toMatchObject({status:'ready',source:'managed-object',version:2,sha256:cipherSha})

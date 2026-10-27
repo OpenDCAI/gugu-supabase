@@ -16,6 +16,7 @@
 | WebSocket `/` | 子协议 `['gugu-files.v1', 'bearer.<JWT>']`,服务端回应 `gugu-files.v1`。❌ 请求头、❌ query 里的令牌。代 agent 打开再带一项 `as.<agentId>`(和 HTTP 的 `X-Gugu-As-Agent` 同一个判据),一条连接一个身份 |
 | `GET /:id` | `Authorization: Bearer <JWT>`,agent 另带 `X-Gugu-As-Agent: <agentId>`。回 `{ epoch, contentType, text, live }`,JSON 缩进 2 格 |
 | `POST /:id/edit` | body `{ old, new }`:在当前内容里找唯一的 `old` 换掉。成功 `{ ok: true, epoch }` |
+| `POST /:id/replace` | Incoming inspected upload: `{ key, expected, finish }`. Prepare drains F71 providers and rejects a changed baseline with 409. Edge then runs the existing attachment/file transaction with the original JWT and always calls finish. |
 | `OPTIONS /:id`、`/:id/edit` | 浏览器的预检:204。这两条路的每个响应(含错误)都带 `Access-Control-Allow-Origin: *` 与允许的方法、请求头(`Authorization`、`Content-Type`、`X-Gugu-As-Agent`)—— 凭证只走 `Authorization` 不走 cookie,所以 `*` 放行也读不到别人的东西 |
 
 错误体都是 `{ error }`:`bad-credential` 401 · `not-found` 404(不是成员与不存在同一句)· `not-a-document` 409 ·
@@ -36,6 +37,10 @@ JSON 的并发(F43,`src/concurrent.mjs`):map 的键是地址,两端同时第一�
 否则离线重连时本地先判自己输了,自己那份在送到服务之前就被回收。计数在 `/stats` 的 `concurrentMerges`。
 
 内部口(只绑回环,❌ 经 nginx 暴露):`GET /healthz`(库与 LISTEN 都通才 200)、`GET /stats`。
+
+Replacement preparation is one-use state on the existing upload receipt, expires after 30 seconds, and needs no new file-service configuration.
+Finish cancels unused preparation under its receipt lock before resuming; success retires the old epoch through F71 so mounted editors reopen. An abandoned request releases after expiry, and late commits are rejected in the database.
+For the service-only `attachments/document-import` migration, a row refusal includes its item UUID in the error message; after confirming that row may be skipped, continue with `after=<that UUID>`.
 
 ## 配置(环境变量)
 

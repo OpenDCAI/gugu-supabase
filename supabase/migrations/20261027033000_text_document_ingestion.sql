@@ -194,7 +194,7 @@ $old$,
             content_type=CASE WHEN v_item.kind='document' THEN v_upload.document->>'content_type' ELSE v_blob.content_type END,
             size_bytes=CASE WHEN v_item.kind='document' THEN octet_length(v_upload.document->'prepared'->>'text') ELSE v_blob.size_bytes END WHERE w.id=v_item.id;
         UPDATE chat.file_blob_uploads u SET item_id=v_item.id,item_version=v_next,
-            document=CASE WHEN v_item.kind='document' THEN jsonb_set(u.document,'{prepared}',u.document->'prepared'-'state'-'text') ELSE u.document END WHERE u.staging_key=p_staging_key;
+            document=CASE WHEN v_item.kind='document' THEN jsonb_set(u.document,'{prepared}',(u.document->'prepared')-'state'-'text') ELSE u.document END WHERE u.staging_key=p_staging_key;
 $new$),
         ('chat.files_record_version(uuid,text,text)',
          $old$       AND v.n NOT IN (SELECT k.n FROM chat.workspace_item_versions k WHERE k.item_id = p_item_id ORDER BY k.n DESC LIMIT v_keep);

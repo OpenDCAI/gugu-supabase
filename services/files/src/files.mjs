@@ -19,7 +19,7 @@
 //   · 通知:成员移出 ⇒ 断开这个人在该群所有文件上的连接(removed-from-group);文件删除 ⇒ 断开(deleted)、卸载、不再存盘。
 //     LISTEN 连接断过就把所有开着的连接重核一遍(断线期间的通知收不到)。
 //
-// 两个端口:对外口只有 /:id、/:id/edit 与 WebSocket(nginx 的 /files/ 剥掉前缀后转到这里);
+// 两个端口:对外口只有 /:id、/:id/edit、/:id/replace 与 WebSocket(nginx 的 /files/ 剥掉前缀后转到这里);
 // 内部口只有 /healthz 与 /stats,只绑回环、❌ 经 nginx 暴露。
 
 import http from 'node:http'

@@ -199,6 +199,29 @@ describe('durable assistant panel contract', () => {
     expect((await db.query<{ allowed: boolean }>("SELECT has_function_privilege('authenticated','identity.assistant_panel_lock(text)','EXECUTE') AS allowed")).rows[0]!.allowed).toBe(false)
   })
 
+  it('a published body is never a legacy document import candidate; the guard and the importer read one predicate', async () => {
+    const candidates = async () => {
+      const ids: string[] = []
+      for (let after: string | null = null; ;) {
+        const rows = (await db.query<{ id: string }>('SELECT id FROM chat.workspace_document_import_candidates($1,20)',[after])).rows
+        ids.push(...rows.map((row) => row.id))
+        if (rows.length < 20) return ids
+        after = rows.at(-1)!.id
+      }
+    }
+    const pendingBody = await file(), appliedBody = await file(), ordinaryFile = await file()
+    const applied = await commit({ domain: 'memory',key: 'applied',data: { relativePath: 'applied.md' },body: appliedBody.id,hash: appliedBody.hash })
+    await ack(applied.operationId)
+    const saved = await commit({ domain: 'memory',key: 'pending',data: { relativePath: 'pending.md' },body: pendingBody.id,hash: pendingBody.hash })
+    const offered = await candidates()
+    expect(offered).toContain(ordinaryFile.id)
+    expect(offered).not.toContain(pendingBody.id)
+    expect(offered).not.toContain(appliedBody.id)
+    // What the importer would have done to it: the guard refuses, as before.
+    await failure(() => db.query('SELECT chat.workspace_import_document($1,1,$2,$3)',[appliedBody.id,appliedBody.blob,{ text: 'x',content_type: 'text/plain' }]),/immutable/)
+    await ack(saved.operationId)
+  })
+
   it('accepts only content-addressed snapshots in the exact owner-assistant DM', async () => {
     const body = await file()
     const saved = await commit({ domain: 'memory',key: 'note',data: { title: 'A note',relativePath: 'note.md' },body: body.id,hash: body.hash })

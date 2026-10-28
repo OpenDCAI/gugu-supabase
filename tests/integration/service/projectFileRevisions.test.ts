@@ -12,6 +12,12 @@ async function user(id=owner) {
   await db.query("SELECT set_config('request.jwt.claims',$1,true)",[JSON.stringify({sub:id,role:'authenticated'})])
 }
 async function service() { await db.query('RESET ROLE') }
+/** The host account's one global file storage setting, which every project chat on its machines follows. */
+async function storage(values:Record<string,unknown>) {
+  await user()
+  await db.query(`INSERT INTO identity.user_settings(user_id,scope,config) VALUES($1,'user',jsonb_build_object('file_storage',$2::jsonb))
+    ON CONFLICT(user_id,scope) DO UPDATE SET config=identity.user_settings.config||EXCLUDED.config`,[owner,values])
+}
 async function fails(sql:string,args:unknown[]=[]) {
   await db.query('SAVEPOINT refused')
   try { await db.query(sql,args) } catch(error) {
@@ -48,18 +54,22 @@ beforeEach(async()=>{
 afterEach(async()=>{await db.query('ROLLBACK')})
 
 describe('project local metadata, exact references and read-only host ownership',()=>{
-  it('keeps defaults local and exposes policy only through the existing membership and actor gates',async()=>{
+  it('keeps defaults local and exposes the host account policy only through the existing membership and actor gates',async()=>{
     await user(member)
     expect((await db.query('SELECT chat.file_project_policy_for($1,$2) AS r',[group,member])).rows[0].r)
-      .toMatchObject({proactive_upload:false,temporary_transfer:true,retention:'7d',host_device_id:device,host_project_id:'root'})
+      .toMatchObject({proactive_upload:false,temporary_transfer:true,retention:'7d',image_retention:'7d',host_device_id:device,host_project_id:'root',host_account_id:owner})
     expect((await fails(POLICY,[group,device,'root',true,true,'1d'])).hint).toBe('file_transfer_denied')
     expect((await fails('SELECT chat.file_project_policy_for($1,$2)',[group,owner])).message).toMatch(/Not allowed to act/)
     await user(outsider)
     expect((await fails('SELECT chat.file_project_policy_for($1,$2)',[group,outsider])).message).toBeTruthy()
+    await storage({retention:'1d',image_retention:'30d'})
+    await user(member)
+    expect((await db.query('SELECT chat.file_project_policy_for($1,$2) AS r',[group,member])).rows[0].r)
+      .toMatchObject({proactive_upload:false,temporary_transfer:true,retention:'1d',image_retention:'30d',host_device_id:device})
+    // Existing clients still bind through the old RPC; its policy arguments no longer change the account setting.
     await user()
-    for(const retention of ['read-once','1d','7d','30d']) expect((await db.query(POLICY,[group,device,'root',false,false,retention])).rows[0].r.retention).toBe(retention)
-    expect((await fails(POLICY,[group,device,'root',false,true,'forever'])).code).toBe('23514')
-    expect((await fails(POLICY,[group,device,'root',null,true,'7d'])).code).toBe('23502')
+    expect((await db.query(POLICY,[group,device,'root',true,false,'read-once'])).rows[0].r)
+      .toMatchObject({proactive_upload:false,temporary_transfer:true,retention:'1d',image_retention:'30d'})
     expect((await fails(POLICY,[group,otherDevice,'root',false,true,'7d'])).hint).toBe('file_transfer_denied')
     expect((await fails(POLICY,[group,device,'unbound',false,true,'7d'])).hint).toBe('file_transfer_denied')
   })
@@ -280,7 +290,7 @@ describe('temporary generations reuse managed budgets and private key issuance',
     expect((await db.query('SELECT chat.file_temporary_request($1,$2,$3) AS r',[{item_id:item},outsider,randomUUID()])).rows[0].r).toEqual({status:'gone'})
     await user()
     expect((await fails('SELECT chat.file_managed_upload_as($1,$2,$3,128)',[randomUUID(),group,owner])).hint).toBe('file_transfer_denied')
-    await db.query(POLICY,[group,device,'root',true,true,'7d'])
+    await storage({proactive_upload:true})
     expect((await db.query('SELECT chat.file_managed_upload_as($1,$2,$3,128) AS r',[randomUUID(),group,owner])).rows[0].r.max_bytes).toBe(128)
     expect((await request()).transfer_status).toBe('requested')
   })
@@ -320,13 +330,13 @@ describe('temporary generations reuse managed budgets and private key issuance',
     expect((await db.query('SELECT bucket_id,size_bytes FROM chat.file_blobs WHERE id=(SELECT blob_id FROM chat.file_temporary_transfers WHERE id=$1)',[id])).rows[0]).toEqual({bucket_id:'temporary',size_bytes:'128'})
   })
   it('lets only the host publish a managed next version through the existing upload path when cloud upload is enabled',async()=>{
-    await user();await db.query(POLICY,[group,device,'root',true,true,'7d'])
+    await storage({proactive_upload:true})
     const permit=(await db.query('SELECT chat.file_managed_upload_as($1,$2,$3,128) AS r',[randomUUID(),group,owner])).rows[0].r
     await service();await db.query('SELECT * FROM chat.file_blob_register($1,$2,$3,128,$4)',[owner,permit.staging_key,cipherSha,type])
     await db.query('SELECT chat.file_managed_upload_registered($1,$2)',[permit.staging_key,owner])
-    await user();await db.query(POLICY,[group,device,'root',false,true,'7d'])
+    await storage({proactive_upload:false})
     const rejected=await fails('SELECT * FROM chat.file_replace_as($1,$2,$3,1)',[permit.staging_key,item,owner]);expect(rejected.hint,rejected.message).toBe('file_transfer_read_only')
-    await db.query(POLICY,[group,device,'root',true,true,'7d'])
+    await storage({proactive_upload:true})
     await db.query('SELECT * FROM chat.file_replace_as($1,$2,$3,1)',[permit.staging_key,item,owner])
     expect(await resolve()).toMatchObject({status:'ready',source:'managed-object',version:2,sha256:cipherSha})
     expect(await resolve({item_id:item,version:1})).toMatchObject({source:'local',sha256:sha})
@@ -399,7 +409,7 @@ describe('temporary generations reuse managed budgets and private key issuance',
     expect((await fails('SELECT chat.file_temporary_accept($1,128)',[transfer])).hint).toBe('file_transfer_denied')
   })
   it('makes read-once generations private to one download and treats completion as retention only',async()=>{
-    await user();await db.query(POLICY,[group,device,'root',false,true,'read-once'])
+    await storage({retention:'read-once'})
     await ready();const id=randomUUID(),row=await download(id)
     expect(row.status).toBe('ready');expect((await download()).status).toBe('pending')
     expect(await getKey(id)).toBe(key)
@@ -427,7 +437,7 @@ describe('temporary generations reuse managed budgets and private key issuance',
     if(reason==='removal') await db.query('DELETE FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2',[group,member])
     if(reason==='unbinding') await db.query('UPDATE identity.device_projects SET chat_id=NULL WHERE device_id=$1',[device])
     if(reason==='new-version') { await user();await publish({8:1,4:'ef'.repeat(32)}) }
-    if(reason==='policy') { await user();await db.query(POLICY,[group,device,'root',false,false,'7d']) }
+    if(reason==='policy') await storage({temporary_transfer:false})
     expect(await expireTemporary()).toBe(1)
     expect(await generation(transfer)).toMatchObject({state:'retired',data_key:null})
     expect((await db.query('SELECT blob_id FROM chat.file_blob_gc WHERE blob_id=$1',[before.blob_id])).rows).toHaveLength(1)

@@ -40,7 +40,7 @@ JSON 的并发(F43,`src/concurrent.mjs`):map 的键是地址,两端同时第一�
 
 Replacement preparation is one-use state on the existing upload receipt, expires after 30 seconds, and needs no new file-service configuration.
 Finish cancels unused preparation under its receipt lock before resuming; success retires the old epoch through F71 so mounted editors reopen. An abandoned request releases after expiry, and late commits are rejected in the database.
-For the service-only `attachments/document-import` migration, a row refusal includes its item UUID in the error message; after confirming that row may be skipped, continue with `after=<that UUID>`.
+For the service-only `attachments/document-import` migration, a row whose stored bytes cannot be read or do not match its version (`source_unavailable`, `source_changed`) is returned in `skipped` with its item UUID and passed over; any other refusal stops the batch with the item UUID in its message. `dry_run: true` reads and classifies the same rows and lists each decision in `items` without writing. Published assistant panel bodies are never candidates.
 
 ## 配置(环境变量)
 

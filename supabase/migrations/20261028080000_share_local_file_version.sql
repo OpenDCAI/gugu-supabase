@@ -42,4 +42,7 @@ $new$)
         EXECUTE replace(definition, r.old_body, r.new_body);
     END LOOP;
 END $share_local$;
+-- Redefining it this way leaves it without its grant, as the earlier patches of it found: give it back.
+REVOKE ALL ON FUNCTION chat.attachment_place_share(uuid, integer, text, text, text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION chat.attachment_place_share(uuid, integer, text, text, text) TO authenticated;
 NOTIFY pgrst, 'reload schema';

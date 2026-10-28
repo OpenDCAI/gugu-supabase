@@ -93,6 +93,46 @@ afterEach(async () => {
 })
 
 describe('reversible agent session archival', () => {
+  it.each([
+    { mode: 'passive', route: 'mention', admitted: true },
+    { mode: 'active', route: 'mention', admitted: true },
+    { mode: 'passive', route: 'reply', admitted: true },
+    { mode: 'active', route: 'reply', admitted: true },
+    { mode: 'passive', route: 'open', admitted: false },
+    { mode: 'active', route: 'open', admitted: true },
+    { mode: 'active', route: 'other-mention', admitted: false },
+    { mode: 'active', route: 'other-reply', admitted: false },
+  ])('preserves unarchived admission: $mode / $route', async ({ mode, route, admitted }) => {
+    await db.query('UPDATE chat.chat_members SET listen_mode=$3 WHERE chat_id=$1 AND user_id=$2', [group, agent, mode])
+    const reply = route.endsWith('reply') ? await send([], { sender: route === 'reply' ? agent : peer }) : null
+    const message = randomUUID()
+    const to = route === 'mention' ? [agent] : route === 'other-mention' ? [peer] : null
+    await db.query(`INSERT INTO chat.messages(id,chat_id,sender_user_id,content,to_user_ids,reply_to_message_id)
+      VALUES($1,$2,$3,'Unarchived routing regression',$4,$5)`, [message, group, outsider, to, reply])
+    expect(await facts(message)).toEqual({ wake: admitted, command: admitted, blocked: false, receipt: false })
+    expect((await pull()).includes(message)).toBe(admitted)
+  })
+
+  it('measures archival for an Agent in a 300-member group', async () => {
+    await db.query('UPDATE chat.chats SET max_members=300 WHERE id=$1', [group])
+    const humans = (await db.query(`INSERT INTO identity.users(id,type,display_name)
+      SELECT gen_random_uuid()::text,'human','Large group fixture' FROM generate_series(1,296) RETURNING id`)).rows.map(({ id }) => id)
+    // Construct the large, already-existing group without timing 296 joins and
+    // their O(n²) unrelated revision fanouts. This setting is transaction-local
+    // and is restored before the real archival RPC (including all its triggers).
+    await db.query('SET LOCAL session_replication_role=replica')
+    await db.query(`INSERT INTO chat.chat_members(chat_id,user_id,role,joined_ingest_seq,inbox_published_at)
+      SELECT $1,id,'member',0,now() FROM unnest($2::text[]) AS id`, [group, humans])
+    await db.query('SET LOCAL session_replication_role=origin')
+    expect((await db.query('SELECT count(*)::int AS n FROM chat.chat_members WHERE chat_id=$1', [group])).rows[0].n).toBe(300)
+    const start = performance.now()
+    await archive()
+    const elapsed = performance.now() - start
+    console.log(`Session archival, 300-member group: ${elapsed.toFixed(2)} ms (RPC wall time; fixture setup excluded)`)
+    expect((await db.query('SELECT count(*)::int AS n FROM chat.chat_members WHERE chat_id=$1', [group])).rows[0].n).toBe(300)
+    expect((await db.query('SELECT session_archived_at FROM identity.users WHERE id=$1', [agent])).rows[0].session_archived_at).not.toBeNull()
+  })
+
   it('retains the same identity, name, seats and historical sender through archive and restore', async () => {
     const authored = await send([], { sender: agent })
     const before = await db.query('SELECT * FROM chat.chat_members WHERE chat_id=$1 ORDER BY user_id', [group])

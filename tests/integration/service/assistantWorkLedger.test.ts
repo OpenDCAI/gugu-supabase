@@ -246,6 +246,18 @@ describe('account work ledger and its only delivery outbox', () => {
     expect((await as(owner,()=>call<{items:unknown[]}>('assistant_work_notice_wake_claim',[workerInstance,20,60]))).items).toHaveLength(0)
   })
 
+  it('reopens a finished executor when the coordinator dispatches to it again, then settles on its next result (#615)',async()=>{
+    const id=randomUUID();await commit(id,[dispatch()],task())
+    expect(await commit(id,[report('completed')],null,randomUUID(),workerInstance)).toMatchObject({outcome:'completed'})
+    expect(await commit(id,[dispatch({content:'再列下载文件夹'})])).toMatchObject({outcome:'active'})
+    const reopened=(await history(id)).work as Work & {executor_outcomes:Record<string,unknown>}
+    expect(reopened.outcome).toBe('active')
+    expect(reopened.executor_outcomes).not.toHaveProperty(worker)
+    // A different result this time is its answer to the follow-up, not a contradiction of the first one.
+    expect(await commit(id,[report('failed')],null,randomUUID(),workerInstance)).toMatchObject({outcome:'failed'})
+    expect((await history(id)).events.filter(event=>event.kind==='dispatch')).toHaveLength(2)
+  })
+
   it('closes stale imported work without a result and allows a late genuine result to prevail',async()=>{
     const id=randomUUID(),event=dispatch(),input={...task(),coordinator_device_id:home}
     await as(owner,()=>call('assistant_work_import',[assistant,workerInstance,id,JSON.stringify(input),JSON.stringify([{...event,occurred_at:'2026-10-20T08:00:00Z',receipt_kind:'received'}])]))

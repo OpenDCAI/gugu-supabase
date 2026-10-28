@@ -179,6 +179,30 @@ describe('temporary and kept copies on the reference ledger',()=>{
     await service()
     expect(row).toEqual({expires_at:null,is_mine:null})
   })
+  it('lists each file\'s storage class, reclaimed copy, uploader and the machine holding a project file',async()=>{
+    const temporary=await send(plain), kept=await send(plain), image=await send(plain,'image/png'), gone=await send(plain)
+    await mark([{message_id:temporary.message}],'temporary')
+    await mark([{message_id:kept.message}],'permanent')
+    await mark([{message_id:gone.message}],'release')
+    const columns='storage_class,copy_expired_at,copy_account_id,host_device_id'
+    await user(host)
+    const rows=(await db.query(`SELECT id,${columns} FROM chat.workspace_list_as($1,$2)`,[plain,host])).rows
+    await service()
+    const of=(item:string)=>rows.find((row)=>row.id===item)
+    expect(of(temporary.item)).toMatchObject({storage_class:'temporary',copy_expired_at:null,copy_account_id:member,host_device_id:null})
+    expect(of(kept.item)).toMatchObject({storage_class:'kept',copy_expired_at:null,copy_account_id:member})
+    expect(of(image.item)).toMatchObject({storage_class:'image',copy_account_id:member})
+    // A reclaimed copy has no class; when it went and whose it was stay.
+    expect(of(gone.item)).toMatchObject({storage_class:null,copy_account_id:member})
+    expect(of(gone.item).copy_expired_at).not.toBeNull()
+    // A project file kept on its machine: no cloud copy, only the machine.
+    await user(host)
+    await db.query("SELECT chat.file_project_policy_as($1,$2,'root',false,true,'7d')",[project,device])
+    const local=(await db.query("SELECT chat.file_device_publish($1,$2,$3,'b.bin',$4,9,'b.bin','application/octet-stream',NULL,NULL) AS r",[randomUUID(),project,device,'cd'.repeat(32)])).rows[0].r
+    const row=(await db.query(`SELECT ${columns} FROM chat.workspace_list_as($1,$2) WHERE id=$3`,[project,host,local.item_id])).rows[0]
+    await service()
+    expect(row).toEqual({storage_class:null,copy_expired_at:null,copy_account_id:null,host_device_id:device})
+  })
   it('accepts temporary_retention among the account\'s known values only',async()=>{
     await user(host)
     for (const value of [{temporary_retention:'read-once'},{temporary_retention:'2d'},{temporary_retention:7}]) {

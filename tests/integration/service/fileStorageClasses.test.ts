@@ -161,6 +161,24 @@ describe('temporary and kept copies on the reference ledger',()=>{
     await service()
     expect((await overview(host)).machines).toEqual([{device_id:device,label:'Studio Mac',files:1,bytes:123,temporary_copy_bytes:0}])
   })
+  it('lists each file\'s expiry and whether the reader uploaded it, as the uploader\'s mark decides',async()=>{
+    const note=await send(plain)
+    await mark([{message_id:note.message}],'temporary')
+    const list=async(as:string)=>{ await user(as); const r=(await db.query('SELECT id,expires_at,is_mine,filename FROM chat.workspace_list_as($1,$2)',[plain,as])).rows; await service(); return r }
+    const mine=(await list(member)).find((row)=>row.id===note.item)
+    expect(mine.is_mine).toBe(true)
+    expect(Date.parse(mine.expires_at)-Date.now()).toBeGreaterThan(6*DAY*1000)
+    const theirs=(await list(host)).find((row)=>row.id===note.item)
+    expect(theirs).toMatchObject({is_mine:false})
+    expect(theirs.expires_at).toEqual(mine.expires_at)
+    // A file with no cloud copy has neither.
+    await user(host)
+    await db.query("SELECT chat.file_project_policy_as($1,$2,'root',false,true,'7d')",[project,device])
+    const local=(await db.query("SELECT chat.file_device_publish($1,$2,$3,'a.bin',$4,9,'a.bin','application/octet-stream',NULL,NULL) AS r",[randomUUID(),project,device,'ab'.repeat(32)])).rows[0].r
+    const row=(await db.query('SELECT expires_at,is_mine FROM chat.workspace_list_as($1,$2) WHERE id=$3',[project,host,local.item_id])).rows[0]
+    await service()
+    expect(row).toEqual({expires_at:null,is_mine:null})
+  })
   it('accepts temporary_retention among the account\'s known values only',async()=>{
     await user(host)
     for (const value of [{temporary_retention:'read-once'},{temporary_retention:'2d'},{temporary_retention:7}]) {

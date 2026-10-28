@@ -251,6 +251,27 @@ describe('project local metadata, exact references and read-only host ownership'
       .toEqual([[1,'file.bin',sha],[2,'file.bin','cd'.repeat(32)],[3,'renamed.bin','cd'.repeat(32)]])
     expect(await resolve()).toMatchObject({version:3,file_name:'renamed.bin',sha256:'cd'.repeat(32)})
   })
+  // "itinerary.md has no version 1 any more (it is at version 1)": a project file kept on its host has no cloud blob behind
+  // its versions, and sending it by reference (message_send_file with file) took that for a version that was gone.
+  it('sends a local file by reference at the version its link names, and keeps it in its own chat',async()=>{
+    const SHARE='SELECT * FROM chat.attachment_share($1,$2,$3,$4,$5)'
+    await publish();await user()
+    expect((await db.query(SHARE,[item,1,randomUUID(),group,owner])).rows[0]).toMatchObject({file_item_id:item,file_version:1})
+    expect((await db.query(SHARE,[item,null,randomUUID(),group,owner])).rows[0]).toMatchObject({file_item_id:item,file_version:1})
+    // The link's version is the current one: its next version publishes from it, and both stay sendable.
+    await publish({3:'data/new.bin',4:'cd'.repeat(32),5:456,8:1})
+    const sent=(await db.query(SHARE,[item,2,randomUUID(),group,owner])).rows[0]
+    expect(sent).toMatchObject({file_item_id:item,file_version:2})
+    expect(sent.content).toContain('[Size] 456')
+    expect((await db.query(SHARE,[item,1,randomUUID(),group,owner])).rows[0]).toMatchObject({file_version:1})
+    expect(await fails(SHARE,[item,3,randomUUID(),group,owner])).toMatchObject({hint:'attachment_source_gone',message:'file.bin has no version 3 yet (it is at version 2)'})
+    // Another chat: there are no bytes in the cloud to place there.
+    const other=randomUUID();await service()
+    await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','elsewhere',$2)",[other,owner])
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner')",[other,owner])
+    await user()
+    expect(await fails(SHARE,[item,2,randomUUID(),other,owner])).toMatchObject({hint:'file_transfer_read_only',message:'file.bin is kept on its host computer: it can be sent only in its own chat'})
+  })
   it('invalidates an unbound project even if its policy row survives; removal cascades policy but preserves a tombstone',async()=>{
     await publish();await service()
     await db.query('UPDATE identity.device_projects SET chat_id=NULL WHERE device_id=$1',[device])

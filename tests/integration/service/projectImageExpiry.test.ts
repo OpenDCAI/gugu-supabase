@@ -142,6 +142,6 @@ describe('project chat images expire on the host account\'s global setting',()=>
     await service()
     await storage({proactive_upload:false,temporary_transfer:false,retention:'read-once',image_retention:'30d'})
     expect((await db.query('SELECT chat.file_storage_policy($1) AS p',[project])).rows[0].p)
-      .toEqual({proactive_upload:false,temporary_transfer:false,retention:'read-once',image_retention:'30d'})
+      .toEqual({proactive_upload:false,temporary_transfer:false,retention:'read-once',image_retention:'30d',temporary_retention:'7d'})
   })
 })

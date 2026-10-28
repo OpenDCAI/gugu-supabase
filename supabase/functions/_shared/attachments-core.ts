@@ -205,6 +205,7 @@ function blobType(declared: string | null, bytes: Uint8Array) {
 
 export async function handleCommit(deps: AttachmentsDeps, userId: string, body: Record<string, unknown>) {
   const stagingKey = stagingOf(body, userId)
+  const keep = keepOf(body)
   await call(deps.userRpc,'file_managed_upload_scope',{p_key:stagingKey,p_as:str(body,body.friend_user_id?'agent_user_id':'sender_user_id'),
     p_chat:str(body,'chat_id',false),p_item:null})
   // agent 代主人把文件发给主人的好友(message_send_file_as_owner):库里那一半照 send_friend_message_as_owner 的规矩。
@@ -242,7 +243,25 @@ export async function handleCommit(deps: AttachmentsDeps, userId: string, body: 
   }
   await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name')!)
   const rows = (await writeFile(deps, 'attachment_commit', commitArgs)) as unknown[]
-  return rows[0] ?? null
+  const message = rows[0] as { id?: string } | undefined
+  if (message?.id) await keepAs(deps, keep, { message_id: message.id }, commitArgs.p_sender_user_id)
+  return message ?? null
+}
+
+/**
+ * How long the copy that just joined a chat stays (the uploader's 「临时 / 保留」): the same mark the person makes later, applied
+ * as they upload. Not given: unchanged. A failure is the request's: the commit is idempotent, so the retry marks it again.
+ */
+async function keepAs(deps: AttachmentsDeps, keep: Keep, ref: { message_id: string } | { item_id: string }, as: string | null) {
+  if (keep) await call(deps.userRpc, 'file_storage_mark_as', { p_refs: [ref], p_action: keep, p_as: as })
+}
+
+type Keep = 'temporary' | 'permanent' | null
+/** Read before anything is stored: a wrong value refuses the request, never a file sent without its class. */
+function keepOf(body: Record<string, unknown>): Keep {
+  const keep = str(body, 'keep', false)
+  if (keep != null && keep !== 'temporary' && keep !== 'permanent') throw new Refusal(400, 'invalid', 'keep is temporary or permanent')
+  return keep as Keep
 }
 
 // ── place ────────────────────────────────────────────────────────────────────────
@@ -250,6 +269,7 @@ export async function handleCommit(deps: AttachmentsDeps, userId: string, body: 
 // expected_version 对不上就拒);不给 ⇒ 在 folder(不给 = 根)里建一个文件。字节的登记和提交是同一步。
 export async function handlePlace(deps: AttachmentsDeps, userId: string, body: Record<string, unknown>) {
   const stagingKey = stagingOf(body, userId)
+  const keep = keepOf(body)
   const itemId = str(body, 'item_id', false)
   // 以谁的身份写:调用者自己,或它自己的 agent(as_user_id;库照 *_as 的规矩核)。
   const as = str(body, 'as_user_id', false) ?? userId
@@ -269,7 +289,9 @@ export async function handlePlace(deps: AttachmentsDeps, userId: string, body: R
       }
   await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name', false) ?? '')
   const rows = (await writeFile(deps, args.fn, args.args)) as unknown[]
-  return rows[0] ?? null
+  const item = rows[0] as { id?: string } | undefined
+  if (item?.id) await keepAs(deps, keep, { item_id: item.id }, as)
+  return item ?? null
 }
 
 function stagingOf(body: Record<string, unknown>, userId: string): string {

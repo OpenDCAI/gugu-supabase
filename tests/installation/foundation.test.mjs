@@ -180,6 +180,30 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     assert.equal((await query("SELECT to_regnamespace('billing') AS billing"))[0].billing, null)
     assert.equal((await query("SELECT count(*)::integer AS n FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND p.proname IN ('model_access_reserve','cloud_computer_charge','gateway_pool_claim')"))[0].n, 0)
 
+    await t.test('session archival state is readable, writes are RPC-only and replaced APIs retain their grants', async () => {
+      for (const table of ['identity.agent_session_archive_intervals', 'chat.message_agent_delivery_blocks']) {
+        assert.equal((await db.query('SELECT relrowsecurity AS enabled FROM pg_class WHERE oid=$1::regclass', [table])).rows[0].enabled, true)
+        for (const role of ['anon', 'authenticated']) {
+          for (const privilege of ['INSERT', 'UPDATE', 'DELETE']) {
+            assert.equal((await db.query('SELECT has_table_privilege($1,$2,$3) AS allowed', [role, table, privilege])).rows[0].allowed, false)
+          }
+        }
+      }
+      for (const column of ['session_archived_at', 'session_lifecycle_revision', 'session_lifecycle_operation_id']) {
+        assert.equal((await db.query("SELECT has_column_privilege('authenticated','identity.users',$1,'SELECT') AS allowed", [column])).rows[0].allowed, true)
+        assert.equal((await db.query("SELECT has_column_privilege('authenticated','identity.users',$1,'UPDATE') AS allowed", [column])).rows[0].allowed, false)
+      }
+      for (const signature of [
+        'identity.set_agent_session_archival(text,text,uuid,bigint,timestamp with time zone,jsonb)',
+        'identity.pull_agent_inbox_v2(text,text,bigint,integer,jsonb,bigint)',
+        'identity.recheck_device_command_execution(uuid,uuid)', 'chat.sync_snapshot()',
+      ]) {
+        assert.equal((await db.query("SELECT has_function_privilege('authenticated',$1,'EXECUTE') AS allowed", [signature])).rows[0].allowed, true)
+        assert.equal((await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS allowed", [signature])).rows[0].allowed, false)
+      }
+      assert.equal((await query("SELECT has_function_privilege('authenticated','identity.assert_device_command_post_context(uuid,uuid,text,text,text,text[])','EXECUTE') AS allowed"))[0].allowed, false)
+    })
+
     await db.query('BEGIN')
     try {
       const [owner, member, outsider, chat, message] = Array.from({ length: 5 }, randomUUID)

@@ -235,6 +235,7 @@ function fakes(opts: {
         if (opts.legacy && !args.p_staging_key) return { data: null, error: { message: 'message old-1 is an old attachment: forward it through attachments/forward', hint: 'attachment_forward_needs_bytes', code: 'P0001' } }
         return { data: [{ id: args.p_message_id, forwarded_from_message_id: args.p_source_message_id }], error: null }
       }
+      if (fn === 'file_storage_mark_as') return { data: 1, error: null }
       if (fn === 'file_place_as') return { data: [{ id: 'i9', version: 1, path: args.p_file_name }], error: null }
       if (fn === 'file_replace_as') return { data: [{ id: args.p_item_id, version: 4 }], error: null }
       if (fn === 'file_urls_as') {
@@ -336,6 +337,28 @@ describe('managed authorization before bytes or signatures', () => {
     expect(f.calls).toEqual([])
     expect(f.rpcs).toEqual([])
     expect(f.bucket.finals.size).toBe(0)
+  })
+})
+
+describe('临时 / 保留(keep)', () => {
+  const placeBody = (extra: Record<string, unknown> = {}) => ({ staging_key: STAGING, chat_id: 'c1', file_name: 'deck.pptx', ...extra })
+  it('marks the copy that just joined the chat, as the uploader marks it later; not given, nothing is marked', async () => {
+    const sent = fakes({ object: pngBytes() })
+    await handleCommit(sent.deps, USER, commitBody({ keep: 'temporary' }))
+    expect(sent.rpcs.map((r) => `${r.as} ${r.fn}`)).toEqual(['service file_blob_register', 'user attachment_commit', 'user file_storage_mark_as'])
+    expect(sent.rpcs[2]!.args).toEqual({ p_refs: [{ message_id: 'm1' }], p_action: 'temporary', p_as: USER })
+    const placed = fakes({ object: pngBytes() })
+    await handlePlace(placed.deps, USER, placeBody({ keep: 'permanent', as_user_id: 'agent-1' }))
+    expect(placed.rpcs.at(-1)).toEqual({ as: 'user', fn: 'file_storage_mark_as', args: { p_refs: [{ item_id: 'i9' }], p_action: 'permanent', p_as: 'agent-1' } })
+    const plain = fakes({ object: pngBytes() })
+    await handleCommit(plain.deps, USER, commitBody())
+    expect(plain.rpcs.some((r) => r.fn === 'file_storage_mark_as')).toBe(false)
+  })
+  it('refuses an unknown class before anything is stored or sent', async () => {
+    const bad = fakes({ object: pngBytes() })
+    await expect(handleCommit(bad.deps, USER, commitBody({ keep: 'forever' }))).rejects.toMatchObject({ status: 400, code: 'invalid' })
+    await expect(handlePlace(bad.deps, USER, placeBody({ keep: 'later' }))).rejects.toMatchObject({ status: 400, code: 'invalid' })
+    expect(bad.rpcs).toEqual([])
   })
 })
 

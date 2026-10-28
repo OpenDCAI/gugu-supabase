@@ -180,13 +180,52 @@ describe('project local metadata, exact references and read-only host ownership'
     expect(await resolve({item_id:'bad-id'})).toEqual({status:'gone'})
     expect(await resolve()).toMatchObject({status:'ready'})
   })
-  it('blocks existing mutation APIs for remote readers and stops owner metadata edits that omit a published revision',async()=>{
+  const MOVE='SELECT * FROM chat.workspace_move_as($1,$2,$3,$4,$5)'
+  const revisions=async()=>{
+    await service()
+    return (await db.query('SELECT version,relative_path,sha256,size_bytes::int,file_name FROM chat.file_device_revisions WHERE item_id=$1 ORDER BY version',[item])).rows
+  }
+  it('blocks existing mutation APIs for remote readers',async()=>{
     await publish();await user(member)
-    expect((await fails('SELECT * FROM chat.workspace_move_as($1,$2,NULL,$3)',[item,member,'renamed.bin'])).hint).toBe('file_transfer_read_only')
+    expect((await fails(MOVE,[item,member,null,'renamed.bin',null])).hint).toBe('file_transfer_read_only')
+  })
+  // The host renames or moves its own local file: the rename is the next version, carrying the same bytes on the host.
+  it('lets the host rename and move a local file, keeping every version readable under its own name',async()=>{
+    await publish();await user()
+    expect((await db.query(MOVE,[item,owner,null,'renamed.bin',1])).rows[0]).toMatchObject({version:2,filename:'renamed.bin'})
+    expect(await resolve()).toMatchObject({status:'ready',source:'local',version:2,file_name:'renamed.bin',sha256:sha,size_bytes:123,relative_path:'data/file.bin'})
+    expect(await resolve({item_id:item,version:1})).toMatchObject({version:1,file_name:'file.bin',sha256:sha})
     await user()
-    expect((await fails('SELECT * FROM chat.workspace_move_as($1,$2,NULL,$3)',[item,owner,'renamed.bin'])).hint).toBe('file_transfer_read_only')
-    await publish({3:'data/renamed.bin',6:'renamed.bin',8:1})
-    expect(await resolve()).toMatchObject({version:2,file_name:'renamed.bin'})
+    expect((await db.query(MOVE,[item,owner,'资料/2026',null,2])).rows[0]).toMatchObject({version:3,filename:'renamed.bin',path:'资料/2026/renamed.bin'})
+    expect(await resolve()).toMatchObject({status:'ready',version:3,file_name:'renamed.bin',sha256:sha})
+    // Someone on another machine still cannot, and their refusal leaves no carried row behind.
+    await user(member)
+    expect((await fails(MOVE,[item,member,null,'theirs.bin',3])).hint).toBe('file_transfer_read_only')
+    expect(await revisions()).toEqual([1,2,3].map((version)=>({version,relative_path:'data/file.bin',sha256:sha,size_bytes:123,file_name:version===1?'file.bin':'renamed.bin'})))
+  })
+  it('publishes the next version after a rename from the renamed version, and only from it',async()=>{
+    await publish();await user()
+    await db.query(MOVE,[item,owner,null,'renamed.bin',1])
+    expect((await fails(PUBLISH,args({3:'data/new.bin',4:'cd'.repeat(32),5:456,6:'renamed.bin',8:1}))).hint).toBe('file_transfer_conflict')
+    expect(await publish({3:'data/new.bin',4:'cd'.repeat(32),5:456,6:'renamed.bin',8:2})).toMatchObject({version:3})
+    expect(await resolve()).toMatchObject({version:3,file_name:'renamed.bin',sha256:'cd'.repeat(32),relative_path:'data/new.bin'})
+    expect(await resolve({item_id:item,version:2})).toMatchObject({file_name:'renamed.bin',sha256:sha,relative_path:'data/file.bin'})
+  })
+  // A rename and a next version that both start from version 1: the file row is locked by whichever writes first, and the
+  // later one is refused as a version conflict, in either order — never a second row for the same version.
+  it('refuses whichever of a rename and a next version comes second from the same version',async()=>{
+    await publish();await user()
+    await publish({3:'data/new.bin',4:'cd'.repeat(32),5:456,8:1})
+    expect((await fails(MOVE,[item,owner,null,'renamed.bin',1])).hint).toBe('workspace_version_conflict')
+    expect(await revisions()).toEqual([
+      {version:1,relative_path:'data/file.bin',sha256:sha,size_bytes:123,file_name:'file.bin'},
+      {version:2,relative_path:'data/new.bin',sha256:'cd'.repeat(32),size_bytes:456,file_name:'file.bin'}])
+    await user()
+    await db.query(MOVE,[item,owner,null,'renamed.bin',2])
+    expect((await fails(PUBLISH,args({3:'data/newer.bin',4:'ef'.repeat(32),5:789,8:2}))).hint).toBe('file_transfer_conflict')
+    expect((await revisions()).map(({version,file_name,sha256:hash})=>[version,file_name,hash]))
+      .toEqual([[1,'file.bin',sha],[2,'file.bin','cd'.repeat(32)],[3,'renamed.bin','cd'.repeat(32)]])
+    expect(await resolve()).toMatchObject({version:3,file_name:'renamed.bin',sha256:'cd'.repeat(32)})
   })
   it('invalidates an unbound project even if its policy row survives; removal cascades policy but preserves a tombstone',async()=>{
     await publish();await service()
@@ -229,6 +268,7 @@ describe('project local metadata, exact references and read-only host ownership'
       expect((await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS ok",['chat.'+signature])).rows[0].ok).toBe(false)
     }
     expect((await db.query("SELECT has_function_privilege('authenticated','chat.file_device_read_only()','EXECUTE') AS ok")).rows[0].ok).toBe(false)
+    expect((await db.query("SELECT has_function_privilege('authenticated','chat.file_device_carry_revision()','EXECUTE') AS ok")).rows[0].ok).toBe(false)
     expect((await db.query("SELECT prosecdef FROM pg_proc WHERE oid='chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb)'::regprocedure")).rows[0].prosecdef).toBe(false)
     const inner='file_private.publish_revision(uuid,text,text,text,text,bigint,text,text,integer,uuid)'
     expect((await db.query("SELECT prosecdef FROM pg_proc WHERE oid=$1::regprocedure",[inner])).rows[0].prosecdef).toBe(true)

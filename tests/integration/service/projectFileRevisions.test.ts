@@ -272,7 +272,7 @@ describe('project local metadata, exact references and read-only host ownership'
     await user()
     expect(await fails(SHARE,[item,2,randomUUID(),other,owner])).toMatchObject({hint:'file_transfer_read_only',message:'file.bin is kept on its host computer: it can be sent only in its own chat'})
   })
-  it('invalidates an unbound project even if its policy row survives; removal cascades policy but preserves a tombstone',async()=>{
+  it('invalidates an unbound project while its policy row survives, and reads it again when it is bound again',async()=>{
     await publish();await service()
     await db.query('UPDATE identity.device_projects SET chat_id=NULL WHERE device_id=$1',[device])
     expect(await resolve()).toEqual({status:'gone'})
@@ -282,7 +282,22 @@ describe('project local metadata, exact references and read-only host ownership'
     expect(await resolve()).toEqual({status:'gone'})
     await service()
     expect((await db.query('SELECT item_id FROM chat.file_device_revisions WHERE item_id=$1',[item])).rows).toHaveLength(1)
-    expect((await db.query('SELECT chat_id FROM chat.file_project_policies WHERE chat_id=$1',[group])).rows).toEqual([])
+    expect((await db.query('SELECT host_device_id,host_project_id FROM chat.file_project_policies WHERE chat_id=$1',[group])).rows).toEqual([{host_device_id:device,host_project_id:'root'}])
+  })
+  it('keeps the binding when one publication of the host\'s projects leaves the project out, and reads its files again when it is back',async()=>{
+    await publish();await service()
+    const project={local_project_id:'root',name:'fixture',root_path:'/private/root',created_at:new Date().toISOString(),chat_id:group,group_representative:true,folders:[]}
+    const PROJECTS='SELECT identity.publish_device_projects($1,$2::jsonb) AS r'
+    await user();await db.query(PROJECTS,[device,JSON.stringify([])])
+    expect(await resolve()).toEqual({status:'gone'})
+    // Nor can the host publish into the chat while the project is not listed.
+    await user();await fails(PUBLISH,args({0:randomUUID(),3:'data/other.bin'}))
+    await user();await db.query(PROJECTS,[device,JSON.stringify([project])])
+    expect(await resolve()).toMatchObject({status:'ready',source:'local',host_device_id:device,host_project_id:'root'})
+    await user();expect(await publish({0:randomUUID(),3:'data/other.bin'})).toMatchObject({version:1})
+    // Deleting the chat still deletes its binding.
+    await service();await db.query('DELETE FROM chat.chats WHERE id=$1',[group])
+    expect((await db.query('SELECT 1 FROM chat.file_project_policies WHERE chat_id=$1',[group])).rows).toEqual([])
   })
   it('does not convert an existing document or cross-group item into a local file',async()=>{
     await service()

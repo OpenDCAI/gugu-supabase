@@ -130,6 +130,30 @@ describe('project local metadata, exact references and read-only host ownership'
     expect(result.message.content).toBe('[附件] file.bin (application/octet-stream)\n[Size] 123\n[Kind] file\n[Caption]\nshared caption')
     expect(await resolve({message_id:message})).toMatchObject({status:'ready',source:'local',sha256:sha,version:1})
   })
+  it('sends an agent\'s project file as that agent when its owner\'s host publishes it, under the ordinary can_act_as rule',async()=>{
+    const send='SELECT chat.file_device_publish($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) AS r'
+    const [ownAgent,straying,othersAgent]=[randomUUID(),randomUUID(),randomUUID()]
+    await service()
+    await db.query(`INSERT INTO identity.users(id,type,display_name,owner_user_id,device_id) VALUES($1,'agent','own',$4,$6),($2,'agent','straying',$4,$6),($3,'agent','others',$5,$7)`,
+      [ownAgent,straying,othersAgent,owner,member,device,otherDevice])
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'member'),($1,$3,'member')",[group,ownAgent,othersAgent])
+    await user()
+    // Not the owner's agent, or the owner's agent outside this chat: refused before anything is written.
+    for(const sender of [othersAgent,straying]) {
+      const refused=await fails(send,[...args(),{message_id:randomUUID(),sender_user_id:sender}])
+      expect([refused.code,refused.hint]).toEqual(['42501','file_transfer_denied'])
+      await service()
+      expect((await db.query('SELECT id FROM chat.workspace_items WHERE id=$1',[item])).rows).toEqual([])
+      await user()
+    }
+    const message=randomUUID()
+    const sent=(await db.query(send,[...args(),{message_id:message,sender_user_id:ownAgent}])).rows[0].r.message
+    // The agent speaks as itself; sent_by_agent marks an agent speaking in its owner's name, which this is not.
+    expect(sent).toMatchObject({id:message,sender_user_id:ownAgent,sent_by_agent:false,agent_sender:null,file_item_id:item,file_version:1})
+    // Without a sender the caller sends, as before.
+    const own=(await db.query(send,[...args({0:randomUUID(),3:'data/own.bin'}),{message_id:randomUUID()}])).rows[0].r.message
+    expect(own).toMatchObject({sender_user_id:owner,sent_by_agent:false})
+  })
   it('rolls back the local file and revision when message authorization, payload or idempotency rejects sending',async()=>{
     const send='SELECT chat.file_device_publish($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)'
     const message=randomUUID();await db.query(`SELECT * FROM chat.send_message_idempotent($1,$2,$3,'{}','existing','text',NULL,NULL,false,false)`,[message,group,owner])

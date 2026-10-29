@@ -129,6 +129,15 @@ describe('project local metadata, exact references and read-only host ownership'
     expect(result).toMatchObject({item_id:item,version:1,message:{id:message,chat_id:group,sender_user_id:owner,file_item_id:item,file_version:1,is_whisper:false,to_user_ids:[member]}})
     expect(result.message.content).toBe('[附件] file.bin (application/octet-stream)\n[Size] 123\n[Kind] file\n[Caption]\nshared caption')
     expect(await resolve({message_id:message})).toMatchObject({status:'ready',source:'local',sha256:sha,version:1})
+    expect((await db.query('SELECT source_message_ids FROM chat.workspace_items WHERE id=$1',[item])).rows)
+      .toEqual([{source_message_ids:[message]}])
+    // The private metadata write grants no remote mutation or arbitrary message-link capability.
+    expect((await fails('SELECT file_private.link_project_message($1,$2)',[item,message])).hint).toBe('file_transfer_denied')
+    await user()
+    expect((await fails('SELECT file_private.link_project_message($1,$2)',[item,randomUUID()])).hint).toBe('file_transfer_denied')
+    await db.query('SELECT file_private.link_project_message($1,$2)',[item,message])
+    expect((await db.query('SELECT version,source_message_ids FROM chat.workspace_items WHERE id=$1',[item])).rows)
+      .toEqual([{version:1,source_message_ids:[message]}])
   })
   it('sends an agent\'s project file as that agent when its owner\'s host publishes it, under the ordinary can_act_as rule',async()=>{
     const send='SELECT chat.file_device_publish($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) AS r'

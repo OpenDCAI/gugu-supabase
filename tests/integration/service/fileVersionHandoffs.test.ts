@@ -50,6 +50,16 @@ async function status(id:string,cancel=false) {
 }
 async function row(id:string) { await service();return (await db.query('SELECT * FROM chat.file_version_handoffs WHERE id=$1',[id])).rows[0] }
 async function current() { await service();return (await db.query('SELECT version,updated_by,size_bytes FROM chat.workspace_items WHERE id=$1',[item])).rows[0] }
+async function freshProject() {
+  await service()
+  const chat=randomUUID(),project=randomUUID()
+  // The host reserves the chat id before creating the group; neither a file nor a file policy exists yet.
+  await db.query(`INSERT INTO identity.device_projects(device_id,user_id,local_project_id,name,root_path,created_at,chat_id)
+    VALUES($1,$2,$3,'fresh','/private/fresh',now(),$4)`,[device,owner,project,chat])
+  await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','fresh project',$2)",[chat,owner])
+  await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner'),($1,$3,'member'),($1,$4,'member')",[chat,owner,member,agent])
+  return {chat,project}
+}
 
 beforeAll(async()=>{
   if(!['127.0.0.1','localhost','[::1]'].includes(new URL(url).hostname)) throw Error('Handoff contracts require an isolated loopback database')
@@ -87,6 +97,7 @@ describe('asking the host to write a next version',()=>{
     for(const fn of ['chat.file_version_handoff_request(uuid,uuid,integer,text,text,bigint,text,bigint,bigint,jsonb,text)',
       'chat.file_version_handoff_request(uuid,uuid,integer,text,text,bigint,text,bigint,bigint,jsonb,text,text)','chat.file_version_handoff_pending(text)',
       'chat.file_version_handoff_publish(uuid,text,text,bigint)','chat.file_version_handoff_status(uuid,boolean)','chat.file_project_policy_for(text,text)',
+      'file_private.link_project_message(uuid,text)',
       'file_private.publish_revision(uuid,text,text,text,text,bigint,text,text,integer,uuid)']) {
       expect([fn,await can('authenticated',fn),await can('anon',fn)]).toEqual([fn,true,false])
     }
@@ -143,6 +154,85 @@ describe('asking the host to write a next version',()=>{
 })
 
 describe('a new file message handed to its host (#577)',()=>{
+  it('sends the first file in a fresh project group without a host seed or explicit file policy',async()=>{
+    const fresh=await freshProject(),args=creationArgs();args[11]=fresh.chat
+    // A member also has this group bound locally; it is not authority to choose that member's host.
+    await db.query(`INSERT INTO identity.device_projects(device_id,user_id,local_project_id,name,root_path,created_at,chat_id,group_representative)
+      VALUES($1,$2,'member-root','member','/private/member',now()-interval '1 day',$3,true)`,['b-'+device,member,fresh.chat])
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE chat_id=$1',[fresh.chat])).rows).toEqual([])
+    expect((await db.query('SELECT chat_id FROM chat.file_project_policies WHERE chat_id=$1',[fresh.chat])).rows).toEqual([])
+    await user(outsider)
+    expect((await fails('SELECT chat.file_project_policy_for($1,$2)',[fresh.chat,outsider])).hint).toBe('workspace_not_member')
+    await user(member)
+    expect((await fails('SELECT chat.file_project_policy_for($1,$2)',[fresh.chat,owner])).message).toMatch(/Not allowed to act/)
+    expect((await db.query('SELECT chat.file_project_policy_for($1,$2) AS r',[fresh.chat,agent])).rows[0].r)
+      .toMatchObject({host_device_id:device,host_project_id:fresh.project,host_account_id:owner,host_online:true,proactive_upload:false})
+    const r=await create(args);await commit(r.handoff_id)
+    expect(await publish(r.handoff_id)).toMatchObject({status:'published',version:1,message:{chat_id:fresh.chat,sender_user_id:agent}})
+    await service()
+    expect((await db.query('SELECT created_by,updated_by,source_message_ids FROM chat.workspace_items WHERE id=$1',[args[1]])).rows)
+      .toEqual([{created_by:agent,updated_by:agent,source_message_ids:[(args[9] as {message_id:string}).message_id]}])
+  })
+  it('keeps a fresh offline host named, without a placeholder, handoff, upload or permit',async()=>{
+    const fresh=await freshProject(),args=creationArgs();args[11]=fresh.chat
+    await db.query("UPDATE identity.gugu_devices SET status='offline' WHERE device_id=$1",[device])
+    expect(await create(args)).toMatchObject({status:'host_offline',host_device_id:device,host_label:'Studio Mac'})
+    await service()
+    for(const table of ['file_version_handoffs','file_transfer_reservations'])
+      expect((await db.query(`SELECT id FROM chat.${table} WHERE id=$1`,[args[0]])).rows).toEqual([])
+    expect((await db.query('SELECT staging_key FROM chat.file_transfer_uploads WHERE reservation_id=$1',[args[0]])).rows).toEqual([])
+    expect((await db.query('SELECT id FROM chat.workspace_items WHERE chat_id=$1',[fresh.chat])).rows).toEqual([])
+    expect((await db.query('SELECT id FROM chat.messages WHERE chat_id=$1',[fresh.chat])).rows).toEqual([])
+  })
+  it('does not invent a host for an ordinary group or a project owned only by a member',async()=>{
+    await service()
+    const chat=randomUUID()
+    await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','ordinary',$2)",[chat,owner])
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner'),($1,$3,'member')",[chat,owner,member])
+    await user(member)
+    expect((await db.query('SELECT chat.file_project_policy_for($1,$2) AS r',[chat,member])).rows[0].r).toBeNull()
+    await service()
+    await db.query(`INSERT INTO identity.device_projects(device_id,user_id,local_project_id,name,root_path,created_at,chat_id)
+      VALUES($1,$2,'member-root','member','/private/member',now(),$3)`,['b-'+device,member,chat])
+    await user(member)
+    expect((await db.query('SELECT chat.file_project_policy_for($1,$2) AS r',[chat,member])).rows[0].r).toBeNull()
+    await service()
+    expect((await db.query('SELECT chat_id FROM chat.file_project_policies WHERE chat_id=$1',[chat])).rows).toEqual([])
+  })
+  it('preserves an explicit binding while it is unlisted instead of selecting another project',async()=>{
+    await service()
+    await db.query(`INSERT INTO identity.device_projects(device_id,user_id,local_project_id,name,root_path,created_at,chat_id,group_representative)
+      VALUES($1,$2,'other-root','other','/private/other',now()-interval '1 day',$3,true)`,[device,owner,group])
+    await user(member)
+    expect((await db.query('SELECT chat.file_project_policy_for($1,$2) AS r',[group,agent])).rows[0].r)
+      .toMatchObject({host_project_id:'root'})
+    await service();await db.query("DELETE FROM identity.device_projects WHERE device_id=$1 AND local_project_id='root'",[device])
+    await user(member)
+    expect((await db.query('SELECT chat.file_project_policy_for($1,$2) AS r',[group,agent])).rows[0].r).toBeNull()
+    await service()
+    expect((await db.query('SELECT host_project_id FROM chat.file_project_policies WHERE chat_id=$1',[group])).rows)
+      .toEqual([{host_project_id:'root'}])
+  })
+  it('uses the published representative when an admin has multiple projects bound to a fresh group',async()=>{
+    const fresh=await freshProject()
+    await db.query("UPDATE chat.chat_members SET role='admin' WHERE chat_id=$1 AND user_id=$2",[fresh.chat,owner])
+    await db.query(`INSERT INTO identity.device_projects(device_id,user_id,local_project_id,name,root_path,created_at,chat_id,group_representative)
+      VALUES($1,$2,'representative','representative','/private/representative',now()+interval '1 day',$3,true)`,[device,owner,fresh.chat])
+    await user(member)
+    expect((await db.query('SELECT chat.file_project_policy_for($1,$2) AS r',[fresh.chat,agent])).rows[0].r)
+      .toMatchObject({host_device_id:device,host_project_id:'representative',host_account_id:owner})
+  })
+  it('uses the fresh host account global storage setting without changing it',async()=>{
+    const fresh=await freshProject(),args=creationArgs();args[11]=fresh.chat
+    await db.query(`INSERT INTO identity.user_settings(user_id,scope,config) VALUES($1,'user',$2)
+      ON CONFLICT(user_id,scope) DO UPDATE SET config=EXCLUDED.config`,[owner,{file_storage:{proactive_upload:true,retention:'1d'}}])
+    await user(member)
+    expect((await db.query('SELECT chat.file_project_policy_for($1,$2) AS r',[fresh.chat,agent])).rows[0].r)
+      .toMatchObject({host_account_id:owner,proactive_upload:true,retention:'1d'})
+    expect((await fails(CREATE_REQUEST,args)).hint).toBe('file_transfer_invalid')
+    await service()
+    expect((await db.query('SELECT id FROM chat.file_transfer_reservations WHERE id=$1',[args[0]])).rows).toEqual([])
+  })
   it('creates no placeholder; the same drain publishes v1 and its message as the requester, once',async()=>{
     const args=creationArgs(),r=await create(args),h=await row(r.handoff_id)
     expect(h).toMatchObject({item_id:args[1],base_version:null,requester_actor:agent,requester_account:member})
@@ -159,8 +249,8 @@ describe('a new file message handed to its host (#577)',()=>{
       message:{id:h.message.message_id,sender_user_id:agent,file_item_id:args[1],file_version:1}})
     expect(await publish(r.handoff_id)).toMatchObject({status:'published',version:1})
     await service()
-    expect((await db.query('SELECT version,created_by,updated_by FROM chat.workspace_items WHERE id=$1',[args[1]])).rows)
-      .toEqual([{version:1,created_by:agent,updated_by:agent}])
+    expect((await db.query('SELECT version,created_by,updated_by,source_message_ids FROM chat.workspace_items WHERE id=$1',[args[1]])).rows)
+      .toEqual([{version:1,created_by:agent,updated_by:agent,source_message_ids:[h.message.message_id]}])
     expect((await db.query('SELECT version,host_device_id,sha256 FROM chat.file_device_revisions WHERE item_id=$1',[args[1]])).rows)
       .toEqual([{version:1,host_device_id:device,sha256:edited}])
     expect((await db.query('SELECT id FROM chat.messages WHERE file_item_id=$1',[args[1]])).rows).toEqual([{id:h.message.message_id}])
@@ -192,7 +282,8 @@ describe('a new file message handed to its host (#577)',()=>{
     await commit(r.handoff_id)
     expect(await publish(r.handoff_id)).toMatchObject({status:'published',version:1,message:{chat_id:topic,file_item_id:args[1]}})
     await service()
-    expect((await db.query('SELECT chat_id FROM chat.workspace_items WHERE id=$1',[args[1]])).rows).toEqual([{chat_id:group}])
+    expect((await db.query('SELECT chat_id,source_message_ids FROM chat.workspace_items WHERE id=$1',[args[1]])).rows)
+      .toEqual([{chat_id:group,source_message_ids:[(args[9] as {message_id:string}).message_id]}])
   })
   it('binds the new target, metadata and message identity to the request id',async()=>{
     const args=creationArgs();await create(args)
@@ -259,6 +350,8 @@ describe('the host writes it',()=>{
     // Written once: publishing again only reports it.
     expect(await publish(id)).toMatchObject({status:'published',version:2})
     expect((await current()).version).toBe(2)
+    expect((await db.query('SELECT source_message_ids FROM chat.workspace_items WHERE id=$1',[item])).rows)
+      .toEqual([{source_message_ids:[h.message.message_id]}])
   })
   it('keeps the host\'s own edits recorded as the host\'s',async()=>{
     await service()

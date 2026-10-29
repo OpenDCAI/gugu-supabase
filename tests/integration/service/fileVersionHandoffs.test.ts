@@ -102,6 +102,15 @@ describe('asking the host to write a next version',()=>{
     expect(h).toMatchObject({state:'uploading',base_version:1,requester_account:member,requester_actor:agent,host_device_id:device,data_key:null})
     expect(Number((await db.query('SELECT chat.file_temporary_usage($1) AS n',[group])).rows[0].n)).toBe(168)
   })
+  it('holds the provider ceiling only until the copy is committed; then only its stored bytes count', async()=>{
+    const r=await request({8:900})
+    await service()
+    expect(Number((await db.query('SELECT chat.file_temporary_usage($1) AS n',[group])).rows[0].n)).toBe(900)
+    await commit(r.handoff_id)
+    await service()
+    expect((await db.query('SELECT state,actual_bytes FROM chat.file_transfer_reservations WHERE id=$1',[r.handoff_id])).rows[0]).toEqual({state:'settled',actual_bytes:'168'})
+    expect(Number((await db.query('SELECT chat.file_temporary_usage($1) AS n',[group])).rows[0].n)).toBe(168)
+  })
   it('refuses at once while the host is offline, naming the machine, and writes nothing',async()=>{
     await service();await db.query("UPDATE identity.gugu_devices SET status='offline' WHERE device_id=$1",[device])
     expect(await request()).toEqual({status:'host_offline',item_id:item,host_device_id:device,host_label:'Studio Mac',host_account_id:owner,host_online:false})

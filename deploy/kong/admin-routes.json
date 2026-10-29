@@ -1,0 +1,3 @@
+{
+  "service_role_only": ["pg-meta", "mcp", "rest-admin-v1", "analytics-v1", "pooler-v2-ws"]
+}

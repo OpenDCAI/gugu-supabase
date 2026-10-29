@@ -2,6 +2,7 @@
 CREATE OR REPLACE FUNCTION identity.assistant_work_outbox_claim(p_runtime_instance_id text,p_limit integer DEFAULT 20,p_lease_seconds integer DEFAULT 60)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE v_owner text := auth.uid()::text; v_result jsonb; v_coordinators text[]; v_device text;
+    v_now timestamptz;
 BEGIN
     v_device := identity.assistant_work_runtime(p_runtime_instance_id);
     IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 100 OR p_lease_seconds IS NULL OR p_lease_seconds NOT BETWEEN 1 AND 90 THEN
@@ -19,6 +20,21 @@ BEGIN
             OR (e.delivery_state='claimed' AND e.lease_until<clock_timestamp()))
       ) ORDER BY u.id FOR SHARE OF u
     ) locked;
+    -- Expiry belongs to the account, even when the delivery device never returns.
+    -- Do not borrow its lease or interrupt a delivery whose current lease is live.
+    v_now := clock_timestamp();
+    WITH expired AS MATERIALIZED (
+      SELECT e.seq FROM identity.assistant_work_events e
+      WHERE e.owner_user_id=v_owner AND e.platform_received_at<=v_now-interval '24 hours'
+        AND (e.delivery_state='pending' OR (e.delivery_state='claimed' AND e.lease_until<=v_now))
+      ORDER BY e.seq FOR UPDATE SKIP LOCKED
+    )
+    UPDATE identity.assistant_work_events e SET delivery_state='abandoned',
+      lease_token=NULL,lease_instance_id=NULL,lease_until=NULL,abandoned_at=v_now,
+      abandoned_reason_code='DELIVERY_EXPIRED',last_error_code='DELIVERY_EXPIRED'
+    FROM expired x WHERE e.seq=x.seq;
+    -- The existing business-change trigger broadcasts abandonment once; lease
+    -- maintenance is quiet, and a repeated sweep changes no already-abandoned row.
     WITH candidates AS MATERIALIZED (
       SELECT e.seq FROM identity.assistant_work_events e WHERE e.owner_user_id = v_owner
         AND CASE WHEN e.kind='dispatch' THEN e.to_device_id=v_device
@@ -112,6 +128,29 @@ END;
 $$;
 REVOKE ALL ON FUNCTION identity.assistant_work_outbox_settle(text,uuid,uuid,text,text,integer,jsonb) FROM PUBLIC,anon,authenticated;
 GRANT EXECUTE ON FUNCTION identity.assistant_work_outbox_settle(text,uuid,uuid,text,text,integer,jsonb) TO authenticated;
+
+-- Keep the existing verified-notice path and expose only the owned device's label.
+CREATE OR REPLACE FUNCTION identity.assistant_work_abandoned(p_runtime_instance_id text,p_limit integer DEFAULT 100)
+RETURNS jsonb LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE v_events jsonb;
+BEGIN
+    PERFORM identity.assistant_work_runtime(p_runtime_instance_id);
+    IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 100 THEN RAISE EXCEPTION 'Invalid abandoned-event page' USING ERRCODE = '22023'; END IF;
+    SELECT COALESCE(jsonb_agg((to_jsonb(e) - ARRAY['operation_hash','event_hash','lease_token','lease_instance_id','notice_wake_attempts','notice_wake_available_at','notice_wake_token','notice_wake_instance_id','notice_wake_until'])
+      || jsonb_build_object('seq',e.seq::text,'terminal_version',e.terminal_version::text,'assistant_user_id',w.assistant_user_id,
+        'to_device_label',COALESCE(NULLIF(btrim(d.label),''),NULLIF(btrim(d.hostname),''))) ORDER BY e.seq),'[]') INTO v_events
+      FROM (SELECT e.* FROM identity.assistant_work_events e WHERE e.owner_user_id = auth.uid()::text
+        AND e.delivery_state = 'abandoned' AND e.abandonment_notified_at IS NULL AND EXISTS (
+          SELECT 1 FROM identity.assistant_work_notice_pending(auth.uid()::text) g WHERE g.work_id=e.work_id
+            AND g.reason_code=identity.assistant_work_notice_reason(e.abandoned_reason_code)
+            AND g.notice_kind=(CASE WHEN e.kind='completed' THEN 'completed' ELSE 'handoff' END) AND g.pending AND NOT g.notified) ORDER BY e.seq LIMIT p_limit) e
+      JOIN identity.assistant_work w ON w.owner_user_id = e.owner_user_id AND w.work_id = e.work_id
+      LEFT JOIN identity.gugu_devices d ON d.user_id::text=e.owner_user_id AND d.device_id=e.to_device_id;
+    RETURN jsonb_build_object('events',v_events);
+END;
+$$;
+REVOKE ALL ON FUNCTION identity.assistant_work_abandoned(text,integer) FROM PUBLIC,anon,authenticated;
+GRANT EXECUTE ON FUNCTION identity.assistant_work_abandoned(text,integer) TO authenticated;
 
 
 -- Wake affected account pumps after releasing pre-upgrade delays, rather than waiting

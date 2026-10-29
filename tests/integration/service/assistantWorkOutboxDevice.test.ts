@@ -59,6 +59,52 @@ beforeEach(async () => {
 afterEach(async () => { await db.query('ROLLBACK') })
 
 describe('assistant work belongs to its target device', () => {
+  it('expires an offline target on another device claim and records one verified owner notice', async () => {
+    const id = randomUUID(), event = dispatch()
+    await commit(id, [event], task())
+    await db.query('UPDATE identity.gugu_devices SET label=$1,label_customized_at=clock_timestamp() WHERE device_id=$2', ['离线测试电脑', device])
+    await db.query("UPDATE identity.runtime_instances SET last_heartbeat_at=now()-interval '25 hours' WHERE instance_id=$1", [workerInstance])
+    await db.query("UPDATE identity.assistant_work_events SET platform_received_at=clock_timestamp()-interval '24 hours',available_at=clock_timestamp()+interval '5 minutes' WHERE message_id=$1", [event.message_id])
+    const notices = async () => Number((await db.query("SELECT count(*) AS n FROM realtime.messages WHERE topic=$1 AND event='assistant_work_changed'", [`gugu:user:${owner}:events`])).rows[0].n)
+    const before = await notices()
+    expect((await claim()).events).toHaveLength(0)
+    const row = (await db.query('SELECT delivery_state,abandoned_reason_code,lease_token,lease_instance_id,attempts,failed_attempts,executor_admitted_at,owner_delivered_at FROM identity.assistant_work_events WHERE message_id=$1', [event.message_id])).rows[0]
+    expect(row).toEqual({ delivery_state: 'abandoned', abandoned_reason_code: 'DELIVERY_EXPIRED', lease_token: null, lease_instance_id: null, attempts: 0, failed_attempts: 0, executor_admitted_at: null, owner_delivered_at: null })
+    expect(await notices()).toBe(before + 1)
+    expect((await claim()).events).toHaveLength(0)
+    expect(await notices()).toBe(before + 1)
+    const abandoned = () => as(owner, () => call<{ events: Delivery[] }>('assistant_work_abandoned', [instance, 100]))
+    expect((await abandoned()).events).toEqual([expect.objectContaining({ message_id: event.message_id, to_device_id: device, to_device_label: '离线测试电脑', abandoned_reason_code: 'DELIVERY_EXPIRED' })])
+    const notice = randomUUID()
+    await failure(() => as(owner, () => call('assistant_work_owner_delivered', [assistant, instance, event.message_id, chat, notice, 'abandonment_notice'])), /message|source|not found/i)
+    await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'text')", [notice, chat, assistant, `发给 ${device} 设备的活没送到`])
+    for (let retry = 0; retry < 2; retry++) await as(owner, () => call('assistant_work_owner_delivered', [assistant, instance, event.message_id, chat, notice, 'abandonment_notice']))
+    expect((await abandoned()).events).toHaveLength(0)
+    expect((await db.query('SELECT count(*)::int AS n FROM chat.messages WHERE chat_id=$1 AND sender_user_id=$2', [chat, assistant])).rows[0].n).toBe(1)
+  })
+
+  it('expires stale leases but preserves young work, active leases, admissions and other accounts', async () => {
+    const stale = dispatch(), active = dispatch(), admitted = dispatch(), young = dispatch()
+    for (const event of [stale, active, admitted, young]) await commit(randomUUID(), [event], task())
+    await db.query("UPDATE identity.assistant_work_events SET platform_received_at=clock_timestamp()-interval '25 hours' WHERE message_id=ANY($1::uuid[])", [[stale.message_id, active.message_id, admitted.message_id]])
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='claimed',lease_token=gen_random_uuid(),lease_instance_id=$1,lease_until=clock_timestamp()+CASE WHEN message_id=$2 THEN interval '-1 second' ELSE interval '30 seconds' END WHERE message_id=ANY($3::uuid[])", [workerInstance, stale.message_id, [stale.message_id, active.message_id]])
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='admitted',executor_admitted_at=now() WHERE message_id=$1", [admitted.message_id])
+    await db.query("UPDATE identity.assistant_work_events SET platform_received_at=clock_timestamp()-interval '23 hours' WHERE message_id=$1", [young.message_id])
+    // A different authenticated account must not sweep this owner's old work.
+    const otherDevice = `ledger-${randomUUID()}`, otherRuntime = randomUUID()
+    await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,'fixture','fixture','linux')", [otherDevice, stranger])
+    await db.query('INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id) VALUES($1,$2,$3)', [otherRuntime, otherDevice, stranger])
+    expect((await as(stranger, () => call<{events: Delivery[]}>('assistant_work_outbox_claim', [otherRuntime, 20, 60]))).events).toHaveLength(0)
+    expect((await db.query('SELECT delivery_state FROM identity.assistant_work_events WHERE message_id=$1', [stale.message_id])).rows[0].delivery_state).toBe('claimed')
+    expect((await claim()).events).toHaveLength(0)
+    const states = (await db.query('SELECT message_id,delivery_state,lease_token FROM identity.assistant_work_events WHERE owner_user_id=$1', [owner])).rows
+    expect(states.find(row => row.message_id === stale.message_id)).toMatchObject({ delivery_state: 'abandoned', lease_token: null })
+    expect(states.find(row => row.message_id === active.message_id)).toMatchObject({ delivery_state: 'claimed', lease_token: expect.any(String) })
+    expect(states.find(row => row.message_id === admitted.message_id)).toHaveProperty('delivery_state', 'admitted')
+    expect(states.find(row => row.message_id === young.message_id)).toHaveProperty('delivery_state', 'pending')
+    expect((await claim(workerInstance)).events.map(row => row.message_id)).toEqual([young.message_id])
+  })
+
   it('upgrade releases old foreign leases and incompatible backoff without changing valid leases or history', async () => {
     const pending = dispatch(), foreign = dispatch(), valid = dispatch(), rejected = dispatch()
     for (const event of [pending, foreign, valid, rejected]) await commit(randomUUID(), [event], task())

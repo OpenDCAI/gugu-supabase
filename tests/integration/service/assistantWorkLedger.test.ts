@@ -581,12 +581,12 @@ describe('account work ledger and its only delivery outbox', () => {
   it('returns server-computed lease and age budgets independently of a device wall clock',async()=>{
     const id=randomUUID(),event=dispatch()
     await commit(id,[event],task())
-    await db.query("UPDATE identity.assistant_work_events SET platform_received_at=clock_timestamp()-interval '25 hours' WHERE message_id=$1",[event.message_id])
+    await db.query("UPDATE identity.assistant_work_events SET platform_received_at=clock_timestamp()-interval '23 hours' WHERE message_id=$1",[event.message_id])
     const lease=(await claim(workerInstance)).events[0]!
     expect(lease.lease_remaining_ms).toBeGreaterThan(59000)
     expect(lease.lease_remaining_ms).toBeLessThanOrEqual(60000)
-    expect(lease.age_ms).toBeGreaterThanOrEqual(25*60*60*1000)
-    expect(lease.age_ms).toBeLessThan(25*60*60*1000+5000)
+    expect(lease.age_ms).toBeGreaterThanOrEqual(23*60*60*1000)
+    expect(lease.age_ms).toBeLessThan(23*60*60*1000+5000)
   })
   it('filters reconciliation work before paging and excludes ordinary progress and acknowledged abandonment',async()=>{
     const active=randomUUID();await commit(active,[dispatch()],task())

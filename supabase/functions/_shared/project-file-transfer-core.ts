@@ -54,8 +54,8 @@ function count(body:Record<string,unknown>,name:string,min:number) {
   return value
 }
 /**
- * #791: a member on another machine hands a changed copy of a project file to its host, which writes it as the next
- * version. The requester uploads the encrypted copy (request, commit) and reads the outcome (status); the host reads what
+ * #577/#791: a member on another machine hands a new file or changed copy to its host, which publishes it as that
+ * member's version. The requester uploads the encrypted copy (request, commit) and reads the outcome (status); the host reads what
  * it has to write (pending), downloads it with its key (download) and writes it (publish). Same object store, permits and
  * inspection as temporary transfers, in the other direction.
  */
@@ -70,6 +70,9 @@ async function handleVersionHandoff(deps:AttachmentsDeps,user:string,actor:strin
   const store=objectStorage(deps)
   if(route==='file-handoff-request') {
     const sha=text(body,'sha256'),ciphertext=count(body,'ciphertext_bytes',1)
+    const creating=body.expected_version===undefined
+    if(!creating&&body.chat_id!==undefined) throw new Refusal(400,'invalid','Choose a new file chat or an existing version')
+    const target=creating?{p_expected:null,p_chat:text(body,'chat_id')}:{p_expected:count(body,'expected_version',1),p_chat:null}
     if(!/^[0-9a-f]{64}$/.test(sha)) throw new Refusal(400,'invalid','sha256 must be a lowercase SHA-256')
     if(body.message!==undefined&&(typeof body.message!=='object'||body.message===null||Array.isArray(body.message))) throw new Refusal(400,'invalid','message must be an object')
     const cfg=await call(deps.serviceRpc,'file_transfer_settings',{}) as Record<string,unknown>
@@ -84,7 +87,7 @@ async function handleVersionHandoff(deps:AttachmentsDeps,user:string,actor:strin
       throw new Refusal(503,'not_configured','The upload provider size ceiling and lifetime must match deployment policy')
     }
     const row=await call(deps.userRpc,'file_version_handoff_request',{
-      p_id:id(body,'handoff_id'),p_item:id(body,'item_id'),p_expected:count(body,'expected_version',1),p_name:text(body,'file_name'),
+      p_id:id(body,'handoff_id'),p_item:id(body,'item_id'),...target,p_name:text(body,'file_name'),
       p_type:text(body,'content_type'),p_size:count(body,'size_bytes',0),p_sha:sha,p_ciphertext:ciphertext,p_reserve:bounds.maxBytes,
       p_message:body.message??null,p_as:actor,
     }) as {status:string;staging_key:string;signed_at:string;expires_at:string;max_bytes:number}

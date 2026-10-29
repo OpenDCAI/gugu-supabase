@@ -90,10 +90,6 @@ CREATE OR REPLACE FUNCTION chat.file_version_handoff_request(p_id uuid,p_item uu
 LANGUAGE sql SECURITY DEFINER SET search_path='' AS $$
     SELECT chat.file_version_handoff_request(p_id,p_item,p_expected,p_name,p_type,p_size,p_sha,p_ciphertext,p_reserve,p_message,p_as,NULL::text)
 $$;
-REVOKE ALL ON FUNCTION chat.file_version_handoff_request(uuid,uuid,integer,text,text,bigint,text,bigint,bigint,jsonb,text,text)
-    FROM PUBLIC,anon,authenticated;
-GRANT EXECUTE ON FUNCTION chat.file_version_handoff_request(uuid,uuid,integer,text,text,bigint,text,bigint,bigint,jsonb,text,text)
-    TO authenticated;
 
 -- The base-revision FK still protects edits. Creations have no base row and must also reach the existing drain.
 DO $pending$ DECLARE definition text; BEGIN
@@ -127,3 +123,13 @@ DO $by$ DECLARE definition text; BEGIN
 END $by$;
 REVOKE ALL ON FUNCTION file_private.publish_revision_by(uuid,text,text,text,text,bigint,text,text,integer,uuid,text)
     FROM PUBLIC,anon,authenticated;
+
+-- The foundation re-closes replaced chat functions too. Restore only their intended callers after all replacements.
+REVOKE ALL ON FUNCTION chat.file_version_handoff_request(uuid,uuid,integer,text,text,bigint,text,bigint,bigint,jsonb,text),
+    chat.file_version_handoff_request(uuid,uuid,integer,text,text,bigint,text,bigint,bigint,jsonb,text,text),
+    chat.file_version_handoff_pending(text),chat.file_version_handoff_publish(uuid,text,text,bigint)
+    FROM PUBLIC,anon,authenticated;
+GRANT EXECUTE ON FUNCTION chat.file_version_handoff_request(uuid,uuid,integer,text,text,bigint,text,bigint,bigint,jsonb,text),
+    chat.file_version_handoff_request(uuid,uuid,integer,text,text,bigint,text,bigint,bigint,jsonb,text,text),
+    chat.file_version_handoff_pending(text),chat.file_version_handoff_publish(uuid,text,text,bigint)
+    TO authenticated;

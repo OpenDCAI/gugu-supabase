@@ -139,6 +139,19 @@ describe('project local metadata, exact references and read-only host ownership'
     expect((await db.query('SELECT version,source_message_ids FROM chat.workspace_items WHERE id=$1',[item])).rows)
       .toEqual([{version:1,source_message_ids:[message]}])
   })
+  it.each(['unique.bin','file.bin'])('keeps the allocated name consistent when the host publishes %s with a message',async name=>{
+    await publish()
+    const next=randomUUID(),message=randomUUID(),expected=name==='file.bin'?'file (2).bin':name
+    const result=(await db.query('SELECT chat.file_device_publish($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) AS r',
+      [...args({0:next,3:'data/'+next,6:name}),{message_id:message}])).rows[0].r
+    expect(result.message).toMatchObject({id:message,sender_user_id:owner,file_item_id:next,file_version:1})
+    expect(result.message.content).toContain('[附件] '+expected+' (')
+    await service()
+    expect((await db.query(`SELECT w.filename,d.file_name,w.source_message_ids FROM chat.workspace_items w
+      JOIN chat.file_device_revisions d ON d.item_id=w.id AND d.version=w.version WHERE w.id=$1`,[next])).rows)
+      .toEqual([{filename:expected,file_name:expected,source_message_ids:[message]}])
+    expect(await resolve({item_id:next})).toMatchObject({status:'ready',file_name:expected,version:1})
+  })
   it('sends an agent\'s project file as that agent when its owner\'s host publishes it, under the ordinary can_act_as rule',async()=>{
     const send='SELECT chat.file_device_publish($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) AS r'
     const [ownAgent,straying,othersAgent]=[randomUUID(),randomUUID(),randomUUID()]

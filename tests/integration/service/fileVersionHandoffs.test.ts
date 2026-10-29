@@ -285,6 +285,32 @@ describe('a new file message handed to its host (#577)',()=>{
     expect((await db.query('SELECT chat_id,source_message_ids FROM chat.workspace_items WHERE id=$1',[args[1]])).rows)
       .toEqual([{chat_id:group,source_message_ids:[(args[9] as {message_id:string}).message_id]}])
   })
+  it.each(['group','topic'])('retains the allocated duplicate name and requester backlink when publishing into a %s',async target=>{
+    await user()
+    await db.query('SELECT chat.file_device_publish($1,$2,$3,$4,$5,140,$6,$7,NULL,NULL)',
+      [randomUUID(),group,device,'seed.md',sha,'new.md',type])
+    const args=creationArgs()
+    if(target==='topic'){
+      const topic=randomUUID(),anchor=randomUUID()
+      await service()
+      await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content) VALUES($1,$2,$3,'source')",[anchor,group,owner])
+      await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id,source_chat_id,source_message_id) VALUES($1,'topic','duplicates',$2,$3,$4)",[topic,owner,group,anchor])
+      await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner'),($1,$3,'member'),($1,$4,'member')",[topic,owner,member,agent])
+      args[11]=topic
+    }
+    const request=await create(args)
+    await commit(request.handoff_id)
+    const sent=await publish(request.handoff_id)
+    expect(sent).toMatchObject({status:'published',version:1,message:{chat_id:args[11],sender_user_id:agent,file_item_id:args[1]}})
+    expect(sent.message.content).toContain('[附件] new (2).md (')
+    expect(await publish(request.handoff_id)).toMatchObject({status:'published',version:1})
+    await service()
+    expect((await db.query(`SELECT w.filename,d.file_name,w.created_by,w.updated_by,w.source_message_ids FROM chat.workspace_items w
+      JOIN chat.file_device_revisions d ON d.item_id=w.id AND d.version=w.version WHERE w.id=$1`,[args[1]])).rows)
+      .toEqual([{filename:'new (2).md',file_name:'new (2).md',created_by:agent,updated_by:agent,
+        source_message_ids:[(args[9] as {message_id:string}).message_id]}])
+    expect((await db.query('SELECT id FROM chat.messages WHERE file_item_id=$1',[args[1]])).rows).toHaveLength(1)
+  })
   it('binds the new target, metadata and message identity to the request id',async()=>{
     const args=creationArgs();await create(args)
     for(const changes of [{1:item},{3:'renamed.md'},{7:169},{9:{message_id:randomUUID()}}]) {

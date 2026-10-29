@@ -48,6 +48,13 @@ GRANT EXECUTE ON FUNCTION file_private.link_project_message(uuid,text) TO authen
 -- Extend the existing transactions after the authoritative message has been inserted. A rejected send rolls back
 -- its revision and backlink together. Handoff claims have been restored to the host before this metadata write.
 DO $links$ DECLARE definition text; before_text text; BEGIN
+    -- The directory trigger allocates a distinct stored name on insertion. The revision must use that exact name,
+    -- or the existing metadata consistency guard correctly refuses the later backlink update.
+    SELECT pg_get_functiondef('file_private.publish_revision_by(uuid,text,text,text,text,bigint,text,text,integer,uuid,text)'::regprocedure) INTO definition;
+    before_text:='p_size,COALESCE(p_by,auth.uid()::text),p_by,p_parent);';
+    IF position(before_text IN definition)=0 THEN RAISE EXCEPTION 'Unexpected publisher creation predecessor'; END IF;
+    EXECUTE replace(definition,before_text,'p_size,COALESCE(p_by,auth.uid()::text),p_by,p_parent) RETURNING filename INTO p_filename;');
+
     SELECT pg_get_functiondef('chat.file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb)'::regprocedure) INTO definition;
     before_text:=$old$        ) AS sent;
     END IF;$old$;

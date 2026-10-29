@@ -1,4 +1,14 @@
 -- Prefer a live target runtime, retaining delegated wake/delivery when it is offline.
+-- Requester incompatibility excludes only that device, not healthy delegates.
+CREATE TABLE identity.assistant_work_claimant_cooldowns (
+    event_seq bigint NOT NULL REFERENCES identity.assistant_work_events(seq) ON DELETE CASCADE,
+    device_id text NOT NULL,
+    retry_after timestamptz NOT NULL,
+    PRIMARY KEY (event_seq,device_id)
+);
+ALTER TABLE identity.assistant_work_claimant_cooldowns ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON identity.assistant_work_claimant_cooldowns FROM PUBLIC,anon,authenticated;
+
 CREATE OR REPLACE FUNCTION identity.assistant_work_outbox_claim(p_runtime_instance_id text,p_limit integer DEFAULT 20,p_lease_seconds integer DEFAULT 60)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE v_owner text := auth.uid()::text; v_result jsonb; v_coordinators text[]; v_device text;
@@ -16,7 +26,7 @@ BEGIN
         SELECT 1 FROM identity.assistant_work w JOIN identity.assistant_work_events e
           ON e.owner_user_id=w.owner_user_id AND e.work_id=w.work_id
         WHERE w.owner_user_id=v_owner AND w.assistant_user_id=u.id AND e.kind<>'dispatch'
-          AND ((e.delivery_state='pending' AND (e.available_at<=clock_timestamp() OR e.last_error_code='CLIENT_OUTDATED'))
+          AND ((e.delivery_state='pending' AND e.available_at<=clock_timestamp())
             OR (e.delivery_state='claimed' AND e.lease_until<clock_timestamp()))
       ) ORDER BY u.id FOR SHARE OF u
     ) locked;
@@ -46,6 +56,9 @@ BEGIN
             JOIN identity.gugu_devices d ON d.device_id=r.device_id AND d.user_id=r.owner_user_id
           WHERE r.owner_user_id::text=v_owner AND r.device_id=target.device_id
             AND r.last_heartbeat_at>v_now-interval '90 seconds'))
+        AND NOT EXISTS (
+          SELECT 1 FROM identity.assistant_work_claimant_cooldowns rejected
+          WHERE rejected.event_seq=e.seq AND rejected.device_id=v_device AND rejected.retry_after>v_now)
         AND (e.kind='dispatch' OR (
           EXISTS(SELECT 1 FROM identity.assistant_work w WHERE w.owner_user_id=e.owner_user_id
             AND w.work_id=e.work_id AND w.assistant_user_id=ANY(v_coordinators))
@@ -55,8 +68,7 @@ BEGIN
             AND older.seq<e.seq AND older.delivery_state IN ('pending','claimed') AND (
               (e.kind<>'dispatch' AND older.kind<>'dispatch') OR (e.kind='dispatch' AND older.kind='dispatch' AND older.to_device_id=e.to_device_id AND older.to_session_id=e.to_session_id))
         )
-        AND ((e.delivery_state = 'pending' AND (e.available_at <= clock_timestamp()
-          OR (e.last_error_code='CLIENT_OUTDATED' AND target.device_id=v_device)))
+        AND ((e.delivery_state = 'pending' AND e.available_at <= clock_timestamp())
           OR (e.delivery_state = 'claimed' AND e.lease_until < clock_timestamp()))
       ORDER BY e.seq FOR UPDATE SKIP LOCKED LIMIT p_limit
     ), claimed AS (
@@ -83,9 +95,9 @@ CREATE OR REPLACE FUNCTION identity.assistant_work_outbox_settle(
     p_runtime_instance_id text,p_message_id uuid,p_lease_token uuid,p_stage text,p_error_code text DEFAULT NULL,
     p_retry_after_seconds integer DEFAULT 5,p_receipt jsonb DEFAULT '{}'
 ) RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
-DECLARE v_owner text := auth.uid()::text; v_event identity.assistant_work_events; v_work identity.assistant_work;
+DECLARE v_owner text := auth.uid()::text; v_event identity.assistant_work_events; v_work identity.assistant_work; v_device text;
 BEGIN
-    PERFORM identity.assistant_work_runtime(p_runtime_instance_id);
+    v_device := identity.assistant_work_runtime(p_runtime_instance_id);
     IF p_stage IS NULL OR p_stage NOT IN ('executor_admitted','assistant_admitted','retry','abandoned')
       OR p_retry_after_seconds IS NULL OR p_retry_after_seconds NOT BETWEEN 1 AND 3600
       OR (p_error_code IS NOT NULL AND p_error_code !~ '^[A-Z0-9_]{1,80}$')
@@ -105,14 +117,19 @@ BEGIN
     IF v_event.delivery_state <> 'claimed' OR v_event.lease_until <= clock_timestamp() THEN RAISE EXCEPTION 'Outbox lease expired or was released' USING ERRCODE = '55000'; END IF;
     IF p_stage = 'abandoned' THEN
         UPDATE identity.assistant_work_events SET delivery_state = 'abandoned',lease_until = NULL,
-          abandoned_at = clock_timestamp(),abandoned_reason_code = p_error_code,last_error_code = p_error_code,
+          abandoned_at = clock_timestamp(),abandoned_reason_code = p_error_code,
+          last_error_code = CASE WHEN p_error_code='DELIVERY_EXPIRED' THEN last_error_code ELSE p_error_code END,
           failed_attempts = failed_attempts + CASE WHEN p_receipt->>'failure_observed' = 'true' THEN 1 ELSE 0 END WHERE seq = v_event.seq;
     ELSIF p_stage = 'retry' THEN
         UPDATE identity.assistant_work_events SET delivery_state = 'pending',lease_until = NULL,lease_token = NULL,lease_instance_id = NULL,
-          available_at = clock_timestamp() + make_interval(secs => CASE WHEN p_error_code='CLIENT_OUTDATED'
-            THEN LEAST(300,GREATEST(30,p_retry_after_seconds)) ELSE p_retry_after_seconds END),last_error_code = p_error_code,
+          available_at = clock_timestamp() + make_interval(secs => CASE WHEN p_error_code='CLIENT_OUTDATED' THEN 0 ELSE p_retry_after_seconds END),last_error_code = p_error_code,
+          attempts = GREATEST(0,attempts - CASE WHEN p_error_code='CLIENT_OUTDATED' THEN 1 ELSE 0 END),
           failed_attempts = failed_attempts + CASE WHEN p_error_code='CLIENT_OUTDATED' THEN 0 ELSE 1 END WHERE seq = v_event.seq;
         IF p_error_code='CLIENT_OUTDATED' THEN
+            DELETE FROM identity.assistant_work_claimant_cooldowns WHERE event_seq=v_event.seq AND retry_after<=clock_timestamp();
+            INSERT INTO identity.assistant_work_claimant_cooldowns(event_seq,device_id,retry_after)
+              VALUES(v_event.seq,v_device,clock_timestamp()+make_interval(secs=>LEAST(300,GREATEST(30,p_retry_after_seconds))))
+              ON CONFLICT(event_seq,device_id) DO UPDATE SET retry_after=EXCLUDED.retry_after;
             PERFORM chat.send_user_event('{}'::jsonb,'assistant_work_changed','gugu:user:'||v_owner||':events',true);
         END IF;
     ELSE

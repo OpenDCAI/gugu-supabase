@@ -39,7 +39,7 @@ BEGIN
   -- Group every endpoint first, as Settings Devices does. Host kind and enrollment
   -- still decide which machines count; archiving only releases tunnel slots.
   WITH machines AS (
-    SELECT COALESCE(d.machine_id, d.device_id) AS machine_key,
+    SELECT COALESCE(NULLIF(d.machine_id, ''), d.device_id) AS machine_key,
            (array_agg(d.label ORDER BY (d.status = 'online') DESC, d.last_seen_at DESC, d.device_id))[1] AS label,
            array_agg(d.device_id ORDER BY d.device_id) AS device_ids,
            CASE WHEN bool_or(COALESCE(e.via, 'tunnel') = 'ssh') THEN 'ssh' ELSE 'tunnel' END AS via,
@@ -49,7 +49,7 @@ BEGIN
       LEFT JOIN identity.gugu_server_enrollments e
         ON e.user_id = d.user_id AND e.machine_id = d.machine_id
      WHERE d.user_id = p_user_id
-     GROUP BY COALESCE(d.machine_id, d.device_id)
+     GROUP BY COALESCE(NULLIF(d.machine_id, ''), d.device_id)
     HAVING bool_or(d.capabilities ->> 'host_kind' = 'server')
   ), occupants AS (
     SELECT m.*, jsonb_build_object('machine_id', m.machine_key, 'label', m.label, 'device_ids', m.device_ids) AS detail
@@ -106,7 +106,7 @@ BEGIN
   END IF;
   -- 同一个账号并发加两台:串行判,❌ 两边都看见「还差一台」一起放进来。
   PERFORM pg_advisory_xact_lock(hashtextextended('gugu-machine-limit:' || NEW.user_id::text, 0));
-  v_refusal := identity.gugu_machine_limit_refusal(NEW.user_id, COALESCE(NEW.machine_id, NEW.device_id), NULL);
+  v_refusal := identity.gugu_machine_limit_refusal(NEW.user_id, COALESCE(NULLIF(NEW.machine_id, ''), NEW.device_id), NULL);
   IF v_refusal IS NOT NULL THEN
     RAISE EXCEPTION 'DEVICE_LIMIT_REACHED: %', v_refusal::text USING ERRCODE = 'P0001';
   END IF;

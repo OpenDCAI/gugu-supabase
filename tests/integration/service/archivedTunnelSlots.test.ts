@@ -32,13 +32,13 @@ async function account() {
     VALUES($1,'authenticated','authenticated',$2,'{"provider":"email","providers":["email"]}','{}',now(),now())`, [id, `${id}@tunnel-slots.invalid`])
   return id
 }
-async function device(machine: string, options: {
+async function device(machine: string | null, options: {
   age?: string; status?: 'online' | 'offline'; kind?: string; via?: string; owner?: string
 } = {}) {
   await service()
   const id = `tunnel-slot-${randomUUID()}`
   await db.query(`INSERT INTO identity.gugu_devices(device_id,user_id,machine_id,label,hostname,platform,status,last_seen_at,capabilities,tier)
-    VALUES($1,$2,$3,$3,'fixture','linux',$4,now()-$5::interval,$6::jsonb,$7)`, [
+    VALUES($1,$2,$3,COALESCE(NULLIF($3,''),$1),'fixture','linux',$4,now()-$5::interval,$6::jsonb,$7)`, [
     id, options.owner ?? owner, machine, options.status ?? 'offline', options.age ?? '1 day',
     JSON.stringify({ host_kind: options.kind ?? 'server', connect_via: options.via ?? 'tunnel' }), id,
   ])
@@ -129,6 +129,15 @@ describe('archived tunnel slots', () => {
     expect(await refusal()).toMatchObject({ used: 1, machines: [{ machine_id: 'tunnel' }] })
     expect(await refusal('candidate', 'ssh')).toBeNull()
     expect(await refusal('tunnel')).toBeNull()
+  })
+
+  it('keeps legacy endpoints without a hardware identity distinct', async () => {
+    const missing = await device(null)
+    const empty = await device('')
+    await asUser()
+    const result = await refusal()
+    expect(result?.used).toBe(2)
+    expect(result?.machines.map(machine => machine.machine_id).sort()).toEqual([missing, empty].sort())
   })
 
   it('retains archived registrations in the total machine limit', async () => {

@@ -5,6 +5,7 @@ import pg from 'pg'
 import { foundationDigest, installFoundation, installReleases, releases } from '../../scripts/foundation.mjs'
 import { topicResourcesFixture } from './topic-resources-fixture.mjs'
 import { installTopicResourcesConcurrently } from './topic-resource-concurrency.mjs'
+import { assertAllocatedProjectPublisher } from './project-publisher-contract.mjs'
 
 // Deliberately requires an empty, disposable Supabase PostgreSQL 17 instance.
 // Never resets schemas, migration history, or user data to make a test pass.
@@ -30,7 +31,35 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     assert.ok(idleExpiryRelease)
     const downloadLockRelease = releases.find((release) => release.version.endsWith('_file_download_lock_scope'))
     assert.ok(downloadLockRelease)
+    const firstFileRelease = releases.find((release) => release.version === '20261029114000_project_first_file_policy')
+    assert.ok(firstFileRelease)
     const releaseQuery = async (sql) => {
+      if (sql.includes(firstFileRelease.sql)) {
+        await t.test('an already recorded later actor release refuses the older first-file release without changes', async () => {
+          const snapshot = async () => ({
+            ledger: await query('SELECT version,digest,installed_at FROM gugu_install.releases ORDER BY version'),
+            functions: await query(`SELECT n.nspname,p.proname,p.proargtypes::text,p.provolatile,p.prosecdef,p.prosrc,p.proacl::text
+              FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+              WHERE n.nspname IN ('chat','file_private') AND p.proname IN ('file_project_policy_for','publish_revision_by',
+                'file_device_publish','file_version_handoff_publish','link_project_message') ORDER BY n.nspname,p.proname,p.proargtypes`),
+            files: await query('SELECT id,chat_id,filename,version,source_message_ids FROM chat.workspace_items ORDER BY id'),
+            policies: await query('SELECT * FROM chat.file_project_policies ORDER BY chat_id'),
+          })
+          const before = await snapshot()
+          await query('BEGIN')
+          try {
+            // Model the authoritative later-release ledger state inside a rollback-only fixture. The #93
+            // combined-release tests install its real body; this test exercises this release's own entry guard.
+            await db.query('INSERT INTO gugu_install.releases(version,digest) VALUES($1,$2)',
+              ['20261029144500_explicit_message_actor', '0'.repeat(64)])
+            await assert.rejects(query(firstFileRelease.sql), { code: 'P0001', hint: 'project_file_release_order' })
+          } finally {
+            await query('ROLLBACK')
+          }
+          assert.deepEqual(await snapshot(), before)
+        })
+        return query(sql)
+      }
       if (sql.includes(downloadLockRelease.sql)) {
         const owner=randomUUID(),group=randomUUID(),ids=[randomUUID(),randomUUID(),randomUUID()]
         await db.query("INSERT INTO identity.users(id,type,display_name) VALUES($1,'human','download upgrade fixture')",[owner])
@@ -170,10 +199,14 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
       return result
     }
     assert.deepEqual(await installReleases(releaseQuery), { applied: versions, versions })
+    await t.test('installed publishers retain directory-allocated names and private grants', async () => {
+      await assertAllocatedProjectPublisher(query)
+    })
     assert.equal((await query('SHOW row_security'))[0].row_security, 'on', 'dump settings stay local to the installation transaction')
     const before = await query('SELECT version,digest,installed_at FROM gugu_install.releases')
     assert.deepEqual(await installFoundation(query), { installed: false, digest: foundationDigest })
     assert.deepEqual(await installReleases(query), { applied: [], versions })
+    await assertAllocatedProjectPublisher(query)
     assert.deepEqual(await query('SELECT version,digest,installed_at FROM gugu_install.releases'), before)
     assert.equal((await query("SELECT count(*)::integer AS n FROM pg_policies WHERE schemaname='realtime' AND policyname LIKE 'gugu_%'"))[0].n, 8, 'foundation 7 + forum events')
     assert.equal((await query("SELECT count(*)::integer AS n FROM cron.job WHERE active AND jobname IN ('device-lease-sweep','file-blob-upload-sweep','file-blob-gc-kick')"))[0].n, 3)

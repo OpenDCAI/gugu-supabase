@@ -49,6 +49,10 @@ async function refusal(machine = 'candidate', via = 'tunnel', userId = owner) {
     'SELECT identity.gugu_machine_limit_refusal($1,$2,$3) AS refusal', [userId, machine, via])
   return rows[0]!.refusal
 }
+async function recentRefusal() {
+  return (await db.query<{ refusal: Refusal | null }>(
+    "SELECT identity.my_recent_machine_limit_refusal(now()-interval '1 minute') AS refusal")).rows[0]!.refusal
+}
 async function failure(sql: string, values: unknown[] = []) {
   await db.query('SAVEPOINT expected_failure')
   try {
@@ -183,11 +187,50 @@ describe('archived tunnel slots', () => {
     await db.query(`INSERT INTO identity.server_login_requests(device_code_hash,user_code,machine_id,status,refusal,refused_user_id,refused_at)
       VALUES($1,$2,'candidate','refused','{"limit":"tunnel","used":1,"max":1}',$3,now())`, [randomUUID(), randomUUID(), owner])
     await asUser()
-    const recent = async () => (await db.query<{ refusal: Refusal | null }>(
-      "SELECT identity.my_recent_machine_limit_refusal(now()-interval '1 minute') AS refusal")).rows[0]!.refusal
-    expect(await recent()).toMatchObject({ used: 1, machines: [{ device_ids: [id] }] })
+    expect(await recentRefusal()).toMatchObject({ used: 1, machines: [{ device_ids: [id] }] })
     await db.query('SELECT identity.remove_device($1)', [id])
-    expect(await recent()).toBeNull()
+    expect(await recentRefusal()).toBeNull()
+  })
+
+  it('records the machine supplied at SSH grant polling when the total limit refuses it', async () => {
+    await device('archived', { age: '8 days' })
+    const id = await device('recent')
+    await db.query('UPDATE identity.installation_machine_limits SET max_machines=2 WHERE id')
+    const code = randomUUID()
+    await db.query("SELECT public.server_login_grant($1,$2,'{}',NULL,$3)", [code, randomUUID(), owner])
+    const { rows } = await db.query<{ result: string; detail: Refusal }>(
+      'SELECT * FROM public.server_login_poll($1,1,$2)', [code, 'ssh-candidate'])
+    expect(rows[0]).toMatchObject({ result: 'machine_limit', detail: { limit: 'total', used: 2 } })
+    expect((await db.query<{ machine_id: string | null }>(
+      'SELECT machine_id FROM identity.server_login_requests WHERE device_code_hash=$1', [code])).rows[0]?.machine_id)
+      .toBe('ssh-candidate')
+    await asUser()
+    expect(await recentRefusal()).toMatchObject({ limit: 'total', used: 2, machine_id: 'ssh-candidate' })
+    await db.query('SELECT identity.remove_device($1)', [id])
+    expect(await recentRefusal()).toBeNull()
+  })
+
+  it('refreshes a previously stored refusal using its actual machine identity', async () => {
+    const id = await device('occupant')
+    await db.query(`INSERT INTO identity.server_login_requests(device_code_hash,user_code,machine_id,status,refusal,refused_user_id,refused_at)
+      VALUES($1,$2,NULL,'refused',$3::jsonb,$4,now())`, [randomUUID(), randomUUID(),
+      JSON.stringify({ limit: 'tunnel', used: 1, max: 1, machine_id: 'candidate' }), owner])
+    await asUser()
+    expect(await recentRefusal()).toMatchObject({ limit: 'tunnel', used: 1, machine_id: 'candidate',
+      machines: [{ device_ids: [id] }] })
+    await db.query('SELECT identity.remove_device($1)', [id])
+    expect(await recentRefusal()).toBeNull()
+  })
+
+  it('preserves the latest legacy refusal when its attempted machine identity is unavailable', async () => {
+    await device('occupant')
+    await db.query(`INSERT INTO identity.server_login_requests(device_code_hash,user_code,machine_id,status,refusal,refused_user_id,refused_at)
+      VALUES($1,$2,'earlier','refused','{"limit":"tunnel","used":1,"max":1}',$3,now()-interval '1 second'),
+            ($4,$5,NULL,'refused','{"limit":"total","used":2,"max":2}',$3,now())`,
+    [randomUUID(), randomUUID(), owner, randomUUID(), randomUUID()])
+    await asUser()
+    expect(await recentRefusal()).toMatchObject({ limit: 'total', used: 2, max: 2 })
+    expect((await recentRefusal())?.machines).toBeUndefined()
   })
 
   it('enforces ownership and keeps anonymous callers out', async () => {

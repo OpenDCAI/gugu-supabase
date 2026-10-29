@@ -114,18 +114,36 @@ BEGIN
 END;
 $$;
 
+-- SSH grants learn the target identity at poll time. Preserve that same identity
+-- on refusal, as the successful consume path already does.
+CREATE OR REPLACE FUNCTION identity.server_login_mark_refused(p_id uuid, p_user_id text, p_refusal jsonb) RETURNS void
+    LANGUAGE sql SECURITY DEFINER
+    SET search_path TO 'identity', 'public'
+    AS $$
+  UPDATE identity.server_login_requests
+     SET status = 'refused', refusal = p_refusal, refused_user_id = p_user_id, refused_at = now(),
+         machine_id = COALESCE(NULLIF(p_refusal ->> 'machine_id', ''), machine_id),
+         decided_at = COALESCE(decided_at, now())
+   WHERE id = p_id;
+$$;
+
 CREATE OR REPLACE FUNCTION identity.my_recent_machine_limit_refusal(p_since timestamptz) RETURNS jsonb
     LANGUAGE sql STABLE SECURITY DEFINER
     SET search_path TO 'identity', 'public', 'pg_catalog'
     AS $$
-  SELECT identity.gugu_machine_limit_refusal(auth.uid(), r.machine_id, r.via)
-         || jsonb_build_object('hostname', r.machine ->> 'hostname', 'refused_at', r.refused_at)
+  WITH latest AS (
+    SELECT r.*, COALESCE(NULLIF(r.refusal ->> 'machine_id', ''), NULLIF(r.machine_id, '')) AS refused_machine_id
     FROM identity.server_login_requests r
-   WHERE auth.uid() IS NOT NULL
-     AND r.refused_user_id = auth.uid()::text
-     AND r.refused_at >= p_since
-   ORDER BY r.refused_at DESC
-   LIMIT 1;
+    WHERE auth.uid() IS NOT NULL
+      AND r.refused_user_id = auth.uid()::text
+      AND r.refused_at >= p_since
+    ORDER BY r.refused_at DESC
+    LIMIT 1
+  )
+  SELECT CASE WHEN r.refused_machine_id IS NULL THEN r.refusal
+              ELSE identity.gugu_machine_limit_refusal(auth.uid(), r.refused_machine_id, r.via) END
+         || jsonb_build_object('hostname', r.machine ->> 'hostname', 'refused_at', r.refused_at)
+    FROM latest r;
 $$;
 
 REVOKE ALL ON FUNCTION identity.gugu_machine_limit_refusal(uuid, text, text) FROM PUBLIC, anon;
@@ -133,3 +151,5 @@ GRANT EXECUTE ON FUNCTION identity.gugu_machine_limit_refusal(uuid, text, text) 
 REVOKE ALL ON FUNCTION identity.gugu_devices_enforce_machine_limit() FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION identity.my_recent_machine_limit_refusal(timestamptz) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION identity.my_recent_machine_limit_refusal(timestamptz) TO authenticated;
+REVOKE ALL ON FUNCTION identity.server_login_mark_refused(uuid, text, jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION identity.server_login_mark_refused(uuid, text, jsonb) TO service_role;

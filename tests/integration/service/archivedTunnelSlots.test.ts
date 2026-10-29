@@ -37,10 +37,10 @@ async function device(machine: string, options: {
 } = {}) {
   await service()
   const id = `tunnel-slot-${randomUUID()}`
-  await db.query(`INSERT INTO identity.gugu_devices(device_id,user_id,machine_id,label,hostname,platform,status,last_seen_at,capabilities)
-    VALUES($1,$2,$3,$3,'fixture','linux',$4,now()-$5::interval,$6::jsonb)`, [
+  await db.query(`INSERT INTO identity.gugu_devices(device_id,user_id,machine_id,label,hostname,platform,status,last_seen_at,capabilities,tier)
+    VALUES($1,$2,$3,$3,'fixture','linux',$4,now()-$5::interval,$6::jsonb,$7)`, [
     id, options.owner ?? owner, machine, options.status ?? 'offline', options.age ?? '1 day',
-    JSON.stringify({ host_kind: options.kind ?? 'server', connect_via: options.via ?? 'tunnel' }),
+    JSON.stringify({ host_kind: options.kind ?? 'server', connect_via: options.via ?? 'tunnel' }), id,
   ])
   return id
 }

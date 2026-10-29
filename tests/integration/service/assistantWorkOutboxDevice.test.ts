@@ -30,6 +30,257 @@ const commit = (id: string, events: Event[], initial: unknown = null, op = rando
 const claim = (runtime = instance, limit = 20) => as(owner, () => call<{ events: Delivery[] }>('assistant_work_outbox_claim', [runtime,limit,60]))
 const settle = (event: Delivery, stage = 'executor_admitted', runtime = instance, receipt = {}) => as(owner, () => call('assistant_work_outbox_settle', [runtime,event.message_id,event.lease_token,stage,stage === 'retry' ? 'CHANNEL_UNAVAILABLE' : null,5,JSON.stringify(receipt)]))
 
+describe('a live work target is prompted after delivery hands back to it', () => {
+  const notices = async () => Number((await db.query("SELECT count(*) AS n FROM realtime.messages WHERE topic=ANY($1) AND event='assistant_work_changed'", [[`gugu:user:${owner}:events`, `gugu:user:${stranger}:events`]])).rows[0].n)
+  const heartbeat = (runtime: string) => db.query('UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp() WHERE instance_id=$1', [runtime])
+
+  it.each(['dispatch', 'progress'])('prompts a resumed %s target when a delegated attempt becomes retryable', async kind => {
+    const id = randomUUID(), event = kind === 'dispatch' ? dispatch() : report('progress')
+    await commit(id, [kind === 'dispatch' ? event : dispatch()], task())
+    if (kind !== 'dispatch') {
+      await db.query("UPDATE identity.assistant_work_events SET delivery_state='admitted',executor_admitted_at=now() WHERE work_id=$1", [id])
+      await commit(id, [event], null, randomUUID(), workerInstance)
+    }
+    const target = kind === 'dispatch' ? workerInstance : instance
+    const proxy = kind === 'dispatch' ? instance : workerInstance
+    await db.query("UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp()-interval '91 seconds' WHERE instance_id=$1", [target])
+    const delegated = (await claim(proxy)).events[0]!
+    expect(delegated.message_id).toBe(event.message_id)
+    const held = await notices()
+    await heartbeat(target)
+    expect(await notices()).toBe(held) // The still-live delivery lease has priority.
+    await as(owner, () => call('assistant_work_outbox_settle', [proxy, event.message_id, delegated.lease_token, 'retry', 'DEVICE_UNREACHABLE', 1, '{"failure_observed":false}']))
+    await db.query("UPDATE identity.assistant_work_events SET available_at=clock_timestamp()-interval '1 second' WHERE message_id=$1", [event.message_id])
+    const before = await notices()
+    await heartbeat(target)
+    expect(await notices()).toBe(before + 1)
+    expect((await db.query('SELECT attempts,failed_attempts FROM identity.assistant_work_events WHERE message_id=$1', [event.message_id])).rows[0]).toEqual({ attempts: 1, failed_attempts: 1 })
+    expect((await claim(proxy)).events).toHaveLength(0)
+    expect((await claim(target)).events.map(row => row.message_id)).toEqual([event.message_id])
+  })
+
+  it.each(['not due', 'active lease', 'admitted', 'expired', 'wrong owner', 'stale heartbeat', 'claimant cooldown', 'ordered behind another event'])('does not prompt for %s work', async state => {
+    const event = dispatch()
+    const id = randomUUID()
+    await commit(id, [event], task())
+    if (state === 'not due') await db.query("UPDATE identity.assistant_work_events SET available_at=clock_timestamp()+interval '1 minute' WHERE message_id=$1", [event.message_id])
+    if (state === 'active lease') await claim(workerInstance)
+    if (state === 'admitted') await db.query("UPDATE identity.assistant_work_events SET delivery_state='admitted',executor_admitted_at=now() WHERE message_id=$1", [event.message_id])
+    if (state === 'expired') await db.query("UPDATE identity.assistant_work_events SET platform_received_at=clock_timestamp()-interval '25 hours' WHERE message_id=$1", [event.message_id])
+    if (state === 'wrong owner') await db.query('UPDATE identity.runtime_instances SET owner_user_id=$1 WHERE instance_id=$2', [stranger, workerInstance])
+    if (state === 'claimant cooldown') await db.query("INSERT INTO identity.assistant_work_claimant_cooldowns(event_seq,device_id,retry_after) SELECT seq,$1,clock_timestamp()+interval '1 minute' FROM identity.assistant_work_events WHERE message_id=$2", [device, event.message_id])
+    if (state === 'ordered behind another event') {
+      await db.query("UPDATE identity.assistant_work_events SET available_at=clock_timestamp()+interval '1 minute' WHERE message_id=$1", [event.message_id])
+      await commit(id, [dispatch()])
+    }
+    const before = await notices()
+    if (state === 'stale heartbeat') await db.query("UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp()-interval '91 seconds' WHERE instance_id=$1", [workerInstance])
+    else await heartbeat(workerInstance)
+    expect(await notices()).toBe(before)
+  })
+
+  it('aggregates ready work into one prompt without repeating it on fresh heartbeats', async () => {
+    for (let i = 0; i < 3; i++) await commit(randomUUID(), [dispatch()], task())
+    const before = await notices()
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 1)
+    await db.query('UPDATE identity.runtime_instances SET last_heartbeat_at=last_heartbeat_at WHERE instance_id=$1', [workerInstance])
+    expect(await notices()).toBe(before + 1)
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 1)
+    const sameDevice = randomUUID()
+    await db.query('INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id) VALUES($1,$2,$3)', [sameDevice, device, owner])
+    expect(await notices()).toBe(before + 1)
+    const row = (await db.query('SELECT sum(attempts)::int AS attempts,sum(failed_attempts)::int AS failures FROM identity.assistant_work_events WHERE owner_user_id=$1', [owner])).rows[0]
+    expect(row).toEqual({ attempts: 0, failures: 0 })
+  })
+
+  it('never prompts another device ready work or overwrites that device hint', async () => {
+    await commit(randomUUID(), [dispatch()], task())
+    const before = await notices()
+    await heartbeat(instance)
+    expect(await notices()).toBe(before)
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 1)
+    await heartbeat(instance)
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 1)
+  })
+
+  it.each(['stale runtime', 'new runtime'])('re-prompts an already hinted retry when its target resumes with a %s', async mode => {
+    await commit(randomUUID(), [dispatch()], task())
+    await heartbeat(workerInstance)
+    await db.query("UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp()-interval '91 seconds' WHERE instance_id=$1", [workerInstance])
+    const before = await notices()
+    const resumed = mode === 'stale runtime' ? workerInstance : randomUUID()
+    if (mode === 'stale runtime') await heartbeat(resumed)
+    else await db.query('INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id) VALUES($1,$2,$3)', [resumed, device, owner])
+    expect(await notices()).toBe(before + 1)
+    await heartbeat(resumed)
+    expect(await notices()).toBe(before + 1)
+  })
+
+  it('does not re-prompt a stale sibling runtime when the target still has a fresh runtime', async () => {
+    await commit(randomUUID(), [dispatch()], task())
+    await heartbeat(workerInstance)
+    const sibling = randomUUID()
+    await db.query("INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id,last_heartbeat_at) VALUES($1,$2,$3,clock_timestamp()-interval '91 seconds')", [sibling, device, owner])
+    const before = await notices()
+    await heartbeat(sibling)
+    expect(await notices()).toBe(before)
+  })
+
+  it.each(['raised error', 'statement timeout'])('keeps the heartbeat when hint publication encounters a %s', async mode => {
+    const event = dispatch()
+    await commit(randomUUID(), [event], task())
+    const previous = (await db.query('SELECT last_heartbeat_at::text AS heartbeat FROM identity.runtime_instances WHERE instance_id=$1', [workerInstance])).rows[0].heartbeat
+    await db.query('SAVEPOINT publication_fault')
+    try {
+      // Fault the publisher boundary directly: realtime.send swallows ordinary
+      // message-insertion errors itself. A statement timeout is real, not a mock.
+      const original = (await db.query("SELECT pg_get_functiondef('chat.send_user_event(jsonb,text,text,boolean)'::regprocedure) AS sql")).rows[0].sql as string
+      const fault = original.replace(/AS \$function\$[\s\S]*\$function\$/, `AS $function$ BEGIN
+        IF current_setting('gugu.test.hint_failure',true)='on' THEN
+          ${mode === 'statement timeout' ? "PERFORM pg_sleep(1);" : "RAISE EXCEPTION 'Fixture hint publication unavailable';"}
+        END IF;
+        PERFORM realtime.send(p_payload,p_event,p_topic,p_private);
+        RETURN;
+      END; $function$`)
+      expect(fault).not.toBe(original)
+      await db.query(fault)
+      const before = await notices()
+      await db.query("SELECT set_config('gugu.test.hint_failure','on',true)")
+      if (mode === 'statement timeout') await db.query("SET LOCAL statement_timeout='100ms'")
+      const result = await heartbeat(workerInstance).then(() => 'ok', error => error.code)
+      expect(result).toBe('ok')
+      await db.query("SET LOCAL statement_timeout='0'")
+      expect((await db.query('SELECT last_heartbeat_at>$2 AS renewed FROM identity.runtime_instances WHERE instance_id=$1', [workerInstance, previous])).rows[0].renewed).toBe(true)
+      expect(await notices()).toBe(before)
+      expect(Number((await db.query('SELECT count(*) AS n FROM identity.assistant_work_ready_hints WHERE event_seq=(SELECT seq FROM identity.assistant_work_events WHERE message_id=$1)', [event.message_id])).rows[0].n)).toBe(0)
+      await db.query("SELECT set_config('gugu.test.hint_failure','off',true)")
+      await heartbeat(workerInstance)
+      expect(await notices()).toBe(before + 1)
+    } finally { await db.query('ROLLBACK TO SAVEPOINT publication_fault') }
+  })
+
+  it('prompts again for a later retry eligibility time, then retires its hint on admission', async () => {
+    const event = dispatch()
+    await commit(randomUUID(), [event], task())
+    const before = await notices()
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 1)
+    const leased = (await claim(workerInstance)).events[0]!
+    await settle(leased, 'retry', workerInstance)
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 1) // The new retry is still in the future.
+    await db.query("UPDATE identity.assistant_work_events SET available_at=clock_timestamp()-interval '1 second' WHERE message_id=$1", [event.message_id])
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 2)
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 2)
+    await settle((await claim(workerInstance)).events[0]!, 'executor_admitted', workerInstance)
+    expect(Number((await db.query('SELECT count(*) AS n FROM identity.assistant_work_ready_hints WHERE event_seq=(SELECT seq FROM identity.assistant_work_events WHERE message_id=$1)', [event.message_id])).rows[0].n)).toBe(0)
+  })
+
+  it('lets a delegate take over again when the prompted target goes offline', async () => {
+    const event = dispatch()
+    await commit(randomUUID(), [event], task())
+    await heartbeat(workerInstance)
+    expect((await claim(instance)).events).toHaveLength(0)
+    await db.query("UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp()-interval '91 seconds' WHERE instance_id=$1", [workerInstance])
+    expect((await claim(instance)).events.map(row => row.message_id)).toEqual([event.message_id])
+  })
+
+  it('retires a hint on abandonment without deleting the event history', async () => {
+    const event = dispatch()
+    await commit(randomUUID(), [event], task())
+    await heartbeat(workerInstance)
+    expect(Number((await db.query('SELECT count(*) AS n FROM identity.assistant_work_ready_hints WHERE event_seq=(SELECT seq FROM identity.assistant_work_events WHERE message_id=$1)', [event.message_id])).rows[0].n)).toBe(1)
+    const leased = (await claim(workerInstance)).events[0]!
+    await as(owner, () => call('assistant_work_outbox_settle', [workerInstance, event.message_id, leased.lease_token, 'abandoned', 'DELIVERY_TIMEOUT', 5, '{}']))
+    expect(Number((await db.query('SELECT count(*) AS n FROM identity.assistant_work_ready_hints WHERE event_seq=(SELECT seq FROM identity.assistant_work_events WHERE message_id=$1)', [event.message_id])).rows[0].n)).toBe(0)
+    expect((await db.query('SELECT delivery_state FROM identity.assistant_work_events WHERE message_id=$1', [event.message_id])).rows[0].delivery_state).toBe('abandoned')
+  })
+
+  it('prompts for an expired delivery lease without altering its fencing token', async () => {
+    const event = dispatch()
+    await commit(randomUUID(), [event], task())
+    const leased = (await claim(workerInstance)).events[0]!
+    await db.query("UPDATE identity.assistant_work_events SET lease_until=clock_timestamp()-interval '1 second' WHERE message_id=$1", [event.message_id])
+    const before = await notices()
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 1)
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 1)
+    expect((await db.query('SELECT delivery_state,lease_token,attempts FROM identity.assistant_work_events WHERE message_id=$1', [event.message_id])).rows[0]).toEqual({ delivery_state: 'claimed', lease_token: leased.lease_token, attempts: 1 })
+  })
+
+  it('does not expose hint receipts or trigger entry points to API roles', async () => {
+    for (const role of ['anon', 'authenticated']) {
+      for (const privilege of ['SELECT', 'INSERT', 'UPDATE', 'DELETE']) expect((await db.query('SELECT has_table_privilege($1,$2,$3) AS allowed', [role, 'identity.assistant_work_ready_hints', privilege])).rows[0].allowed).toBe(false)
+      for (const fn of ['identity.assistant_work_prompt_ready_target()', 'identity.assistant_work_retire_ready_hint()']) expect((await db.query("SELECT has_function_privilege($1,$2,'EXECUTE') AS allowed", [role, fn])).rows[0].allowed).toBe(false)
+    }
+  })
+
+  it('rejects a wrong owner runtime even when its stored event points at that device', async () => {
+    const id = randomUUID(), event = dispatch()
+    await commit(id, [event], task())
+    // A malformed historical row must not let an unowned device advertise work
+    // for another account. The normal commit API already rejects this shape.
+    await db.query(`INSERT INTO identity.assistant_work(owner_user_id,work_id,assistant_user_id,title,coordinator_session_id,coordinator_device_id,executors,initial_task)
+      SELECT $1,work_id,assistant_user_id,title,coordinator_session_id,coordinator_device_id,executors,initial_task
+      FROM identity.assistant_work WHERE owner_user_id=$2 AND work_id=$3`, [stranger, owner, id])
+    await db.query('UPDATE identity.assistant_work_events SET owner_user_id=$1 WHERE message_id=$2', [stranger, event.message_id])
+    await db.query('UPDATE identity.runtime_instances SET owner_user_id=$1 WHERE instance_id=$2', [stranger, workerInstance])
+    const count = async () => Number((await db.query("SELECT count(*) AS n FROM realtime.messages WHERE topic=ANY($1) AND event='assistant_work_changed'", [[`gugu:user:${owner}:events`, `gugu:user:${stranger}:events`]])).rows[0].n)
+    const before = await count()
+    await heartbeat(workerInstance)
+    expect(await count()).toBe(before)
+  })
+
+  it.each(['another heartbeat', 'delivery admission'])('does not wait for or duplicate %s on another connection', async scenario => {
+    const alternate = randomUUID(), event = dispatch()
+    await db.query('INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id) VALUES($1,$2,$3)', [alternate, device, owner])
+    await commit(randomUUID(), [event], task())
+    await db.query('COMMIT')
+    const other = new pg.Client({ connectionString: url })
+    await other.connect()
+    const before = await notices()
+    try {
+      await db.query('BEGIN')
+      if (scenario === 'another heartbeat') await heartbeat(workerInstance)
+      else await db.query("UPDATE identity.assistant_work_events SET delivery_state='admitted',executor_admitted_at=clock_timestamp() WHERE message_id=$1", [event.message_id])
+      await other.query('BEGIN')
+      await other.query("SET LOCAL statement_timeout='500ms'")
+      let deadline: ReturnType<typeof setTimeout> | undefined
+      const second = await Promise.race([
+        other.query('UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp() WHERE instance_id=$1', [alternate]).then(() => 'ok', error => error.code),
+        new Promise<string>(resolve => { deadline = setTimeout(() => resolve('blocked on delivery'), 250) }),
+      ]).finally(() => { if (deadline) clearTimeout(deadline) })
+      expect(second).toBe('ok') // The first transaction still holds the event lock.
+      await other.query('COMMIT')
+      await db.query('COMMIT')
+      // Admission already has its own business-change notice; neither case
+      // may add a second (stale or duplicate) heartbeat hint.
+      expect(await notices()).toBe(before + 1)
+      await heartbeat(workerInstance)
+      expect(await notices()).toBe(before + 1)
+      if (scenario === 'delivery admission') expect(Number((await db.query('SELECT count(*) AS n FROM identity.assistant_work_ready_hints WHERE event_seq=(SELECT seq FROM identity.assistant_work_events WHERE message_id=$1)', [event.message_id])).rows[0].n)).toBe(0)
+    } finally {
+      await other.query('ROLLBACK')
+      await other.end()
+      await db.query('ROLLBACK')
+      await db.query('DELETE FROM identity.assistant_work WHERE owner_user_id=$1', [owner])
+      await db.query('DELETE FROM identity.agent_provision_operations WHERE owner_user_id=$1', [owner])
+      await db.query('DELETE FROM chat.chats WHERE id=$1', [chat])
+      await db.query('DELETE FROM identity.users WHERE id=ANY($1)', [[assistant, executor]])
+      await db.query('DELETE FROM identity.gugu_devices WHERE device_id=ANY($1)', [[home, device]])
+      await db.query('DELETE FROM auth.users WHERE id=ANY($1::uuid[])', [[owner, stranger]])
+      await db.query('BEGIN')
+    }
+  })
+})
+
 beforeAll(async () => {
   if (!['127.0.0.1','localhost','[::1]'].includes(new URL(url).hostname)) throw new Error('Work ledger tests require a disposable loopback database')
   db = new pg.Client({ connectionString: url }); await db.connect()

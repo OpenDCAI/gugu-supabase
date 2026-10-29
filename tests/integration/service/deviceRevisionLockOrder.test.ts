@@ -172,4 +172,30 @@ describe('device and account-revision lock order', () => {
     expect(after[1]).toBeGreaterThan(before[1]!)
     expect(after[2]).toBeGreaterThan(before[2]!)
   }))
+
+  it('pre-locks exactly the accounts a presence fan-out advances', async () => fixture(async f => {
+    const owner = await human(f), friend = await human(f), member = await human(f), stranger = await human(f)
+    const host = await device(f, owner), watched = await agent(f, owner, host), peer = await agent(f, owner, host)
+    await group(f, [member, watched, peer])
+    const [a, b] = [watched, friend].sort()
+    await db.query('INSERT INTO identity.friendships(user_a_id,user_b_id) VALUES ($1,$2)', [a, b])
+    // Any chat a friendship opens is cleaned up with the fixture.
+    f.chats.push(...(await db.query<{ id: string }>('SELECT chat_id AS id FROM chat.chat_members WHERE user_id=ANY($1::text[]) AND chat_id<>ALL($2::text[])', [[watched, friend], f.chats])).rows.map(r => r.id))
+    const candidates = [owner, friend, member, stranger]
+    await heads(candidates)
+    const before = await Promise.all(candidates.map(revision))
+    await db.query('SELECT identity.fan_agent_presence_to_viewers($1, identity.build_agent_presence_payload($1))', [watched])
+    const after = await Promise.all(candidates.map(revision))
+    const advanced = candidates.filter((_, i) => after[i]! > before[i]!).sort()
+    const locked = (await db.query<{ id: string }>('SELECT identity.agent_presence_viewer_ids($1) AS id', [watched])).rows.map(r => r.id).sort()
+    expect(advanced).toEqual([owner, friend, member].sort())
+    expect(locked).toEqual(advanced)
+  }))
+
+  it('locks agent devices before any other BEFORE INSERT trigger on messages runs', async () => {
+    // tgtype bit 2 = BEFORE, bit 4 = INSERT; such triggers fire in name order.
+    const { rows } = await db.query<{ tgname: string }>(`SELECT tgname FROM pg_trigger
+      WHERE tgrelid='chat.messages'::regclass AND NOT tgisinternal AND tgtype & 2 = 2 AND tgtype & 4 = 4 ORDER BY tgname COLLATE "C"`)
+    expect(rows[0]?.tgname).toBe('messages_a_lock_agent_devices')
+  })
 })

@@ -103,7 +103,7 @@ describe('next version handoff HTTP protocol (#791)',()=>{
     const f=handoffs()
     const out=await handleProjectFiles(f.deps,requester,'file-handoff-request',ask) as Record<string,unknown>
     expect(f.objects.uploadBounds).toHaveBeenCalledWith(128,120)
-    expect(f.userRpc).toHaveBeenCalledWith('file_version_handoff_request',{p_id:handoff,p_item:item,p_expected:1,p_name:'notes.md',p_type:'text/markdown',
+    expect(f.userRpc).toHaveBeenCalledWith('file_version_handoff_request',{p_id:handoff,p_item:item,p_expected:1,p_chat:null,p_name:'notes.md',p_type:'text/markdown',
       p_size:100,p_sha:sha,p_ciphertext:128,p_reserve:128,p_message:ask.message,p_as:'agent-b'})
     expect(out).toMatchObject({status:'uploading',host_label:'Studio Mac',upload:{url:'https://origin.test',fields:{key:object},expires_at:'2026-10-24T00:02:00Z',max_bytes:128}})
   })
@@ -114,6 +114,23 @@ describe('next version handoff HTTP protocol (#791)',()=>{
       expect(await handleProjectFiles(f.deps,requester,'file-handoff-request',ask)).toEqual(answer)
     }
     expect(f.objects.upload).not.toHaveBeenCalled()
+  })
+  it('a new file names its chat without pretending a base version exists, and keeps the offline refusal',async()=>{
+    const f=handoffs(),{expected_version:_base,...file}=ask,body={...file,chat_id:'group'}
+    await handleProjectFiles(f.deps,requester,'file-handoff-request',body)
+    expect(f.userRpc).toHaveBeenCalledWith('file_version_handoff_request',expect.objectContaining({p_item:item,p_expected:null,p_chat:'group',p_as:'agent-b'}))
+    f.objects.upload.mockClear()
+    const offline={status:'host_offline',host_label:'Studio Mac',host_online:false}
+    f.userRpc.mockResolvedValueOnce({data:offline,error:null})
+    expect(await handleProjectFiles(f.deps,requester,'file-handoff-request',body)).toEqual(offline)
+    expect(f.objects.upload).not.toHaveBeenCalled()
+  })
+  it('rejects an ambiguous or missing creation target before provider admission',async()=>{
+    const f=handoffs()
+    for(const target of [{expected_version:1,chat_id:'group'},{expected_version:0},{expected_version:null},{expected_version:undefined}])
+      await expect(handleProjectFiles(f.deps,requester,'file-handoff-request',{...ask,...target})).rejects.toMatchObject({status:400})
+    expect(f.objects.uploadBounds).not.toHaveBeenCalled()
+    expect(f.userRpc).not.toHaveBeenCalled()
   })
   it('checks the stored ciphertext of the requester\'s own handoff before the key is committed',async()=>{
     const f=handoffs(),body={handoff_id:handoff,ciphertext_bytes:128,ciphertext_sha256:sha,key}

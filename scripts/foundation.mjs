@@ -7,14 +7,22 @@ export const foundationSql = readFileSync(foundationFile, 'utf8')
 export const foundationDigest = createHash('sha256').update(foundationSql).digest('hex')
 
 const migrationsDir = fileURLToPath(new URL('../supabase/migrations/', import.meta.url))
-/** Releases after the foundation, in file order. A release file is immutable once published; changes ship as a new file. */
+// Numeric filenames are unique for Supabase CLI. Published community ledger IDs
+// remain immutable when a colliding filename is renumbered; SQL bytes stay intact.
+const releaseIdentityByFile = {
+  '20261027120001_message_agent_wakes_readable.sql': '20261027120000_message_agent_wakes_readable',
+  '20261028010001_file_storage_classes.sql': '20261028010000_file_storage_classes',
+  '20261028070001_local_file_rename_carries_revision.sql': '20261028070000_local_file_rename_carries_revision',
+  '20261029050001_offline_project_removal.sql': '20261029050000_offline_project_removal',
+}
+/** Releases retain their published identity, digest and order independently of filename repairs. */
 export const releases = readdirSync(migrationsDir)
   .filter((file) => /^\d{14}_[a-z0-9_]+\.sql$/.test(file) && file !== '20261021000000_foundation.sql')
-  .sort()
   .map((file) => {
     const sql = readFileSync(migrationsDir + file, 'utf8')
-    return { version: file.slice(0, -4), sql, digest: createHash('sha256').update(sql).digest('hex') }
+    return { version: releaseIdentityByFile[file] ?? file.slice(0, -4), sql, digest: createHash('sha256').update(sql).digest('hex') }
   })
+  .sort((a, b) => a.version < b.version ? -1 : a.version > b.version ? 1 : 0)
 
 /** query runs a complete SQL request on one connection. No historical ledger is rewritten. */
 export async function installFoundation(query) {

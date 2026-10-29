@@ -29,6 +29,8 @@ pnpm run setup --client-dir /path/to/gugu
 - 新建的 API 函数默认禁止客户端执行，由 release 显式授权。
 - `identity.machine_limits_for(uuid)` 是安装策略接口，社区版使用安装级配置。设备所有权、群成员、消息与文件权限都由数据库判定。
 
+迁移文件的数字前缀保持唯一，以兼容 Supabase CLI 的版本标识。文件名修复通过 `scripts/foundation.mjs` 的显式映射保留已发布的完整 release 身份；社区安装仍按稳定身份排序。已有账本行和 SQL 字节保持不变，该映射不改写 Supabase 迁移历史。
+
 ## 文件服务
 
 附件上传、提交与签名下载使用你自己的 Supabase Storage。

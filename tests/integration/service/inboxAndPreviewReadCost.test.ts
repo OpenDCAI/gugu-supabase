@@ -24,6 +24,8 @@ let db: Client
 const id = (n: number) => `7e5d0000-7e5d-4000-8000-${String(n).padStart(12, '0')}`
 const OWNER = id(1), ALICE = id(2), PEER = id(3), LATE = id(4), OUTSIDER = id(5), AGENT = id(6)
 const GROUP = id(11)
+/** Another group in which LATE and OUTSIDER are members without a floor: their membership elsewhere must not leak into GROUP. */
+const ELSEWHERE = id(12)
 const EARLY = id(21), TARGET = id(22), WAKE = id(23), WHISPER_TO_AGENT = id(24), WHISPER_TO_PEER = id(25), DELETED = id(26)
 /** Woken rows whose reply preview is NULL: the target was deleted; a system line with no sender. */
 const WAKE_GONE_TARGET = id(27), WAKE_SYSTEM = id(28)
@@ -128,6 +130,11 @@ async function seed(): Promise<{ topic: string }> {
   }
   await db.query(`UPDATE chat.chat_members SET hide_history_before = NULL WHERE chat_id = $1`, [GROUP])
   await db.query(`UPDATE chat.chat_members SET hide_history_before = now() - interval '1 hour' WHERE chat_id = $1 AND user_id = $2`, [GROUP, LATE])
+  await db.query(`INSERT INTO chat.chats (id, kind, name, creator_user_id) VALUES ($1,'group','elsewhere',$2)`, [ELSEWHERE, LATE])
+  for (const user of [LATE, OUTSIDER]) {
+    await db.query(`INSERT INTO chat.chat_members (chat_id, user_id, role) VALUES ($1,$2,$3)`, [ELSEWHERE, user, user === LATE ? 'owner' : 'member'])
+  }
+  await db.query(`UPDATE chat.chat_members SET hide_history_before = NULL WHERE chat_id = $1`, [ELSEWHERE])
   const post = (msg: string, sender: string, minutesAgo: number, extra: { to?: string[]; whisper?: boolean; replyTo?: string } = {}) =>
     db.query(`INSERT INTO chat.messages (id, chat_id, sender_user_id, content, content_type, to_user_ids, is_whisper, reply_to_message_id, created_at)
               VALUES ($1,$2,$3,$4,'text',$5,$6,$7, now() - make_interval(mins => $8))`,
@@ -168,6 +175,10 @@ describe('inbox pull, messages_view and message row policy: same results, cost b
     }
     // The cases the rule distinguishes are all present: the floor hides early lines, whispers stay private, outsiders see nothing.
     const count = async (viewer: string) => (await as<{ n: string }>(viewer, 'SELECT count(*)::text AS n FROM chat.messages WHERE chat_id = $1', [GROUP]))[0]!.n
+    // LATE and OUTSIDER are floorless members of ELSEWHERE: that must neither lift LATE's floor in GROUP
+    // nor let OUTSIDER into GROUP (an uncorrelated membership check would do both).
+    const floorless = await as<{ chat_id: string }>(OUTSIDER, 'SELECT chat_id FROM chat.chat_members WHERE user_id = $1 AND hide_history_before IS NULL', [OUTSIDER])
+    expect(floorless.map((r) => r.chat_id)).toEqual([ELSEWHERE])
     expect(Number(await count(OWNER))).toBeGreaterThan(Number(await count(LATE)))
     expect(await count(OUTSIDER)).toBe('0')
     const alice = (await as<{ id: string }>(ALICE, 'SELECT id FROM chat.messages WHERE chat_id = $1', [GROUP])).map((r) => r.id)

@@ -18,6 +18,10 @@
 --    policy (chat.is_member, another lookup) once per row as well. The common case - a member without a
 --    history floor - is now one set of chat ids per query, which the planner hashes; members with a
 --    floor keep the correlated check exactly as before.
+--
+-- Replacing the view and the policy takes strong locks on chat.messages_view and chat.messages. Give up
+-- after 5 s instead of queueing behind long reads of the view and blocking every read behind us.
+SET LOCAL lock_timeout = '5s';
 
 CREATE OR REPLACE FUNCTION identity.pull_agent_inbox_v2(p_agent_user_id text, p_chat_id text DEFAULT NULL::text, p_after_seq bigint DEFAULT NULL::bigint, p_limit integer DEFAULT 80, p_scan_after jsonb DEFAULT NULL::jsonb, p_scan_max_ingest_seq bigint DEFAULT NULL::bigint) RETURNS TABLE(chat_id text, chat_kind text, chat_public_id integer, chat_name text, chat_creator_user_id text, listen_mode text, notification_level text, last_read_seq bigint, id text, seq bigint, sender_user_id text, sender_type text, sender_display_name text, sender_gugu_number integer, content text, content_type text, to_user_ids text[], is_whisper boolean, reply_to_message_id text, reply_to_sender_user_id text, reply_to_content text, thread_root_id text, is_thread_root boolean, created_at timestamp with time zone, scan_max_ingest_seq bigint, via_app text, file_item_id uuid, file_version integer, file_blob_id uuid)
     LANGUAGE plpgsql STABLE SECURITY DEFINER

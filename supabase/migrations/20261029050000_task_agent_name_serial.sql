@@ -54,25 +54,25 @@ BEGIN
             WHERE id = v_minted.id::text AND name_serial IS NULL;
         END IF;
     ELSE
-        -- The harness label is metadata from the caller's existing type registry, never inferred
-        -- from an explicit task name. Legacy explicit callers may omit it and retain a NULL serial.
-        IF p_name_mode = 'serial' THEN
-            v_parts := regexp_match(v_name, '^(.*\S)\s+(\d{1,9})$');
-            v_base := COALESCE(NULLIF(btrim(p_name_serial_base), ''), v_parts[1], v_name);
-        ELSE
-            v_base := NULLIF(btrim(p_name_serial_base), '');
-        END IF;
-        IF v_base IS NOT NULL THEN
-            PERFORM pg_advisory_xact_lock(hashtextextended(v_owner || '/' || v_base, 6396));
-            v_serial := CASE WHEN p_name_mode = 'serial' THEN COALESCE(v_parts[2]::INTEGER, 1) ELSE 1 END;
+        -- A supplied harness base opts into task-name metadata. Without it, preserve the old
+        -- nine-argument explicit-name collision contract, using this same allocator and lock.
+        v_parts := regexp_match(v_name, '^(.*\S)\s+(\d{1,9})$');
+        v_base := COALESCE(NULLIF(btrim(p_name_serial_base), ''), v_parts[1], v_name);
+        PERFORM pg_advisory_xact_lock(hashtextextended(v_owner || '/' || v_base, 6396));
+        IF p_name_mode = 'serial' OR NULLIF(btrim(p_name_serial_base), '') IS NOT NULL OR EXISTS (
+            SELECT 1 FROM identity.users u
+            WHERE u.type = 'agent' AND u.owner_user_id = v_owner AND u.display_name = v_name
+        ) THEN
+            v_serial := CASE WHEN p_name_mode = 'explicit' AND NULLIF(btrim(p_name_serial_base), '') IS NOT NULL
+                THEN 1 ELSE COALESCE(v_parts[2]::INTEGER, CASE WHEN p_name_mode = 'serial' THEN 1 ELSE 2 END) END;
             -- 原子占号:起号 = GREATEST(这个前缀用过的最大号 + 1, 候选号)。
             INSERT INTO identity.agent_name_serials AS s (owner_user_id, base, high_water)
             VALUES (v_owner, v_base, v_serial)
             ON CONFLICT (owner_user_id, base) DO UPDATE
                 SET high_water = GREATEST(s.high_water + 1, EXCLUDED.high_water), updated_at = now()
             RETURNING s.high_water INTO v_serial;
-            IF p_name_mode = 'serial' THEN
-                -- Preserve legacy placeholder collision handling. Explicit names remain exactly chosen.
+            IF p_name_mode = 'serial' OR NULLIF(btrim(p_name_serial_base), '') IS NULL THEN
+                -- Only the new explicit task API permits duplicate chosen names.
                 WHILE EXISTS (
                     SELECT 1 FROM identity.users u
                     WHERE u.type = 'agent' AND u.owner_user_id = v_owner AND u.display_name = v_base || ' ' || v_serial
@@ -88,7 +88,8 @@ BEGIN
         SELECT * INTO v_minted FROM identity.create_owned_agent(
             v_name, NULL, p_agent_type, p_device_id, p_local_path, NULL, true, NULL, p_agent_id
         );
-        UPDATE identity.users SET name_serial = v_serial WHERE id = v_minted.id::text;
+        UPDATE identity.users SET name_serial = v_serial WHERE id = v_minted.id::text
+            AND (p_name_mode = 'serial' OR NULLIF(btrim(p_name_serial_base), '') IS NOT NULL);
     END IF;
 
     -- 项目 = 群。

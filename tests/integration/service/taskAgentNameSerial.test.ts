@@ -63,6 +63,10 @@ describe('stable task agent name serial metadata', () => {
     const id = randomUUID()
     await db.query(provision, [id, 'Fix issue 999', 'explicit', device, 'Codex'])
     expect(await serial(id)).toBe(1)
+    const looksLikePlaceholder = randomUUID()
+    const row = (await db.query(provision, [looksLikePlaceholder, 'Codex 999', 'explicit', device, 'Codex'])).rows[0]
+    expect(row.display_name).toBe('Codex 999')
+    expect(await serial(looksLikePlaceholder)).toBe(2)
   })
 
   it('attests an existing task placeholder but does not guess a renamed legacy number', async () => {

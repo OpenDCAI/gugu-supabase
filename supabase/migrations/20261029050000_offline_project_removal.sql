@@ -44,7 +44,9 @@ $$;
 REVOKE ALL ON FUNCTION identity.fetch_fair_pending_device_commands(text, integer, text[]) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION identity.fetch_fair_pending_device_commands(text, integer, text[]) TO authenticated, service_role;
 
-CREATE FUNCTION identity.set_device_project_removed(p_device_id text, p_project_id text, p_removed boolean)
+CREATE FUNCTION identity.set_device_project_removed(
+    p_device_id text, p_project_id text, p_removed boolean, p_expected_command_id uuid DEFAULT NULL
+)
 RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' AS $$
 DECLARE
     v_me uuid := auth.uid();
@@ -74,8 +76,15 @@ BEGIN
     IF v_project.removal_command_id IS DISTINCT FROM v_before THEN
         RAISE EXCEPTION 'Project changed while removal was being requested; try again';
     END IF;
-    IF p_removed = (v_project.removal_requested_at IS NOT NULL)
-       AND ((NOT p_removed AND v_before IS NULL) OR v_previous.status IN ('pending', 'running', 'done')) THEN
+    IF NOT p_removed THEN
+        IF v_project.removal_requested_at IS NULL AND v_before IS NULL THEN RETURN NULL; END IF;
+        IF p_expected_command_id IS NULL THEN RAISE EXCEPTION 'Undo requires the removal command'; END IF;
+        IF v_project.removal_requested_at IS NULL AND v_previous.payload->>'undo_of' = p_expected_command_id::text THEN
+            IF v_previous.status IN ('pending', 'running', 'done') THEN RETURN v_before; END IF;
+        ELSIF v_project.removal_requested_at IS NULL OR v_before IS DISTINCT FROM p_expected_command_id THEN
+            RAISE EXCEPTION 'A newer project request superseded this undo';
+        END IF;
+    ELSIF v_project.removal_requested_at IS NOT NULL AND v_previous.status IN ('pending', 'running', 'done') THEN
         RETURN v_before;
     END IF;
     -- Cancel only unclaimed work. A running removal settles before its queued undo.
@@ -83,7 +92,8 @@ BEGIN
     WHERE id = v_before AND user_id = v_me AND status = 'pending';
     INSERT INTO identity.gugu_device_commands (user_id, device_id, type, payload)
     VALUES (v_me, p_device_id, 'project.set_removed', jsonb_build_object(
-        'project_id', p_project_id, 'removed', p_removed, 'folders', v_project.folders
+        'project_id', p_project_id, 'removed', p_removed, 'folders', v_project.folders,
+        'undo_of', CASE WHEN NOT p_removed THEN p_expected_command_id ELSE NULL END
     )) RETURNING id INTO v_command;
     UPDATE identity.device_projects SET
         removal_requested_at = CASE WHEN p_removed THEN COALESCE(removal_requested_at, now()) ELSE NULL END,
@@ -94,8 +104,8 @@ BEGIN
     RETURN v_command;
 END;
 $$;
-REVOKE ALL ON FUNCTION identity.set_device_project_removed(text, text, boolean) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION identity.set_device_project_removed(text, text, boolean) TO authenticated;
+REVOKE ALL ON FUNCTION identity.set_device_project_removed(text, text, boolean, uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION identity.set_device_project_removed(text, text, boolean, uuid) TO authenticated;
 
 -- Release the snapshot only after a successful undo, never after a failed apply.
 -- Completed removals retain their original snapshot for a later undo.
@@ -124,7 +134,13 @@ FOR EACH ROW EXECUTE FUNCTION identity.settle_device_project_removal();
 -- publish_device_projects is replaced below only to preserve the owner's snapshot
 -- while a removal is requested or its undo has not completed.
 
-CREATE OR REPLACE FUNCTION identity.publish_device_projects(p_device_id text, p_projects jsonb) RETURNS boolean
+-- New publishers read completed removal ids BEFORE reading local records. A row
+-- appearing in that fresh read is an independent local Restore/new attachment.
+-- Old or pre-cleanup publications have no matching acknowledgment and stay held.
+DROP FUNCTION identity.publish_device_projects(text, jsonb);
+CREATE FUNCTION identity.publish_device_projects(
+    p_device_id text, p_projects jsonb, p_applied_removals jsonb DEFAULT '{}'::jsonb
+) RETURNS boolean
     LANGUAGE plpgsql SECURITY DEFINER
     SET search_path TO ''
     AS $$
@@ -153,6 +169,11 @@ BEGIN
     END IF;
     IF jsonb_array_length(p_projects) > 1000 THEN
         RAISE EXCEPTION 'A device publishes at most 1000 projects';
+    END IF;
+    IF p_applied_removals IS NULL OR jsonb_typeof(p_applied_removals) <> 'object'
+       OR (SELECT count(*) FROM jsonb_object_keys(p_applied_removals)) > 1000
+       OR EXISTS (SELECT 1 FROM jsonb_each(p_applied_removals) e WHERE jsonb_typeof(e.value) <> 'string') THEN
+        RAISE EXCEPTION 'Applied removals must be a project to command map';
     END IF;
     FOR v_project IN SELECT value FROM jsonb_array_elements(p_projects) LOOP
         IF jsonb_typeof(v_project) <> 'object'
@@ -188,6 +209,16 @@ BEGIN
         RAISE EXCEPTION 'Each project is published once';
     END IF;
 
+    UPDATE identity.device_projects d SET removal_requested_at = NULL, removal_command_id = NULL, updated_at = now()
+    FROM identity.gugu_device_commands c
+    WHERE d.device_id = p_device_id AND d.user_id = v_me AND d.removal_requested_at IS NOT NULL
+      AND c.id = d.removal_command_id AND c.user_id = v_me AND c.status = 'done'
+      AND c.type = 'project.set_removed' AND c.payload->>'removed' = 'true'
+      AND p_applied_removals->>d.local_project_id = c.id::text
+      AND EXISTS (SELECT 1 FROM jsonb_array_elements(p_projects) p WHERE p.value->>'local_project_id' = d.local_project_id);
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    v_changed := v_rows > 0;
+
     DELETE FROM identity.device_projects d
      WHERE d.device_id = p_device_id
        AND d.removal_requested_at IS NULL AND d.removal_command_id IS NULL
@@ -195,7 +226,7 @@ BEGIN
            SELECT 1 FROM jsonb_array_elements(p_projects) p WHERE p.value ->> 'local_project_id' = d.local_project_id
        );
     GET DIAGNOSTICS v_rows = ROW_COUNT;
-    v_changed := v_rows > 0;
+    v_changed := v_changed OR v_rows > 0;
 
     -- Folders are stored with exactly the four keys, so a row compares equal when nothing a reader sees changed.
     INSERT INTO identity.device_projects AS d
@@ -233,5 +264,5 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION identity.publish_device_projects(text, jsonb) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION identity.publish_device_projects(text, jsonb) TO authenticated, service_role;
+REVOKE ALL ON FUNCTION identity.publish_device_projects(text, jsonb, jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION identity.publish_device_projects(text, jsonb, jsonb) TO authenticated, service_role;

@@ -276,9 +276,9 @@ describe('identity.publish_device_projects', () => {
 })
 
 describe('recoverable offline project removal', () => {
-  const request = async (owner: string, target: string, removed: boolean) => {
+  const request = async (owner: string, target: string, removed: boolean, expected: string | null = null) => {
     await asUser(owner)
-    return (await database.query<{ id: string | null }>('SELECT identity.set_device_project_removed($1,$2,$3) AS id', [target, 'offline', removed])).rows[0]!.id
+    return (await database.query<{ id: string | null }>('SELECT identity.set_device_project_removed($1,$2,$3,$4) AS id', [target, 'offline', removed, expected])).rows[0]!.id
   }
   const snapshot = async () => {
     await asService()
@@ -309,7 +309,7 @@ describe('recoverable offline project removal', () => {
     expect((await database.query('SELECT * FROM identity.fetch_fair_pending_device_commands($1,8)', [target])).rows).toEqual([])
     expect((await database.query<{ id: string }>("SELECT id FROM identity.fetch_fair_pending_device_commands($1,8,ARRAY['project.set_removed'])", [target])).rows.map(r => r.id)).toEqual([remove])
     await database.query("UPDATE identity.gugu_device_commands SET status='running' WHERE id=$1", [remove])
-    const undo = await request(owner, target, false)
+    const undo = await request(owner, target, false, remove)
     expect(undo).not.toBe(remove)
     expect((await database.query("SELECT * FROM identity.fetch_fair_pending_device_commands($1,8,ARRAY['project.set_removed'])", [target])).rows).toEqual([])
     await database.query("UPDATE identity.gugu_device_commands SET status='done' WHERE id=$1", [remove])
@@ -318,7 +318,8 @@ describe('recoverable offline project removal', () => {
   it('cancels only unclaimed removal, preserves the restore snapshot until success, then accepts live publication', async () => {
     const { owner, target } = await setup()
     const remove = await request(owner, target, true)
-    const undo = await request(owner, target, false)
+    const undo = await request(owner, target, false, remove)
+    expect(await request(owner, target, false, remove)).toBe(undo)
     expect((await database.query<{ status: string }>('SELECT status FROM identity.gugu_device_commands WHERE id=$1', [remove])).rows[0]!.status).toBe('error')
     expect(await publish(owner, target, [])).toBe(false)
     expect(await snapshot()).toMatchObject({ removal_requested_at: null, removal_command_id: undo, folders: project('offline').folders })
@@ -346,5 +347,32 @@ describe('recoverable offline project removal', () => {
     await asAnon()
     expect(await fails('SELECT identity.set_device_project_removed($1,$2,true)', [target, 'offline'])).toMatch(/permission denied/i)
     expect(await request(owner, target, true)).toBeTruthy()
+  })
+  it('allows an independently restored task to republish only after observing this completed removal', async () => {
+    const { owner, target } = await setup()
+    const removal = await request(owner, target, true)
+    const restored = [{ ...project('offline'), folders: [] }]
+    await asUser(owner)
+    expect((await database.query<{ changed: boolean }>('SELECT identity.publish_device_projects($1,$2,$3) AS changed', [target, JSON.stringify(restored), JSON.stringify({ offline: removal })])).rows[0]!.changed).toBe(false)
+    await database.query("UPDATE identity.gugu_device_commands SET status='done' WHERE id=$1", [removal])
+    expect((await database.query<{ changed: boolean }>('SELECT identity.publish_device_projects($1,$2,$3) AS changed', [target, '[]', JSON.stringify({ offline: removal })])).rows[0]!.changed).toBe(false)
+    expect((await snapshot()).removal_command_id).toBe(removal)
+    expect(await publish(owner, target, restored)).toBe(false)
+    await asUser(owner)
+    expect((await database.query<{ changed: boolean }>('SELECT identity.publish_device_projects($1,$2,$3) AS changed', [target, JSON.stringify(restored), JSON.stringify({ offline: removal })])).rows[0]!.changed).toBe(true)
+    expect(await snapshot()).toMatchObject({ removal_requested_at: null, removal_command_id: null, folders: [] })
+  })
+  it('rejects an obsolete Undo and ignores old Restore acknowledgments after a newer request', async () => {
+    const { owner, target } = await setup()
+    const first = await request(owner, target, true)
+    await database.query("UPDATE identity.gugu_device_commands SET status='done' WHERE id=$1", [first])
+    const undo = await request(owner, target, false, first)
+    await database.query("UPDATE identity.gugu_device_commands SET status='done' WHERE id=$1", [undo])
+    await publish(owner, target, [project('offline')])
+    const current = await request(owner, target, true)
+    expect(await fails('SELECT identity.set_device_project_removed($1,$2,false,$3)', [target, 'offline', first])).toMatch(/newer|superseded/i)
+    expect((await database.query<{ changed: boolean }>('SELECT identity.publish_device_projects($1,$2,$3) AS changed', [target, JSON.stringify([project('offline')]), JSON.stringify({ offline: first })])).rows[0]!.changed).toBe(false)
+    expect((await snapshot()).removal_command_id).toBe(current)
+    expect(await request(owner, target, false, current)).toBeTruthy()
   })
 })

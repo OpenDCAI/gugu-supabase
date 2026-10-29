@@ -11,7 +11,8 @@
 --    `order=seq.desc`, `limit=4n`, computed column `preview`) reads every visible row of those chats
 --    and sorts them, so it paid one call per message in the chat. The reply columns are now scalar
 --    subqueries: unselected, they are never evaluated; selected, only for the rows the query returns
---    (after the sort and limit).
+--    (after the sort and limit). Each reply column read is its own call, so a returned reply row that
+--    reads all three columns (or the whole row, as `preview` does) makes three calls instead of one.
 --
 -- 3. messages_select_member probed chat_members once per row, and that probe ran the chat_members row
 --    policy (chat.is_member, another lookup) once per row as well. The common case - a member without a

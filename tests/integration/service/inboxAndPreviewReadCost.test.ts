@@ -25,6 +25,9 @@ const id = (n: number) => `7e5d0000-7e5d-4000-8000-${String(n).padStart(12, '0')
 const OWNER = id(1), ALICE = id(2), PEER = id(3), LATE = id(4), OUTSIDER = id(5), AGENT = id(6)
 const GROUP = id(11)
 const EARLY = id(21), TARGET = id(22), WAKE = id(23), WHISPER_TO_AGENT = id(24), WHISPER_TO_PEER = id(25), DELETED = id(26)
+/** Woken rows whose reply preview is NULL: the target was deleted; a system line with no sender. */
+const WAKE_GONE_TARGET = id(27), WAKE_SYSTEM = id(28)
+const PULLED = [WAKE, WHISPER_TO_AGENT, WAKE_GONE_TARGET, WAKE_SYSTEM]
 const BACKLOG = 40
 const backlogId = (i: number) => id(100 + i)
 
@@ -137,6 +140,9 @@ async function seed(): Promise<{ topic: string }> {
   await post(WHISPER_TO_PEER, OWNER, 30, { to: [PEER], whisper: true })
   await post(DELETED, ALICE, 20)
   await db.query('UPDATE chat.messages SET deleted_at = now() WHERE id = $1', [DELETED])
+  await post(WAKE_GONE_TARGET, OWNER, 10, { to: [AGENT], replyTo: DELETED })
+  await db.query(`INSERT INTO chat.messages (id, chat_id, sender_user_id, content, content_type, to_user_ids, created_at)
+                  VALUES ($1,$2,NULL,'notice','system',$3, now() - interval '5 minutes')`, [WAKE_SYSTEM, GROUP, [AGENT]])
   const topic = (await as<{ chat_id: string }>(OWNER, 'SELECT chat_id FROM chat.create_topic($1,$2,$3,NULL,NULL)', [GROUP, TARGET, 'topic']))[0]!.chat_id
   await db.query(`INSERT INTO chat.messages (id, chat_id, sender_user_id, content, content_type, reply_to_message_id) VALUES ($1,$2,$3,'in topic','text',$4)`,
     [id(31), topic, ALICE, TARGET])
@@ -151,6 +157,10 @@ describe('inbox pull, messages_view and message row policy: same results, cost b
   it('the row policy admits exactly the rows the previous policy admitted, for every viewer', async () => rollback(async () => {
     const { topic } = await seed()
     for (const viewer of VIEWERS) {
+      // Premise of evaluating the previous expression without row policies: its chat_members probe only ever
+      // looked at the caller's own rows, and the caller's chat_members policy admits all of them.
+      const own = 'SELECT chat_id, hide_history_before FROM chat.chat_members WHERE user_id = $1 ORDER BY chat_id'
+      expect(await as(viewer, own, [viewer]), `own memberships of ${viewer}`).toEqual(await as(viewer, own, [viewer], 'postgres'))
       const now = (await as<{ id: string }>(viewer, 'SELECT id FROM chat.messages WHERE chat_id = ANY($1) ORDER BY id', [[GROUP, topic]])).map((r) => r.id)
       const before = (await as<{ id: string }>(viewer,
         `SELECT id FROM chat.messages AS messages WHERE chat_id = ANY($1) AND ${OLD_POLICY} ORDER BY id`, [[GROUP, topic]], 'postgres')).map((r) => r.id)
@@ -226,21 +236,25 @@ describe('inbox pull, messages_view and message row policy: same results, cost b
       const before = await as<{ row: string }>(OWNER, `SELECT p::text AS row FROM (${OLD_PULL}) p`, args, 'postgres')
       expect(now, `pull ${JSON.stringify(args.slice(1, 5))}`).toEqual(before)
     }
-    const ids = (await as<{ id: string }>(OWNER, 'SELECT id FROM identity.pull_agent_inbox_v2($1)', [AGENT])).map((r) => r.id)
-    expect(ids).toEqual([WAKE, WHISPER_TO_AGENT])
+    const rows = await as<{ id: string; reply_to_content: string | null; sender_display_name: string | null }>(OWNER,
+      'SELECT id, reply_to_content, sender_display_name FROM identity.pull_agent_inbox_v2($1)', [AGENT])
+    expect(rows.map((r) => r.id)).toEqual(PULLED)
+    // The rows whose left joins find nothing are kept, with NULLs: a deleted reply target, a sender-less system line.
+    expect(rows.find((r) => r.id === WAKE_GONE_TARGET)!.reply_to_content).toBeNull()
+    expect(rows.find((r) => r.id === WAKE_SYSTEM)!.sender_display_name).toBeNull()
     // A consumed row leaves both, identically.
     await db.query(`INSERT INTO chat.message_deliveries (message_id, device_id, status, read_at) VALUES ($1, 'gugu-agent:' || $2, 'read', now())`, [WAKE, AGENT])
     const after = await as<{ id: string }>(OWNER, 'SELECT id FROM identity.pull_agent_inbox_v2($1,NULL,NULL,80,NULL,$2)', [AGENT, scan])
     const afterBefore = await as<{ id: string }>(OWNER, `SELECT p.id FROM (${OLD_PULL}) p`, [AGENT, null, null, 80, null, scan], 'postgres')
-    expect(after.map((r) => r.id)).toEqual([WHISPER_TO_AGENT])
-    expect(afterBefore.map((r) => r.id)).toEqual([WHISPER_TO_AGENT])
+    expect(after.map((r) => r.id)).toEqual(PULLED.slice(1))
+    expect(afterBefore.map((r) => r.id)).toEqual(PULLED.slice(1))
   }))
 
   it('pull_agent_inbox_v2 checks reply readability only for the rows it returns, not for the backlog', async () => rollback(async () => {
     await seed()
     const pull = () => delta(() => as<{ id: string }>(OWNER, 'SELECT id FROM identity.pull_agent_inbox_v2($1)', [AGENT]))
     const [rows, cost] = await pull()
-    expect(rows.map((r) => r.id)).toEqual([WAKE, WHISPER_TO_AGENT])
+    expect(rows.map((r) => r.id)).toEqual(PULLED)
     expect(cost.canRead).toBeGreaterThan(0) // the counter is live: both returned rows are replies
     // Triple the backlog: more replies after the agent's read cursor that do not wake it. Same page, same cost.
     for (let i = BACKLOG; i < 3 * BACKLOG; i++) {
@@ -248,7 +262,7 @@ describe('inbox pull, messages_view and message row policy: same results, cost b
                       VALUES ($1,$2,$3,'more','text',$4,$5)`, [backlogId(i), GROUP, PEER, [ALICE], TARGET])
     }
     const [again, more] = await pull()
-    expect(again.map((r) => r.id)).toEqual([WAKE, WHISPER_TO_AGENT])
+    expect(again.map((r) => r.id)).toEqual(PULLED)
     expect(more.canRead).toBe(cost.canRead)
   }))
 

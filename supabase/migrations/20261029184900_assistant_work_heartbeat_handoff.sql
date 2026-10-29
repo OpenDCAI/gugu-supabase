@@ -14,7 +14,7 @@ CREATE INDEX assistant_work_events_active_target ON identity.assistant_work_even
 
 CREATE FUNCTION identity.assistant_work_prompt_ready_target() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
-DECLARE v_now timestamptz := clock_timestamp(); v_count integer;
+DECLARE v_now timestamptz := clock_timestamp(); v_count integer; v_resumed boolean;
 BEGIN
     IF (TG_OP='UPDATE' AND NEW.last_heartbeat_at IS NOT DISTINCT FROM OLD.last_heartbeat_at)
       OR NEW.last_heartbeat_at<=v_now-interval '90 seconds'
@@ -22,6 +22,17 @@ BEGIN
         WHERE d.device_id=NEW.device_id AND d.user_id=NEW.owner_user_id) THEN
         RETURN NEW;
     END IF;
+    -- A broadcast receipt only proves publication, not receipt by the target.
+    -- Re-prompt once when the device returns, even for the same retry epoch.
+    IF TG_OP='UPDATE' THEN
+        v_resumed := OLD.last_heartbeat_at<=v_now-interval '90 seconds';
+    ELSE
+        v_resumed := true;
+    END IF;
+    v_resumed := v_resumed AND NOT EXISTS (
+      SELECT 1 FROM identity.runtime_instances r
+      WHERE r.device_id=NEW.device_id AND r.owner_user_id=NEW.owner_user_id
+        AND r.instance_id<>NEW.instance_id AND r.last_heartbeat_at>v_now-interval '90 seconds');
     WITH candidates AS MATERIALIZED (
       SELECT e.seq,ready.eligible_at FROM identity.assistant_work_events e
       CROSS JOIN LATERAL (SELECT CASE WHEN e.kind='dispatch' THEN e.to_device_id
@@ -41,7 +52,7 @@ BEGIN
               (e.kind<>'dispatch' AND older.kind<>'dispatch') OR
               (e.kind='dispatch' AND older.kind='dispatch' AND older.to_device_id=e.to_device_id
                 AND older.to_session_id=e.to_session_id)))
-        AND (prior.event_seq IS NULL OR prior.target_device_id IS DISTINCT FROM NEW.device_id
+        AND (v_resumed OR prior.event_seq IS NULL OR prior.target_device_id IS DISTINCT FROM NEW.device_id
           OR prior.eligible_at IS DISTINCT FROM ready.eligible_at)
       -- A heartbeat must neither block a delivery nor remember a stale snapshot
       -- after a concurrent admission has retired its hint.
@@ -50,13 +61,22 @@ BEGIN
     INSERT INTO identity.assistant_work_ready_hints AS hinted(event_seq,target_device_id,eligible_at)
       SELECT seq,NEW.device_id,eligible_at FROM candidates
       ON CONFLICT(event_seq) DO UPDATE SET target_device_id=EXCLUDED.target_device_id,eligible_at=EXCLUDED.eligible_at
-        WHERE hinted.target_device_id IS DISTINCT FROM EXCLUDED.target_device_id
+        WHERE v_resumed OR hinted.target_device_id IS DISTINCT FROM EXCLUDED.target_device_id
           OR hinted.eligible_at IS DISTINCT FROM EXCLUDED.eligible_at;
     GET DIAGNOSTICS v_count=ROW_COUNT;
     IF v_count>0 THEN
         PERFORM chat.send_user_event('{}'::jsonb,'assistant_work_changed','gugu:user:'||NEW.owner_user_id::text||':events',true);
     END IF;
     RETURN NEW;
+EXCEPTION
+    -- PostgreSQL excludes query_canceled from OTHERS. A publication timeout is
+    -- also best effort: roll back its hint receipt, preserving the heartbeat.
+    WHEN query_canceled THEN
+        RAISE LOG 'Assistant work ready hint failed (SQLSTATE %)',SQLSTATE;
+        RETURN NEW;
+    WHEN OTHERS THEN
+        RAISE LOG 'Assistant work ready hint failed (SQLSTATE %)',SQLSTATE;
+        RETURN NEW;
 END;
 $$;
 REVOKE ALL ON FUNCTION identity.assistant_work_prompt_ready_target() FROM PUBLIC,anon,authenticated;

@@ -31,7 +31,7 @@ const claim = (runtime = instance, limit = 20) => as(owner, () => call<{ events:
 const settle = (event: Delivery, stage = 'executor_admitted', runtime = instance, receipt = {}) => as(owner, () => call('assistant_work_outbox_settle', [runtime,event.message_id,event.lease_token,stage,stage === 'retry' ? 'CHANNEL_UNAVAILABLE' : null,5,JSON.stringify(receipt)]))
 
 describe('a live work target is prompted after delivery hands back to it', () => {
-  const notices = async () => Number((await db.query("SELECT count(*) AS n FROM realtime.messages WHERE topic=$1 AND event='assistant_work_changed'", [`gugu:user:${owner}:events`])).rows[0].n)
+  const notices = async () => Number((await db.query("SELECT count(*) AS n FROM realtime.messages WHERE topic=ANY($1) AND event='assistant_work_changed'", [[`gugu:user:${owner}:events`, `gugu:user:${stranger}:events`]])).rows[0].n)
   const heartbeat = (runtime: string) => db.query('UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp() WHERE instance_id=$1', [runtime])
 
   it.each(['dispatch', 'progress'])('prompts a resumed %s target when a delegated attempt becomes retryable', async kind => {
@@ -93,6 +93,74 @@ describe('a live work target is prompted after delivery hands back to it', () =>
     expect(await notices()).toBe(before + 1)
     const row = (await db.query('SELECT sum(attempts)::int AS attempts,sum(failed_attempts)::int AS failures FROM identity.assistant_work_events WHERE owner_user_id=$1', [owner])).rows[0]
     expect(row).toEqual({ attempts: 0, failures: 0 })
+  })
+
+  it('never prompts another device ready work or overwrites that device hint', async () => {
+    await commit(randomUUID(), [dispatch()], task())
+    const before = await notices()
+    await heartbeat(instance)
+    expect(await notices()).toBe(before)
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 1)
+    await heartbeat(instance)
+    await heartbeat(workerInstance)
+    expect(await notices()).toBe(before + 1)
+  })
+
+  it.each(['stale runtime', 'new runtime'])('re-prompts an already hinted retry when its target resumes with a %s', async mode => {
+    await commit(randomUUID(), [dispatch()], task())
+    await heartbeat(workerInstance)
+    await db.query("UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp()-interval '91 seconds' WHERE instance_id=$1", [workerInstance])
+    const before = await notices()
+    const resumed = mode === 'stale runtime' ? workerInstance : randomUUID()
+    if (mode === 'stale runtime') await heartbeat(resumed)
+    else await db.query('INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id) VALUES($1,$2,$3)', [resumed, device, owner])
+    expect(await notices()).toBe(before + 1)
+    await heartbeat(resumed)
+    expect(await notices()).toBe(before + 1)
+  })
+
+  it('does not re-prompt a stale sibling runtime when the target still has a fresh runtime', async () => {
+    await commit(randomUUID(), [dispatch()], task())
+    await heartbeat(workerInstance)
+    const sibling = randomUUID()
+    await db.query("INSERT INTO identity.runtime_instances(instance_id,device_id,owner_user_id,last_heartbeat_at) VALUES($1,$2,$3,clock_timestamp()-interval '91 seconds')", [sibling, device, owner])
+    const before = await notices()
+    await heartbeat(sibling)
+    expect(await notices()).toBe(before)
+  })
+
+  it.each(['raised error', 'statement timeout'])('keeps the heartbeat when hint publication encounters a %s', async mode => {
+    const event = dispatch()
+    await commit(randomUUID(), [event], task())
+    const previous = (await db.query('SELECT last_heartbeat_at::text AS heartbeat FROM identity.runtime_instances WHERE instance_id=$1', [workerInstance])).rows[0].heartbeat
+    await db.query('SAVEPOINT publication_fault')
+    try {
+      // Fault the publisher boundary directly: realtime.send swallows ordinary
+      // message-insertion errors itself. A statement timeout is real, not a mock.
+      const original = (await db.query("SELECT pg_get_functiondef('chat.send_user_event(jsonb,text,text,boolean)'::regprocedure) AS sql")).rows[0].sql as string
+      const fault = original.replace(/AS \$function\$[\s\S]*\$function\$/, `AS $function$ BEGIN
+        IF current_setting('gugu.test.hint_failure',true)='on' THEN
+          ${mode === 'statement timeout' ? "PERFORM pg_sleep(1);" : "RAISE EXCEPTION 'Fixture hint publication unavailable';"}
+        END IF;
+        PERFORM realtime.send(p_payload,p_event,p_topic,p_private);
+        RETURN;
+      END; $function$`)
+      expect(fault).not.toBe(original)
+      await db.query(fault)
+      const before = await notices()
+      await db.query("SELECT set_config('gugu.test.hint_failure','on',true)")
+      if (mode === 'statement timeout') await db.query("SET LOCAL statement_timeout='100ms'")
+      const result = await heartbeat(workerInstance).then(() => 'ok', error => error.code)
+      expect(result).toBe('ok')
+      await db.query("SET LOCAL statement_timeout='0'")
+      expect((await db.query('SELECT last_heartbeat_at>$2 AS renewed FROM identity.runtime_instances WHERE instance_id=$1', [workerInstance, previous])).rows[0].renewed).toBe(true)
+      expect(await notices()).toBe(before)
+      expect(Number((await db.query('SELECT count(*) AS n FROM identity.assistant_work_ready_hints WHERE event_seq=(SELECT seq FROM identity.assistant_work_events WHERE message_id=$1)', [event.message_id])).rows[0].n)).toBe(0)
+      await db.query("SELECT set_config('gugu.test.hint_failure','off',true)")
+      await heartbeat(workerInstance)
+      expect(await notices()).toBe(before + 1)
+    } finally { await db.query('ROLLBACK TO SAVEPOINT publication_fault') }
   })
 
   it('prompts again for a later retry eligibility time, then retires its hint on admission', async () => {
@@ -184,7 +252,11 @@ describe('a live work target is prompted after delivery hands back to it', () =>
       else await db.query("UPDATE identity.assistant_work_events SET delivery_state='admitted',executor_admitted_at=clock_timestamp() WHERE message_id=$1", [event.message_id])
       await other.query('BEGIN')
       await other.query("SET LOCAL statement_timeout='500ms'")
-      const second = await other.query('UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp() WHERE instance_id=$1', [alternate]).then(() => 'ok', error => error.code)
+      let deadline: ReturnType<typeof setTimeout> | undefined
+      const second = await Promise.race([
+        other.query('UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp() WHERE instance_id=$1', [alternate]).then(() => 'ok', error => error.code),
+        new Promise<string>(resolve => { deadline = setTimeout(() => resolve('blocked on delivery'), 250) }),
+      ]).finally(() => { if (deadline) clearTimeout(deadline) })
       expect(second).toBe('ok') // The first transaction still holds the event lock.
       await other.query('COMMIT')
       await db.query('COMMIT')

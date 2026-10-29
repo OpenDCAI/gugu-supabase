@@ -16,8 +16,9 @@ services.
   `Content-Length` so browser downloads can inspect range responses.
 
 Deployment tooling merges these fields into each service's existing CORS plugin. It
-preserves unrelated exposed headers, origins, allowed methods, credentials, routes
-and authentication plugins.
+preserves unrelated exposed headers, origins, allowed methods, credentials and
+routes. The CLI's boot file carries no authentication plugins or consumers, and must
+not gain any (see below).
 
 ## Admin routes: `admin-routes.json`
 
@@ -37,8 +38,11 @@ Each listed service gets `key-auth` with `hide_credentials: true` and `acl` allo
 only group `admin`. One `service_role` consumer in that group holds the stack's
 existing service-role JWT and secret key. Self-hosted Supabase uses the same
 pattern. Deployment tooling reads both keys from the running gateway at deploy time,
-never from source. Without a key, and with the anon or publishable key, these paths
-must answer 401 or 403 at the gateway, never 2xx. Tenant routes are unchanged.
+never from source. A GET or POST to these paths without a key, or with the anon or
+publishable key, must answer 401 or 403 at the gateway, never 2xx. A CORS preflight
+(`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is the exception: the
+`cors` plugin runs before `key-auth` and answers it without reaching the upstream.
+Tenant routes are unchanged.
 
 Studio and Vector reach postgres-meta and Logflare directly on the Docker network.
 The CLI's PostgREST readiness probe sends the secret key, so it keeps working.

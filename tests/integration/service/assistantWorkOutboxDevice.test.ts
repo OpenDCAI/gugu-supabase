@@ -59,6 +59,106 @@ beforeEach(async () => {
 afterEach(async () => { await db.query('ROLLBACK') })
 
 describe('assistant work belongs to its target device', () => {
+  it.each(['dispatch', 'progress'])('protects an online %s target but permits delegation when its heartbeat is stale', async kind => {
+    const id = randomUUID(), event = kind === 'dispatch' ? dispatch() : report('progress')
+    await commit(id, [kind === 'dispatch' ? event : dispatch()], task())
+    if (kind !== 'dispatch') {
+      await db.query("UPDATE identity.assistant_work_events SET delivery_state='admitted',executor_admitted_at=now() WHERE work_id=$1", [id])
+      await commit(id, [event], null, randomUUID(), workerInstance)
+    }
+    const proxy = kind === 'dispatch' ? instance : workerInstance
+    const target = kind === 'dispatch' ? workerInstance : instance
+    expect((await claim(proxy)).events).toHaveLength(0)
+    await db.query("UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp()-interval '91 seconds' WHERE instance_id=$1", [target])
+    const delegated = (await claim(proxy)).events
+    expect(delegated.map(row => row.message_id)).toEqual([event.message_id])
+    expect(delegated[0]).toHaveProperty('delivery_target', { device_id: event.to_device_id, session_id: event.to_session_id })
+    await settle(delegated[0]!, kind === 'dispatch' ? 'executor_admitted' : 'assistant_admitted', proxy)
+  })
+
+  it.each(['dispatch', 'progress'])('cools an outdated %s delegate without delaying a target that comes online', async kind => {
+    const id = randomUUID(), event = kind === 'dispatch' ? dispatch() : report('progress'), token = randomUUID()
+    await commit(id, [kind === 'dispatch' ? event : dispatch()], task())
+    if (kind !== 'dispatch') {
+      await db.query("UPDATE identity.assistant_work_events SET delivery_state='admitted',executor_admitted_at=now() WHERE work_id=$1", [id])
+      await commit(id, [event], null, randomUUID(), workerInstance)
+    }
+    const proxy = kind === 'dispatch' ? instance : workerInstance
+    const target = kind === 'dispatch' ? workerInstance : instance
+    await db.query("UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp()-interval '91 seconds' WHERE instance_id=$1", [target])
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='claimed',lease_instance_id=$1,lease_token=$2,lease_until=clock_timestamp()+interval '60 seconds' WHERE message_id=$3", [proxy, token, event.message_id])
+    await as(owner, () => call('assistant_work_outbox_settle', [proxy, event.message_id, token, 'retry', 'CLIENT_OUTDATED', 1, '{"failure_observed":true}']))
+    const row = (await db.query('SELECT failed_attempts,extract(epoch FROM (available_at-clock_timestamp())) AS wait FROM identity.assistant_work_events WHERE message_id=$1', [event.message_id])).rows[0]
+    expect(row.failed_attempts).toBe(0)
+    expect(Number(row.wait)).toBeGreaterThan(29)
+    expect((await claim(proxy)).events).toHaveLength(0)
+    expect((await claim(proxy)).events).toHaveLength(0)
+    await db.query('UPDATE identity.runtime_instances SET last_heartbeat_at=clock_timestamp() WHERE instance_id=$1', [target])
+    expect((await claim(target)).events.map(row => row.message_id)).toEqual([event.message_id])
+  })
+
+  it('bounds one expiry sweep to 100 rows and preserves the last real error', async () => {
+    for (let index = 0; index < 101; index++) await commit(randomUUID(), [dispatch()], task())
+    await db.query("UPDATE identity.assistant_work_events SET platform_received_at=clock_timestamp()-interval '25 hours',last_error_code='DELIVERY_HOST_OUTDATED' WHERE owner_user_id=$1", [owner])
+    expect((await claim(workerInstance, 1)).events).toHaveLength(0)
+    const rows = (await db.query('SELECT delivery_state,last_error_code,abandoned_reason_code FROM identity.assistant_work_events WHERE owner_user_id=$1', [owner])).rows
+    expect(rows.filter(row => row.delivery_state === 'abandoned')).toHaveLength(100)
+    expect(rows.filter(row => row.delivery_state === 'pending')).toHaveLength(1)
+    expect(rows.every(row => row.last_error_code === 'DELIVERY_HOST_OUTDATED')).toBe(true)
+    expect(rows.filter(row => row.delivery_state === 'abandoned').every(row => row.abandoned_reason_code === 'DELIVERY_EXPIRED')).toBe(true)
+    expect((await claim(instance)).events).toHaveLength(0)
+    expect(Number((await db.query("SELECT count(*) AS n FROM identity.assistant_work_events WHERE owner_user_id=$1 AND delivery_state='abandoned'", [owner])).rows[0].n)).toBe(101)
+  })
+
+  it('preserves the last real error separately from the expiry reason', async () => {
+    const event = dispatch()
+    await commit(randomUUID(), [event], task())
+    await db.query("UPDATE identity.assistant_work_events SET platform_received_at=clock_timestamp()-interval '25 hours',last_error_code='DELIVERY_HOST_OUTDATED' WHERE message_id=$1", [event.message_id])
+    expect((await claim()).events).toHaveLength(0)
+    expect((await db.query('SELECT last_error_code,abandoned_reason_code FROM identity.assistant_work_events WHERE message_id=$1', [event.message_id])).rows[0]).toEqual({ last_error_code: 'DELIVERY_HOST_OUTDATED', abandoned_reason_code: 'DELIVERY_EXPIRED' })
+  })
+
+  it('two connections concurrently expire one row and broadcast one notice without leasing it', async () => {
+    const event = dispatch()
+    await commit(randomUUID(), [event], task())
+    await db.query("UPDATE identity.assistant_work_events SET platform_received_at=clock_timestamp()-interval '25 hours' WHERE message_id=$1", [event.message_id])
+    await db.query('COMMIT')
+    const other = new pg.Client({ connectionString: url })
+    await other.connect()
+    const notices = async () => Number((await db.query("SELECT count(*) AS n FROM realtime.messages WHERE topic=$1 AND event='assistant_work_changed'", [`gugu:user:${owner}:events`])).rows[0].n)
+    const before = await notices()
+    async function prepare(client: pg.Client) {
+      await client.query('BEGIN')
+      await client.query("SET LOCAL statement_timeout='5s'")
+      await client.query("SELECT set_config('request.jwt.claims',$1,true)", [JSON.stringify({ sub: owner, role: 'authenticated' })])
+      await client.query('SET LOCAL ROLE authenticated')
+    }
+    async function take(client: pg.Client, runtime: string) {
+      try {
+        const result = await client.query<{ result: { events: Delivery[] } }>('SELECT identity.assistant_work_outbox_claim($1,20,60) AS result', [runtime])
+        await client.query('COMMIT')
+        return result.rows[0]!.result.events
+      } catch (error) { await client.query('ROLLBACK'); throw error }
+    }
+    try {
+      await Promise.all([prepare(db), prepare(other)])
+      const claimed = await Promise.all([take(db, instance), take(other, workerInstance)])
+      expect(claimed.flat()).toHaveLength(0)
+      expect(await notices()).toBe(before + 1)
+      expect((await db.query('SELECT delivery_state,attempts,lease_token FROM identity.assistant_work_events WHERE message_id=$1', [event.message_id])).rows[0]).toEqual({ delivery_state: 'abandoned', attempts: 0, lease_token: null })
+    } finally {
+      await other.end()
+      await db.query('ROLLBACK')
+      await db.query('DELETE FROM identity.assistant_work WHERE owner_user_id=$1', [owner])
+      await db.query('DELETE FROM identity.agent_provision_operations WHERE owner_user_id=$1', [owner])
+      await db.query('DELETE FROM chat.chats WHERE id=$1', [chat])
+      await db.query('DELETE FROM identity.users WHERE id=ANY($1)', [[assistant, executor]])
+      await db.query('DELETE FROM identity.gugu_devices WHERE device_id=ANY($1)', [[home, device]])
+      await db.query('DELETE FROM auth.users WHERE id=ANY($1::uuid[])', [[owner, stranger]])
+      await db.query('BEGIN')
+    }
+  })
+
   it('expires an offline target on another device claim and records one verified owner notice', async () => {
     const id = randomUUID(), event = dispatch()
     await commit(id, [event], task())
@@ -113,7 +213,12 @@ describe('assistant work belongs to its target device', () => {
     await db.query("UPDATE identity.assistant_work_events SET delivery_state='claimed',lease_instance_id=$1,lease_token=$2,lease_until=clock_timestamp()+interval '60 seconds',attempts=1 WHERE message_id=$3", [instance, oldToken, foreign.message_id])
     await db.query("UPDATE identity.assistant_work_events SET delivery_state='claimed',lease_instance_id=$1,lease_token=$2,lease_until=clock_timestamp()+interval '60 seconds',attempts=1 WHERE message_id=$3", [workerInstance, validToken, valid.message_id])
     await db.query("UPDATE identity.assistant_work_events SET last_error_code='DELIVERY_HOST_OUTDATED',failed_attempts=1,available_at=clock_timestamp()+interval '5 minutes' WHERE message_id=$1", [rejected.message_id])
-    const body = readFileSync(new URL('../../../supabase/migrations/20261029143000_assistant_work_target_device_claim.sql', import.meta.url), 'utf8')
+    const offlineDevice = `ledger-${randomUUID()}`, offlineSession = randomUUID(), delegatedToken = randomUUID()
+    await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,'fixture','fixture','linux')", [offlineDevice, owner])
+    const delegated = dispatch({ to_session_id: offlineSession, to_device_id: offlineDevice })
+    await commit(randomUUID(), [delegated], task([{ session_id: offlineSession, device_id: offlineDevice }] as never))
+    await db.query("UPDATE identity.assistant_work_events SET delivery_state='claimed',lease_instance_id=$1,lease_token=$2,lease_until=clock_timestamp()+interval '60 seconds' WHERE message_id=$3", [instance, delegatedToken, delegated.message_id])
+    const body = readFileSync(new URL('../../../supabase/migrations/20261029161000_assistant_work_target_device_claim.sql', import.meta.url), 'utf8')
     const notices = async () => Number((await db.query("SELECT count(*) AS n FROM realtime.messages WHERE topic=$1 AND event='assistant_work_changed'", [`gugu:user:${owner}:events`])).rows[0].n)
     const before = await notices()
     await db.query(body)
@@ -123,6 +228,7 @@ describe('assistant work belongs to its target device', () => {
     expect(rows.find(row => row.message_id === foreign.message_id)).toMatchObject({ delivery_state: 'pending', lease_token: null })
     expect(rows.find(row => row.message_id === valid.message_id)).toMatchObject({ delivery_state: 'claimed', lease_token: validToken })
     expect(rows.find(row => row.message_id === rejected.message_id)).toMatchObject({ failed_attempts: 1, ready: false })
+    expect(rows.find(row => row.message_id === delegated.message_id)).toMatchObject({ delivery_state: 'claimed', lease_token: delegatedToken })
     await failure(() => as(owner, () => call('assistant_work_outbox_settle', [instance, foreign.message_id, oldToken, 'retry', 'CLIENT_OUTDATED', 300, '{}'])), /lease|token/)
     expect((await claim(workerInstance)).events.map(row => row.message_id)).toEqual([pending.message_id, foreign.message_id])
   })
@@ -151,7 +257,7 @@ describe('assistant work belongs to its target device', () => {
     await settle(ready[0]!, 'assistant_admitted', instance)
   })
 
-  it('a deployed foreign lease rejected as CLIENT_OUTDATED is released without failure or backoff', async () => {
+  it('a deployed incompatible lease cools foreign delivery while its live target claims immediately', async () => {
     const id = randomUUID(), event = dispatch(), token = randomUUID()
     await commit(id, [event], task())
     // Reproduce a lease issued before the routing fix, without requiring new client arguments.
@@ -161,7 +267,7 @@ describe('assistant work belongs to its target device', () => {
       'retry', 'CLIENT_OUTDATED', 300, JSON.stringify({ failure_observed: true })]))
     expect.soft(Number((await db.query("SELECT count(*) AS n FROM realtime.messages WHERE topic=$1 AND event='assistant_work_changed'", [`gugu:user:${owner}:events`])).rows[0].n)).toBe(before + 1)
     const row = (await db.query('SELECT failed_attempts,available_at<=clock_timestamp() AS ready FROM identity.assistant_work_events WHERE message_id=$1', [event.message_id])).rows[0]
-    expect.soft(row).toEqual({ failed_attempts: 0, ready: true })
+    expect.soft(row).toEqual({ failed_attempts: 0, ready: false })
     expect((await claim(workerInstance)).events.map(row => row.message_id)).toEqual([event.message_id])
   })
 

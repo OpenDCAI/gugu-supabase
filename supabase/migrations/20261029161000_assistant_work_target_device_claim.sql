@@ -1,4 +1,4 @@
--- Claim only on the validated delivery device; keep the deployed RPC signature unchanged.
+-- Prefer a live target runtime, retaining delegated wake/delivery when it is offline.
 CREATE OR REPLACE FUNCTION identity.assistant_work_outbox_claim(p_runtime_instance_id text,p_limit integer DEFAULT 20,p_lease_seconds integer DEFAULT 60)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE v_owner text := auth.uid()::text; v_result jsonb; v_coordinators text[]; v_device text;
@@ -16,7 +16,7 @@ BEGIN
         SELECT 1 FROM identity.assistant_work w JOIN identity.assistant_work_events e
           ON e.owner_user_id=w.owner_user_id AND e.work_id=w.work_id
         WHERE w.owner_user_id=v_owner AND w.assistant_user_id=u.id AND e.kind<>'dispatch'
-          AND ((e.delivery_state='pending' AND e.available_at<=clock_timestamp())
+          AND ((e.delivery_state='pending' AND (e.available_at<=clock_timestamp() OR e.last_error_code='CLIENT_OUTDATED'))
             OR (e.delivery_state='claimed' AND e.lease_until<clock_timestamp()))
       ) ORDER BY u.id FOR SHARE OF u
     ) locked;
@@ -27,18 +27,25 @@ BEGIN
       SELECT e.seq FROM identity.assistant_work_events e
       WHERE e.owner_user_id=v_owner AND e.platform_received_at<=v_now-interval '24 hours'
         AND (e.delivery_state='pending' OR (e.delivery_state='claimed' AND e.lease_until<=v_now))
-      ORDER BY e.seq FOR UPDATE SKIP LOCKED
+      ORDER BY e.seq FOR UPDATE SKIP LOCKED LIMIT 100
     )
     UPDATE identity.assistant_work_events e SET delivery_state='abandoned',
       lease_token=NULL,lease_instance_id=NULL,lease_until=NULL,abandoned_at=v_now,
-      abandoned_reason_code='DELIVERY_EXPIRED',last_error_code='DELIVERY_EXPIRED'
+      abandoned_reason_code='DELIVERY_EXPIRED'
     FROM expired x WHERE e.seq=x.seq;
     -- The existing business-change trigger broadcasts abandonment once; lease
     -- maintenance is quiet, and a repeated sweep changes no already-abandoned row.
     WITH candidates AS MATERIALIZED (
-      SELECT e.seq FROM identity.assistant_work_events e WHERE e.owner_user_id = v_owner
-        AND CASE WHEN e.kind='dispatch' THEN e.to_device_id=v_device
-          ELSE identity.assistant_work_coordinator(e.owner_user_id,e.work_id)->>'device_id'=v_device END
+      SELECT e.seq FROM identity.assistant_work_events e
+      CROSS JOIN LATERAL (SELECT CASE WHEN e.kind='dispatch' THEN e.to_device_id
+        ELSE identity.assistant_work_coordinator(e.owner_user_id,e.work_id)->>'device_id' END AS device_id) target
+      WHERE e.owner_user_id = v_owner
+        AND e.platform_received_at>v_now-interval '24 hours'
+        AND (target.device_id=v_device OR NOT EXISTS (
+          SELECT 1 FROM identity.runtime_instances r
+            JOIN identity.gugu_devices d ON d.device_id=r.device_id AND d.user_id=r.owner_user_id
+          WHERE r.owner_user_id::text=v_owner AND r.device_id=target.device_id
+            AND r.last_heartbeat_at>v_now-interval '90 seconds'))
         AND (e.kind='dispatch' OR (
           EXISTS(SELECT 1 FROM identity.assistant_work w WHERE w.owner_user_id=e.owner_user_id
             AND w.work_id=e.work_id AND w.assistant_user_id=ANY(v_coordinators))
@@ -48,7 +55,9 @@ BEGIN
             AND older.seq<e.seq AND older.delivery_state IN ('pending','claimed') AND (
               (e.kind<>'dispatch' AND older.kind<>'dispatch') OR (e.kind='dispatch' AND older.kind='dispatch' AND older.to_device_id=e.to_device_id AND older.to_session_id=e.to_session_id))
         )
-        AND ((e.delivery_state = 'pending' AND e.available_at <= clock_timestamp()) OR (e.delivery_state = 'claimed' AND e.lease_until < clock_timestamp()))
+        AND ((e.delivery_state = 'pending' AND (e.available_at <= clock_timestamp()
+          OR (e.last_error_code='CLIENT_OUTDATED' AND target.device_id=v_device)))
+          OR (e.delivery_state = 'claimed' AND e.lease_until < clock_timestamp()))
       ORDER BY e.seq FOR UPDATE SKIP LOCKED LIMIT p_limit
     ), claimed AS (
       UPDATE identity.assistant_work_events e SET delivery_state = 'claimed',lease_token = gen_random_uuid(),lease_instance_id = p_runtime_instance_id,
@@ -100,7 +109,8 @@ BEGIN
           failed_attempts = failed_attempts + CASE WHEN p_receipt->>'failure_observed' = 'true' THEN 1 ELSE 0 END WHERE seq = v_event.seq;
     ELSIF p_stage = 'retry' THEN
         UPDATE identity.assistant_work_events SET delivery_state = 'pending',lease_until = NULL,lease_token = NULL,lease_instance_id = NULL,
-          available_at = clock_timestamp() + make_interval(secs => CASE WHEN p_error_code='CLIENT_OUTDATED' THEN 0 ELSE p_retry_after_seconds END),last_error_code = p_error_code,
+          available_at = clock_timestamp() + make_interval(secs => CASE WHEN p_error_code='CLIENT_OUTDATED'
+            THEN LEAST(300,GREATEST(30,p_retry_after_seconds)) ELSE p_retry_after_seconds END),last_error_code = p_error_code,
           failed_attempts = failed_attempts + CASE WHEN p_error_code='CLIENT_OUTDATED' THEN 0 ELSE 1 END WHERE seq = v_event.seq;
         IF p_error_code='CLIENT_OUTDATED' THEN
             PERFORM chat.send_user_event('{}'::jsonb,'assistant_work_changed','gugu:user:'||v_owner||':events',true);
@@ -145,7 +155,8 @@ BEGIN
             AND g.reason_code=identity.assistant_work_notice_reason(e.abandoned_reason_code)
             AND g.notice_kind=(CASE WHEN e.kind='completed' THEN 'completed' ELSE 'handoff' END) AND g.pending AND NOT g.notified) ORDER BY e.seq LIMIT p_limit) e
       JOIN identity.assistant_work w ON w.owner_user_id = e.owner_user_id AND w.work_id = e.work_id
-      LEFT JOIN identity.gugu_devices d ON d.user_id::text=e.owner_user_id AND d.device_id=e.to_device_id;
+      LEFT JOIN identity.gugu_devices d ON d.user_id::text=e.owner_user_id AND d.device_id=CASE WHEN e.kind='dispatch'
+        THEN e.to_device_id ELSE identity.assistant_work_coordinator(e.owner_user_id,e.work_id)->>'device_id' END;
     RETURN jsonb_build_object('events',v_events);
 END;
 $$;
@@ -168,7 +179,14 @@ BEGIN
       -- Reclaim with the same message ID; already admitted recipients deduplicate it.
       UPDATE identity.assistant_work_events e SET delivery_state='pending',available_at=clock_timestamp(),
         lease_token=NULL,lease_instance_id=NULL,lease_until=NULL
-        WHERE e.delivery_state='claimed' AND (
+        WHERE e.delivery_state='claimed' AND EXISTS (
+          SELECT 1 FROM identity.runtime_instances target_runtime
+            JOIN identity.gugu_devices d ON d.device_id=target_runtime.device_id AND d.user_id=target_runtime.owner_user_id
+          WHERE target_runtime.owner_user_id::text=e.owner_user_id
+            AND target_runtime.device_id=CASE WHEN e.kind='dispatch' THEN e.to_device_id
+              ELSE identity.assistant_work_coordinator(e.owner_user_id,e.work_id)->>'device_id' END
+            AND target_runtime.last_heartbeat_at>clock_timestamp()-interval '90 seconds'
+        ) AND (
           SELECT r.device_id FROM identity.runtime_instances r
             WHERE r.instance_id=e.lease_instance_id AND r.owner_user_id::text=e.owner_user_id
         ) IS DISTINCT FROM CASE WHEN e.kind='dispatch' THEN e.to_device_id

@@ -113,6 +113,8 @@ describe('F43 同时建同一条嵌套路径(真服务)', () => {
     const data = await converged([A, B], (d) => Object.keys(d.votes?.['10'] ?? {}).length === 2)
     expect(data.votes).toEqual({ '10': { userA: 1, userB: 1 } })
     expect(merges(svc).create).toBeGreaterThan(before.create)
+    // A's later update needs an internal repair before it changes the readable body.
+    expect(await waitFor(async () => (await fx.admin.query<{ updated_by: string | null }>('SELECT updated_by FROM chat.workspace_items WHERE id=$1', [file])).rows[0]?.updated_by === u.a)).toBeGreaterThanOrEqual(0)
   })
 
   it('更深一层:a.b.c 下各写一个叶子 ⇒ 都在', async () => {

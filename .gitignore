@@ -1,6 +1,8 @@
 node_modules/
 .env
 .env.*
+.envs/
 .local/
 *.log
 .DS_Store
+supabase/.temp/

@@ -279,7 +279,7 @@ describe('文本文件按引用发(chat.attachment_document_snapshot,迁移 2026
       'SELECT n, blob_id, inline_text FROM chat.workspace_item_versions WHERE item_id = $1 ORDER BY n', [itemId])).rows
   }
 
-  it('编辑过的文本文件:没有字节先要字节;带上这段正文的上传 ⇒ 最新一版带上字节、钉住它;另一个群收到的是这段正文', async () => {
+  it('编辑过的文本文件:没有字节先要字节;带上这段正文的上传 ⇒ 带字节的下一版(一版的字节不改)、钉住它;另一个群收到的是这段正文', async () => {
     const source = await newGroup(owner, [member])
     const target = await newGroup(member, [owner])
     const text = `# 周报 ${randomUUID()}`
@@ -288,13 +288,13 @@ describe('文本文件按引用发(chat.attachment_document_snapshot,迁移 2026
     expect(await fails(SNAPSHOT, [doc, owner, text, null])).toMatch(/hint: attachment_forward_needs_bytes/)
     await asOwner()
     const up = await upload(owner, text, 'text/markdown', Buffer.byteLength(text))
-    // The latest version already says this text: it gets the bytes; no version is added (the list's version 2 is not it).
-    expect(await snapshot(owner, doc, text, up.key)).toBe(2)
-    expect(await versions(doc)).toMatchObject([{ n: 1, blob_id: null }, { n: 2, blob_id: up.blob, inline_text: text }])
+    // A version's bytes never change: the text becomes the next version, with bytes (the list's version 2 is not it).
+    expect(await snapshot(owner, doc, text, up.key)).toBe(3)
+    expect(await versions(doc)).toMatchObject([{ n: 1, blob_id: null }, { n: 2, blob_id: null }, { n: 3, blob_id: up.blob, inline_text: text }])
 
-    const own = await share(owner, doc, 2, randomUUID(), source, owner)
-    expect(own).toMatchObject({ file_item_id: doc, file_version: 2 })
-    const sent = await share(owner, doc, 2, randomUUID(), target, owner)
+    const own = await share(owner, doc, 3, randomUUID(), source, owner)
+    expect(own).toMatchObject({ file_item_id: doc, file_version: 3 })
+    const sent = await share(owner, doc, 3, randomUUID(), target, owner)
     expect(sent.chat_id).toBe(target)
     await asOwner()
     const { rows: [placed] } = await database.query<{ kind: string; inline_text: string }>('SELECT kind, inline_text FROM chat.workspace_items WHERE id = $1', [sent.file_item_id])
@@ -306,14 +306,14 @@ describe('文本文件按引用发(chat.attachment_document_snapshot,迁移 2026
     const text = `# 周报 ${randomUUID()}`
     const doc = await editedDocument(group, [text])
     const first = await upload(owner, text, 'text/markdown', Buffer.byteLength(text))
-    expect(await snapshot(owner, doc, text, first.key)).toBe(1)
-    expect(await snapshot(member, doc, text, null)).toBe(1)
-    expect(await versions(doc)).toHaveLength(1)
+    expect(await snapshot(owner, doc, text, first.key)).toBe(2)
+    expect(await snapshot(member, doc, text, null)).toBe(2)
+    expect(await versions(doc)).toHaveLength(2)
 
     const newer = `${text}\n\n还没存成一轮的改动`
     const second = await upload(member, newer, 'text/markdown', Buffer.byteLength(newer))
-    expect(await snapshot(member, doc, newer, second.key)).toBe(2)
-    expect(await versions(doc)).toMatchObject([{ n: 1, blob_id: first.blob }, { n: 2, blob_id: second.blob, inline_text: newer }])
+    expect(await snapshot(member, doc, newer, second.key)).toBe(3)
+    expect(await versions(doc)).toMatchObject([{ n: 1, blob_id: null }, { n: 2, blob_id: first.blob }, { n: 3, blob_id: second.blob, inline_text: newer }])
   })
 
   it('字节不是这段正文、别人的上传、存的文件:都拒,什么都不改', async () => {

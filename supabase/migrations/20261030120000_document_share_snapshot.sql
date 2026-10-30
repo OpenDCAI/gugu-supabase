@@ -2,8 +2,9 @@
 -- themselves: "x has no version 2 any more (it is at version 2)". attachment_share pins a version's bytes, and a
 -- document's versions are text only (chat.files_record_version records rounds without bytes).
 --   · chat.attachment_document_snapshot: the document's text as it is now, as a version with bytes. The latest version
---     when it already says this text (its bytes attached once, then reused); otherwise the next version, numbered and
---     kept as the file service numbers and keeps them. With no bytes for that text yet, it asks for them
+--     when it already says this text with bytes; otherwise the next version (a version's bytes never change,
+--     workspace_bytes_pinned), numbered and kept as the file service numbers and keeps them — the file service's next
+--     round of the same text is then not recorded again. With no bytes for that text yet, it asks for them
 --     (HINT attachment_forward_needs_bytes): the attachments edge function (POST share) stages the text, registers it
 --     (content-addressed by sha256) and asks again with that upload. The bytes must be exactly that text.
 --   · attachment_place_share: a document version without bytes says where it is sent from, instead of "gone".
@@ -13,7 +14,6 @@ DECLARE
     v_keep CONSTANT INTEGER := 50;
     v_item chat.workspace_items%ROWTYPE;
     v_last chat.workspace_item_versions%ROWTYPE;
-    v_same BOOLEAN;
     v_blob chat.file_blobs%ROWTYPE;
 BEGIN
     IF (SELECT auth.uid()) IS NULL THEN
@@ -32,8 +32,7 @@ BEGIN
             MESSAGE = format('%s is not a text document: its versions already have bytes', v_item.filename);
     END IF;
     SELECT * INTO v_last FROM chat.workspace_item_versions v WHERE v.item_id = v_item.id ORDER BY v.n DESC LIMIT 1;
-    v_same := FOUND AND v_last.device_version IS NULL AND v_last.inline_text IS NOT DISTINCT FROM p_text;
-    IF v_same AND v_last.blob_id IS NOT NULL THEN
+    IF FOUND AND v_last.blob_id IS NOT NULL AND v_last.inline_text IS NOT DISTINCT FROM p_text THEN
         RETURN v_last.n;
     END IF;
     IF p_staging_key IS NULL THEN
@@ -47,10 +46,6 @@ BEGIN
     END IF;
     IF v_blob.sha256 IS DISTINCT FROM encode(sha256(convert_to(p_text, 'UTF8')), 'hex') THEN
         RAISE EXCEPTION USING HINT = 'file_place_invalid', MESSAGE = 'the uploaded bytes are not this text';
-    END IF;
-    IF v_same THEN
-        UPDATE chat.workspace_item_versions v SET blob_id = v_blob.id WHERE v.item_id = v_item.id AND v.n = v_last.n;
-        RETURN v_last.n;
     END IF;
     INSERT INTO chat.workspace_item_versions (item_id, n, inline_text, blob_id, content_type, size_bytes, made_by)
     VALUES (v_item.id, COALESCE(v_last.n, 0) + 1, p_text, v_blob.id, v_item.content_type, octet_length(p_text), v_item.updated_by);

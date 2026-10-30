@@ -1,7 +1,7 @@
 import * as Y from 'yjs'
 import { describe, expect, it } from 'vitest'
 
-import { keepReplacedMaps, mergeConcurrentCreations } from '../../../packages/files-core/src/concurrent.mjs'
+import { contentOriginOf, keepReplacedMaps, mergeConcurrentCreations } from '../../../packages/files-core/src/concurrent.mjs'
 import { buildDoc, rebuildDoc } from '../../../packages/files-core/src/content.mjs'
 
 /**
@@ -110,6 +110,25 @@ describe('F43 同时建同一条嵌套路径', () => {
       expect(r.merges.length).toBeGreaterThan(0)
     })
   }
+
+  it('a derived merge retains its causal writer without reusing the transport origin', async () => {
+    const writer = { source: 'connection', connection: { context: { actorId: 'A' } } }
+    const repairs: unknown[] = []
+    await run(true, async ({ hub, A, B }) => {
+      hub.on('afterTransaction', (tr) => {
+        if (tr.origin !== writer && contentOriginOf(tr.origin) === writer) repairs.push(tr.origin)
+      })
+      write(B, ['votes', '10'], 'B', 1)
+      Y.applyUpdate(hub, Y.encodeStateAsUpdate(B, Y.encodeStateVector(hub)))
+      write(A, ['votes', '10'], 'A', 1)
+      Y.applyUpdate(hub, Y.encodeStateAsUpdate(A, Y.encodeStateVector(hub)), writer)
+      await tick()
+      expect(hub.getMap('root').toJSON().votes['10']).toEqual({ A: 1, B: 1 })
+    })
+    expect(repairs.length).toBeGreaterThan(0)
+    expect(contentOriginOf(writer)).toBe(writer)
+    expect(contentOriginOf(null)).toBe(null)
+  })
 
   it('对照:看见旧值之后有意替换(重置成 {})不修,也不把删掉的复活', async () => {
     const steps = async ({ A, B, up, down }: Pages) => {

@@ -1,3 +1,4 @@
+import { createFixtureGroup } from '../../support/groupFixture'
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -62,7 +63,7 @@ async function agentOf(ownerId: string, name: string): Promise<string> {
 async function newGroup(settings: Record<string, unknown> = { agent_join_approval: true }): Promise<string> {
   const id = randomUUID()
   await asUser(owner)
-  await database.query('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
+  await createFixtureGroup(database, [
     id, 'Approval queue', owner, JSON.stringify([{ user_id: ownerAgent, role: 'member' }]),
   ])
   await asService()
@@ -81,12 +82,12 @@ async function isMember(chatId: string, userId: string): Promise<boolean> {
 async function addAgent(actor: string, chatId: string, agentId: string) {
   await asUser(actor)
   return (await database.query<{ result: { status: string; request_id?: string } }>(
-    'SELECT chat.add_group_agent($1,$2,$3) AS result', [chatId, agentId, '请让它帮忙评审'])).rows[0]!.result
+    'SELECT chat.add_group_agent($1,$2,$3,auth.uid()::text) AS result', [chatId, agentId, '请让它帮忙评审'])).rows[0]!.result
 }
 async function pendingFor(manager: string, chatId: string) {
   await asUser(manager)
   return (await database.query<{ id: string; requester_user_id: string; requester_type: string; requested_by_user_id: string | null; requested_by_name: string | null }>(
-    'SELECT * FROM chat.list_group_join_requests($1)', [chatId])).rows
+    'SELECT * FROM chat.list_group_join_requests($1,false,auth.uid()::text)', [chatId])).rows
 }
 async function mine(actor: string, chatId: string) {
   await asUser(actor)
@@ -142,7 +143,7 @@ describe('Agent 加入需审批 = 审批队列', () => {
     const [request] = await pendingFor(admin, group)
     expect(request).toMatchObject({ requester_user_id: memberAgent, requester_type: 'agent', requested_by_user_id: member, requested_by_name: 'Member' })
     await asUser(admin)
-    await database.query('SELECT chat.decide_group_join($1,true)', [request!.id])
+    await database.query('SELECT chat.decide_group_join($1,true,auth.uid()::text)', [request!.id])
     expect(await isMember(group, memberAgent)).toBe(true)
     expect(await mine(member, group)).toEqual([{ agent_user_id: memberAgent, status: 'accepted' }])
 
@@ -150,7 +151,7 @@ describe('Agent 加入需审批 = 审批队列', () => {
     await addAgent(member, group, second)
     const [again] = await pendingFor(owner, group)
     await asUser(owner)
-    await database.query('SELECT chat.decide_group_join($1,false)', [again!.id])
+    await database.query('SELECT chat.decide_group_join($1,false,auth.uid()::text)', [again!.id])
     expect(await isMember(group, second)).toBe(false)
     expect((await mine(member, group)).find((row) => row.agent_user_id === second)?.status).toBe('rejected')
   })
@@ -161,27 +162,27 @@ describe('Agent 加入需审批 = 审批队列', () => {
     for (const agent of [accepted, rejected, waiting]) await addAgent(member, group, agent)
     const idOf = new Map((await pendingFor(owner, group)).map((row) => [row.requester_user_id, row.id]))
     await asUser(owner)
-    await database.query('SELECT chat.decide_group_join($1,true)', [idOf.get(accepted)])
-    await database.query('SELECT chat.decide_group_join($1,false)', [idOf.get(rejected)])
+    await database.query('SELECT chat.decide_group_join($1,true,auth.uid()::text)', [idOf.get(accepted)])
+    await database.query('SELECT chat.decide_group_join($1,false,auth.uid()::text)', [idOf.get(rejected)])
     expect((await pendingFor(owner, group)).map((row) => row.requester_user_id)).toEqual([waiting])
     await asUser(owner)
     const { rows } = await database.query<{ requester_user_id: string; status: string }>(
-      'SELECT requester_user_id, status FROM chat.list_group_join_requests($1, true)', [group])
+      'SELECT requester_user_id, status FROM chat.list_group_join_requests($1, true,auth.uid()::text)', [group])
     expect(Object.fromEntries(rows.map((row) => [row.requester_user_id, row.status])))
       .toEqual({ [accepted]: 'accepted', [rejected]: 'rejected', [waiting]: 'pending' })
     await asUser(member)
-    expect(await fails('SELECT * FROM chat.list_group_join_requests($1, true)', [group])).toMatch(/Not authorized/)
+    expect(await fails('SELECT * FROM chat.list_group_join_requests($1, true,auth.uid()::text)', [group])).toMatch(/group_manager_required/)
   })
 
   it('普通成员看不到、也批不了待审', async () => {
     const group = await newGroup()
     await addAgent(member, group, memberAgent)
     await asUser(member)
-    expect(await fails('SELECT * FROM chat.list_group_join_requests($1)', [group])).toMatch(/Not authorized/)
+    expect(await fails('SELECT * FROM chat.list_group_join_requests($1,false,auth.uid()::text)', [group])).toMatch(/group_manager_required/)
     await asService()
     const id = (await database.query<{ id: string }>('SELECT id FROM chat.group_join_requests WHERE chat_id=$1', [group])).rows[0]!.id
     await asUser(member)
-    expect(await fails('SELECT chat.decide_group_join($1,true)', [id])).toMatch(/Not authorized/)
+    expect(await fails('SELECT chat.decide_group_join($1,true,auth.uid()::text)', [id])).toMatch(/group_manager_required/)
   })
 
   it('批准时重查人数上限:满了拒,放宽后再批就过', async () => {
@@ -191,12 +192,12 @@ describe('Agent 加入需审批 = 审批队列', () => {
     await asService()
     await database.query('UPDATE chat.chats SET max_members = 4 WHERE id = $1', [group]) // 已有 4 人
     await asUser(owner)
-    expect(await fails('SELECT chat.decide_group_join($1,true)', [request!.id])).toMatch(/member_limit_reached/)
+    expect(await fails('SELECT chat.decide_group_join($1,true,auth.uid()::text)', [request!.id])).toMatch(/member_limit_reached/)
     expect(await isMember(group, memberAgent)).toBe(false)
     await asService()
     await database.query('UPDATE chat.chats SET max_members = 5 WHERE id = $1', [group])
     await asUser(owner)
-    await database.query('SELECT chat.decide_group_join($1,true)', [request!.id])
+    await database.query('SELECT chat.decide_group_join($1,true,auth.uid()::text)', [request!.id])
     expect(await isMember(group, memberAgent)).toBe(true)
   })
 
@@ -207,7 +208,7 @@ describe('Agent 加入需审批 = 审批队列', () => {
     await asService()
     await database.query('DELETE FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [group, member])
     await asUser(owner)
-    expect(await fails('SELECT chat.decide_group_join($1,true)', [request!.id])).toMatch(/join_request_requester_left/)
+    expect(await fails('SELECT chat.decide_group_join($1,true,auth.uid()::text)', [request!.id])).toMatch(/join_request_requester_left/)
   })
 
   it('agent 发起的邀请(自有 agent)也进同一条队列', async () => {
@@ -218,7 +219,7 @@ describe('Agent 加入需审批 = 审批队列', () => {
     const second = await agentOf(member, 'Invitee Agent')
     await asUser(member)
     const result = (await database.query<{ result: { status: string } }>(
-      'SELECT chat.request_agent_group_invitation($1,$2,$3,$4) AS result', [group, memberAgent, second, '一起评审'])).rows[0]!.result
+      'SELECT chat.request_group_invitation_as($1,$3,$4,$2) AS result', [group, memberAgent, second, '一起评审'])).rows[0]!.result
     expect(result.status).toBe('pending_approval')
     expect(await isMember(group, second)).toBe(false)
     expect((await pendingFor(owner, group)).map((row) => row.requester_user_id)).toEqual([second])
@@ -228,6 +229,6 @@ describe('Agent 加入需审批 = 审批队列', () => {
     const group = await newGroup()
     await asUser(member)
     expect(await fails('INSERT INTO chat.chat_members (chat_id,user_id,role) VALUES ($1,$2,\'member\')', [group, memberAgent]))
-      .toMatch(/row-level security/)
+      .toMatch(/permission denied/)
   })
 })

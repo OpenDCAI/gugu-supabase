@@ -9,3 +9,5 @@
 从仓库执行 `pnpm --filter @gugu-supabase/files start`。默认业务端口 18320、管理端口 18321 均绑定回环；通过自己的 HTTPS 反向代理发布业务端口的 `/files` 和 WebSocket，管理端口保持内网。客户端配置对应的文件服务地址，配置键以客户端 `.envs/example.env` 为准。
 
 相关变量与上限见 `services/files/src/config.mjs`。当前没有把这一常驻进程包装成 Supabase Cloud 的一键部署；多用户文件权限与协作逻辑由隔离集成测试验证。
+
+Apply the `20261025055000_workspace_content_editor` release before starting the matching file service. Content stores now write the authenticated human or delegated agent as `updated_by` in the same UPDATE as the body. Unchanged content preserves its previous editor and timestamp; historical rows keep a null editor rather than guessing from version history. The existing metadata RPCs return this additional field without changing their other fields or authorization.

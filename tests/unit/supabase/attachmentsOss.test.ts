@@ -19,6 +19,8 @@ import { hasThumbnail, objectHeaders, sniff } from '../../../supabase/functions/
 import {
   type AttachmentsDeps,
   handleCommit,
+  handleSessionCommit,
+  handleSessionUrls,
   handleForward,
   handlePlace,
   handleGc,
@@ -32,7 +34,7 @@ const OSS: OssConfig = {
   region: 'cn-wulanchabu', bucket: 'gugu-files-test', endpointInternal: 'oss-cn-wulanchabu-internal.aliyuncs.com',
   endpointPublic: 'oss-cn-wulanchabu.aliyuncs.com', accessKeyId: 'LTAI-test', accessKeySecret: 'secret-test',
 }
-const CDN = { domain: 'files-dev.gugu.nextmind.space', authKey: 'cdn-key-test' }
+const CDN = { domain: 'files-dev.gugu.nextmind.space', authKey: 'cdn-key-test', authTtlSeconds:1800 }
 const USER = '11111111-1111-4111-8111-111111111111'
 const STAGING = `staging/${USER}/22222222-2222-4222-8222-222222222222`
 
@@ -148,16 +150,21 @@ function fakes(opts: {
   const bucket: Bucket = { staging: opts.object ? { bytes: opts.object, etag: '"E1"' } : null, finals: new Map() }
   const keyOf = (url: string) => new URL(url).pathname.slice(1)
   const calls: Call[] = []
+  const order: string[] = []
   const rpcs: { as: 'user' | 'service'; fn: string; args: Record<string, unknown> }[] = []
   const logs: string[] = []
   const removed: string[] = []
   const registerErrors = [...(opts.registerErrors ?? [])]
+  const controls: {as:'user'|'service';fn:string;args:Record<string,unknown>}[]=[]
   const deps: AttachmentsDeps = {
+    textFiles: { maxBytes: 1024 * 1024, classify: () => ({ kind: 'file', why: 'binary fixture' }) },
     oss: OSS,
     cdn: CDN,
     fetch: async (url, init) => {
+      order.push('object:' + (init?.method ?? 'GET'))
       const headers = Object.fromEntries(Object.entries((init?.headers ?? {}) as Record<string, string>))
       calls.push({ method: init?.method ?? 'GET', url, headers })
+      if ((init?.method ?? 'GET') === 'GET' && new URL(url).searchParams.has('versioning')) return new Response('<VersioningConfiguration/>',{status:200})
       if ((init?.method ?? 'GET') === 'GET' && url.startsWith('https://db.example/storage/v1/object/sign/')) {
         const bytes = opts.legacy?.bytes
         return bytes ? new Response(bytes as unknown as BodyInit, { status: 200 }) : new Response('{"error":"not_found"}', { status: 400 })
@@ -194,6 +201,31 @@ function fakes(opts: {
       return new Response('unexpected', { status: 500 })
     },
     userRpc: async (fn, args) => {
+      order.push('user:' + fn)
+      if (fn === 'workspace_get_as') return { data: [{ kind: 'file' }], error: null }
+      if (fn==='file_managed_upload_prepare') { controls.push({as:'user',fn,args});return {data:{max_bytes:MAX_ATTACHMENT_BYTES,permit_seconds:900},error:null} }
+      if (fn==='file_managed_upload_scope') { controls.push({as:'user',fn,args});return {data:null,error:null} }
+      if (fn==='file_managed_upload_as') {
+        controls.push({as:'user',fn,args})
+        if (typeof args.p_bytes!=='number'||args.p_bytes<=0) return {data:null,error:{message:'size required',hint:'file_transfer_invalid'}}
+        return {data:{staging_key:'staging/'+USER+'/'+args.p_id,max_bytes:args.p_bytes,signed_at:'2026-10-16T12:00:00Z',expires_at:'2026-10-16T12:15:00Z'},error:null}
+      }
+      if (fn==='file_transfer_download_as') {
+        controls.push({as:'user',fn,args})
+        const ref=args.p_ref as {item_id?:string;message_id?:string;attachment_id?:string}
+        const old=ref.item_id?.startsWith('5555')
+        return {data:{
+          status:'ready',source:'managed-object',item_id:ref.item_id??null,version:old?2:ref.message_id?null:1,
+          message_id:ref.message_id??null,current_version:old?2:ref.message_id?null:3,chat_id:'c',
+          file_name:old?'b.pptx':ref.message_id?'w.pdf':'a.png',bucket_id:old?'workspace':'oss',
+          object_name:old?'c/u/x-b.pptx':ref.message_id?'cd/'+'cd'.repeat(32):'ab/'+'ab'.repeat(32),
+          sha256:'ab'.repeat(32),size_bytes:old?5:ref.message_id?7:10,
+          content_type:old?'application/x':ref.message_id?'application/pdf':'image/png',width:old?null:640,height:old?null:480,
+          download_id:args.p_id,signed_at:'2026-10-16T12:00:00Z',expires_at:'2026-10-16T12:01:00.000Z',transfer_id:null,
+          ...(opts.legacy&&ref.message_id?{bucket_id:'chat-media',object_name:opts.legacy.row.object_name,
+            file_name:opts.legacy.row.file_name,content_type:opts.legacy.row.content_type,size_bytes:opts.legacy.bytes?.length??1}:{}),
+        },error:null}
+      }
       rpcs.push({ as: 'user', fn, args })
       if (fn === 'attachment_commit') return { data: [{ id: args.p_message_id, file_version: 1 }], error: null }
       if (fn === 'send_friend_file_as_owner') return { data: { chat_id: 'dm-1', message_id: 'm-o', sender_user_id: USER, sent_by_agent: true }, error: null }
@@ -203,6 +235,7 @@ function fakes(opts: {
         if (opts.legacy && !args.p_staging_key) return { data: null, error: { message: 'message old-1 is an old attachment: forward it through attachments/forward', hint: 'attachment_forward_needs_bytes', code: 'P0001' } }
         return { data: [{ id: args.p_message_id, forwarded_from_message_id: args.p_source_message_id }], error: null }
       }
+      if (fn === 'file_storage_mark_as') return { data: 1, error: null }
       if (fn === 'file_place_as') return { data: [{ id: 'i9', version: 1, path: args.p_file_name }], error: null }
       if (fn === 'file_replace_as') return { data: [{ id: args.p_item_id, version: 4 }], error: null }
       if (fn === 'file_urls_as') {
@@ -215,6 +248,10 @@ function fakes(opts: {
       return { data: null, error: { message: `no fake for ${fn}` } }
     },
     serviceRpc: async (fn, args) => {
+      order.push('service:' + fn)
+      if (fn==='file_managed_upload_for') {controls.push({as:'service',fn,args});return {data:{max_bytes:MAX_ATTACHMENT_BYTES},error:null}}
+      if (fn==='file_managed_upload_registered'||fn==='file_transfer_expire'||fn==='file_temporary_expire'||fn==='file_version_handoff_expire') {controls.push({as:'service',fn,args});return {data:null,error:null}}
+      if (fn==='file_transfer_settings') {controls.push({as:'service',fn,args});return {data:{},error:null}}
       rpcs.push({ as: 'service', fn, args })
       if (fn === 'file_blob_register') {
         const next = registerErrors.shift()
@@ -233,7 +270,18 @@ function fakes(opts: {
     log: (stage) => void logs.push(stage),
     retryDelayMs: 0,
   }
-  return { deps, calls, rpcs, logs, removed, bucket }
+  return { deps, calls, rpcs, controls, logs, removed, bucket, order }
+}
+/** The quota/actor guard must precede every byte read. Staging remains immutable and charged. */
+function expectManagedCommit(f: ReturnType<typeof fakes>, publication: string, start = 0) {
+  if (start) expect(f.order.slice(0, start)).toEqual(['user:file_managed_upload_prepare','object:GET','user:file_managed_upload_as'])
+  expect(f.order.slice(start, start + 3)).toEqual(['user:file_managed_upload_scope', 'service:file_managed_upload_for', 'object:GET'])
+  const registered = f.order.indexOf('service:file_managed_upload_registered')
+  expect(registered).toBeGreaterThan(f.order.indexOf('service:file_blob_register'))
+  expect(f.order.indexOf('user:' + publication)).toBeGreaterThan(registered)
+  expect(f.controls.some(r => r.fn === 'file_managed_upload_closed')).toBe(false)
+  expect(f.calls.some(c => c.method === 'DELETE' && c.url.includes('/staging/'))).toBe(false)
+  expect(f.bucket.staging).not.toBeNull()
 }
 const pngBytes = () => {
   const b = new Uint8Array(64)
@@ -244,26 +292,100 @@ const pngBytes = () => {
 }
 const commitBody = (extra: Record<string, unknown> = {}) => ({ staging_key: STAGING, message_id: 'm1', chat_id: 'c1', sender_user_id: USER, file_name: 'shot.png', ...extra })
 
+describe('managed authorization before bytes or signatures', () => {
+  it('asks a client that declares no size to update, before reserving or signing',async()=>{
+    const f=fakes()
+    await expect(handleUpload(f.deps,USER,{})).rejects.toMatchObject({status:426,code:'client_outdated',message:expect.stringMatching(/^Update Gugu to send files/)})
+    expect(f.controls).toEqual([])
+    expect(f.calls).toEqual([])
+  })
+  it('refuses a provider lifetime mismatch before issuing an upload reservation or URL',async()=>{
+    const f=fakes()
+    const store=await import('../../../supabase/functions/_shared/attachment-object-storage')
+    let signed=false
+    f.deps.objects=store.supabaseObjectStorage({url:'https://db.example',serviceKey:'fixture',bucket:'attachments',
+      fetch:async()=>new Response(JSON.stringify({file_size_limit:MAX_ATTACHMENT_BYTES})),
+      signUpload:async()=>{signed=true;return 'https://db.example/scoped'},signDownload:async()=>'',
+    })
+    await expect(handleUpload(f.deps,USER,{size_bytes:5})).rejects.toMatchObject({status:503,code:'not_configured'})
+    expect(signed).toBe(false)
+    expect(f.controls.map(r=>r.fn)).toEqual(['file_managed_upload_prepare'])
+  })
+  it('refuses a finite provider ceiling above the deployment quota before reserving or signing',async()=>{
+    const f=fakes(),store=await import('../../../supabase/functions/_shared/attachment-object-storage')
+    const original=f.deps.userRpc
+    f.deps.userRpc=async(fn,args)=>fn==='file_managed_upload_prepare'
+      ?{data:{max_bytes:MAX_ATTACHMENT_BYTES,permit_seconds:7200},error:null}:original(fn,args)
+    let signed=false
+    f.deps.objects=store.supabaseObjectStorage({url:'https://db.example',serviceKey:'fixture',bucket:'attachments',
+      fetch:async()=>new Response(JSON.stringify({file_size_limit:MAX_ATTACHMENT_BYTES+1})),
+      signUpload:async()=>{signed=true;return 'https://db.example/scoped'},signDownload:async()=>'',
+    })
+    await expect(handleUpload(f.deps,USER,{size_bytes:5})).rejects.toMatchObject({status:503,code:'not_configured'})
+    expect(signed).toBe(false)
+    expect(f.controls).toEqual([])
+  })
+  it.each(['upload','commit','place','session','urls'])('stops %s when its control-plane authorization is denied', async route => {
+    const f=fakes({object:pngBytes()})
+    f.deps.userRpc=async()=>({data:null,error:{message:'denied by policy',hint:'file_transfer_denied'}})
+    const run=route==='upload'?()=>handleUpload(f.deps,USER,{size_bytes:64}):
+      route==='commit'?()=>handleCommit(f.deps,USER,commitBody()):
+      route==='place'?()=>handlePlace(f.deps,USER,{staging_key:STAGING,chat_id:'c1',file_name:'x.png'}):
+      route==='session'?()=>handleSessionCommit(f.deps,USER,{staging_key:STAGING,attachment_id:'33333333-3333-4333-8333-333333333333',sender_user_id:USER,sender_session_id:'s',recipient_user_ids:['receiver'],file_name:'x.png'}):
+      ()=>handleUrls(f.deps,USER,{refs:[{message_id:'m1'}]})
+    await expect(run()).rejects.toMatchObject({status:403,code:'denied'})
+    expect(f.calls).toEqual([])
+    expect(f.rpcs).toEqual([])
+    expect(f.bucket.finals.size).toBe(0)
+  })
+})
+
+describe('临时 / 保留(keep)', () => {
+  const placeBody = (extra: Record<string, unknown> = {}) => ({ staging_key: STAGING, chat_id: 'c1', file_name: 'deck.pptx', ...extra })
+  it('marks the copy that just joined the chat, as the uploader marks it later; not given, nothing is marked', async () => {
+    const sent = fakes({ object: pngBytes() })
+    await handleCommit(sent.deps, USER, commitBody({ keep: 'temporary' }))
+    expect(sent.rpcs.map((r) => `${r.as} ${r.fn}`)).toEqual(['service file_blob_register', 'user attachment_commit', 'user file_storage_mark_as'])
+    expect(sent.rpcs[2]!.args).toEqual({ p_refs: [{ message_id: 'm1' }], p_action: 'temporary', p_as: USER })
+    const placed = fakes({ object: pngBytes() })
+    await handlePlace(placed.deps, USER, placeBody({ keep: 'permanent', as_user_id: 'agent-1' }))
+    expect(placed.rpcs.at(-1)).toEqual({ as: 'user', fn: 'file_storage_mark_as', args: { p_refs: [{ item_id: 'i9' }], p_action: 'permanent', p_as: 'agent-1' } })
+    const plain = fakes({ object: pngBytes() })
+    await handleCommit(plain.deps, USER, commitBody())
+    expect(plain.rpcs.some((r) => r.fn === 'file_storage_mark_as')).toBe(false)
+  })
+  it('refuses an unknown class before anything is stored or sent', async () => {
+    const bad = fakes({ object: pngBytes() })
+    await expect(handleCommit(bad.deps, USER, commitBody({ keep: 'forever' }))).rejects.toMatchObject({ status: 400, code: 'invalid' })
+    await expect(handlePlace(bad.deps, USER, placeBody({ keep: 'later' }))).rejects.toMatchObject({ status: 400, code: 'invalid' })
+    expect(bad.rpcs).toEqual([])
+  })
+})
+
 describe('提交', () => {
   it.each([17, 1023, 1024, 30 * 1024, 150 * 1024, 5 * 1024 * 1024])('原始表示的 %i 字节保留 ETag，按原字节哈希并锁定复制源', async (size) => {
     const bytes = new Uint8Array(size).fill(97)
-    const { deps, calls, rpcs } = fakes({ object: bytes })
+    const f = fakes({ object: bytes })
+    const { deps, calls, rpcs } = f
     await expect(handleCommit(deps, USER, commitBody({ file_name: 'probe.txt', content_type: 'text/plain' }))).resolves.toEqual({ id: 'm1', file_version: 1 })
+    expectManagedCommit(f, 'attachment_commit')
     expect(calls[1]!.headers['x-oss-copy-source-if-match']).toBe('"E1"')
     expect(rpcs[0]!.args).toMatchObject({ p_sha256: createHash('sha256').update(bytes).digest('hex'), p_size_bytes: size })
   })
 
-  it('读暂存(内网)→ 自己算 sha256 → 复制到 <aa>/<sha256>(图片类型、一年 immutable)→ 登记 → 删暂存 → 以调用者身份发消息', async () => {
+  it('读暂存(内网)→ 自己算 sha256 → 复制到 <aa>/<sha256>(图片类型、一年 immutable)→ 登记 → 保留暂存及额度 → 以调用者身份发消息', async () => {
     const bytes = pngBytes()
-    const { deps, calls, rpcs } = fakes({ object: bytes })
+    const f = fakes({ object: bytes })
+    const { deps, calls, rpcs } = f
     const message = await handleCommit(deps, USER, commitBody({ content_type: 'text/html' }))
+    expectManagedCommit(f, 'attachment_commit')
+    expect(f.bucket.staging?.bytes).toEqual(bytes)
     expect(message).toEqual({ id: 'm1', file_version: 1 })
     const sha = createHash('sha256').update(bytes).digest('hex')
     expect(calls.map((c) => `${c.method} ${c.url.replace(/\?.*$/, '')}`)).toEqual([
       `GET https://gugu-files-test.oss-cn-wulanchabu-internal.aliyuncs.com/${STAGING}`,
       `PUT https://gugu-files-test.oss-cn-wulanchabu.aliyuncs.com/${sha.slice(0, 2)}/${sha}`,
       `HEAD https://gugu-files-test.oss-cn-wulanchabu.aliyuncs.com/${sha.slice(0, 2)}/${sha}`,
-      `DELETE https://gugu-files-test.oss-cn-wulanchabu.aliyuncs.com/${STAGING}`,
     ])
     expect(calls[1]!.headers).toMatchObject({
       'x-oss-copy-source': `/gugu-files-test/${STAGING}`, 'x-oss-copy-source-if-match': '"E1"', 'x-oss-metadata-directive': 'REPLACE', 'Content-Type': 'image/png', 'Cache-Control': IMMUTABLE,
@@ -276,6 +398,7 @@ describe('提交', () => {
     expect(rpcs[1]!.args).not.toHaveProperty('p_caption')
     const captioned = fakes({ object: bytes })
     await handleCommit(captioned.deps, USER, commitBody({ caption: '看这张' }))
+    expectManagedCommit(captioned, 'attachment_commit')
     expect(captioned.rpcs[1]!.args).toMatchObject({ p_caption: '看这张' })
   })
 
@@ -283,10 +406,12 @@ describe('提交', () => {
     const pdf = new TextEncoder().encode('%PDF-1.7 not really')
     const one = fakes({ object: pdf })
     await handleCommit(one.deps, USER, commitBody({ file_name: 'a.pdf', content_type: 'application/pdf' }))
+    expectManagedCommit(one, 'attachment_commit')
     expect(one.rpcs[0]!.args.p_content_type).toBe('application/pdf')
     expect(one.calls[1]!.headers).toMatchObject({ 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment' })
     const two = fakes({ object: pdf })
     await handleCommit(two.deps, USER, commitBody({ content_type: 'image/png' }))
+    expectManagedCommit(two, 'attachment_commit')
     expect(two.rpcs[0]!.args.p_content_type).toBe('application/octet-stream')
   })
 
@@ -294,6 +419,7 @@ describe('提交', () => {
     const deleting = { hint: 'file_blob_deleting', message: 'file blob x is being collected; try again shortly' }
     const ok = fakes({ object: pngBytes(), registerErrors: [deleting, deleting] })
     await handleCommit(ok.deps, USER, commitBody())
+    expectManagedCommit(ok, 'attachment_commit')
     expect(ok.calls.filter((c) => c.method === 'PUT')).toHaveLength(3)
     expect(ok.rpcs.filter((r) => r.fn === 'file_blob_register')).toHaveLength(3)
     const stuck = fakes({ object: pngBytes(), registerErrors: Array(5).fill(deleting) })
@@ -310,21 +436,23 @@ describe('提交', () => {
     expect(rpcs).toEqual([])
   })
 
-  it('复制和登记之间回收把同一个 sha 的旧 blob 收完、删了对象(登记新建一行):删暂存前看一眼,不在就再复制一次;复用已有的行不看', async () => {
+  it('复制和登记之间回收把同一个 sha 的旧 blob 收完、删了对象(登记新建一行):发布前看一眼,不在就再复制一次;复用已有的行不看', async () => {
     const bytes = pngBytes()
     const sha = createHash('sha256').update(bytes).digest('hex')
     const final = `${sha.slice(0, 2)}/${sha}`
     const raced = fakes({ object: bytes, afterRegister: (b) => void b.finals.clear() })
     await handleCommit(raced.deps, USER, commitBody())
-    expect(raced.calls.map((c) => c.method)).toEqual(['GET', 'PUT', 'HEAD', 'PUT', 'DELETE'])
+    expectManagedCommit(raced, 'attachment_commit')
+    expect(raced.calls.map((c) => c.method)).toEqual(['GET', 'PUT', 'HEAD', 'PUT'])
     expect(raced.bucket.finals.get(final)).toEqual(bytes)
-    expect(raced.bucket.staging).toBeNull()
+    expect(raced.bucket.staging?.bytes).toEqual(bytes)
     const reused = fakes({ object: bytes, registerCreated: false })
     await handleCommit(reused.deps, USER, commitBody())
-    expect(reused.calls.map((c) => c.method)).toEqual(['GET', 'PUT', 'DELETE'])
+    expectManagedCommit(reused, 'attachment_commit')
+    expect(reused.calls.map((c) => c.method)).toEqual(['GET', 'PUT'])
   })
 
-  it('暂存没了(上一次已经登记、删了暂存):不复制不登记,交给库认那次登记;超过 25 MiB:413,什么都不登记;暂存不是自己的:400', async () => {
+  it('暂存没了(上一次已经登记、删了暂存):不复制不登记,交给库认那次登记;超过许可的 25 MiB:413,什么都不登记;暂存不是自己的:400', async () => {
     const retry = fakes({ object: null })
     expect(await handleCommit(retry.deps, USER, commitBody())).toEqual({ id: 'm1', file_version: 1 })
     expect(retry.rpcs.map((r) => r.fn)).toEqual(['attachment_commit'])
@@ -349,8 +477,10 @@ describe('提交', () => {
 
 describe('代主人发给好友', () => {
   it('带 friend_user_id 的提交:登记字节,再以主人身份 send_friend_file_as_owner(agent、请求号、说明原样带上);缺请求号在读字节之前拒', async () => {
-    const { deps, rpcs } = fakes({ object: pngBytes() })
+    const f = fakes({ object: pngBytes() })
+    const { deps, rpcs } = f
     const answer = await handleCommit(deps, USER, { staging_key: STAGING, friend_user_id: 'f1', agent_user_id: 'a1', file_name: 'x.png', request_id: 'r1', caption: '给你' })
+    expectManagedCommit(f, 'send_friend_file_as_owner')
     expect(answer).toMatchObject({ chat_id: 'dm-1', message_id: 'm-o', sent_by_agent: true })
     expect(rpcs.map((r) => `${r.as} ${r.fn}`)).toEqual(['service file_blob_register', 'user send_friend_file_as_owner'])
     expect(rpcs[1]!.args).toEqual({ p_agent_user_id: 'a1', p_friend_user_id: 'f1', p_staging_key: STAGING, p_file_name: 'x.png', p_request_id: 'r1', p_caption: '给你' })
@@ -364,19 +494,24 @@ describe('只放进群文件夹(App 写文件)', () => {
   const placeBody = (extra: Record<string, unknown> = {}) => ({ staging_key: STAGING, chat_id: 'c1', file_name: 'deck.pptx', ...extra })
 
   it('建文件:读暂存 → 登记 → 以调用者身份 file_place_as(文件夹、代谁、来源消息原样带上);不发消息', async () => {
-    const { deps, rpcs } = fakes({ object: pngBytes() })
+    const f = fakes({ object: pngBytes() })
+    const { deps, rpcs } = f
     expect(await handlePlace(deps, USER, placeBody({ folder: 'specs', as_user_id: 'agent-1', source_message_ids: ['m7'] }))).toEqual({ id: 'i9', version: 1, path: 'deck.pptx' })
+    expectManagedCommit(f, 'file_place_as')
     expect(rpcs.map((r) => `${r.as} ${r.fn}`)).toEqual(['service file_blob_register', 'user file_place_as'])
     expect(rpcs[1]!.args).toEqual({ p_staging_key: STAGING, p_chat_id: 'c1', p_as_user_id: 'agent-1', p_file_name: 'deck.pptx', p_folder: 'specs', p_source_message_ids: ['m7'] })
   })
 
   it('给 item_id ⇒ 换那个文件(expected_version 带上);不给 as_user_id ⇒ 调用者自己,不给 folder ⇒ NULL(根)', async () => {
-    const { deps, rpcs } = fakes({ object: pngBytes() })
+    const f = fakes({ object: pngBytes() })
+    const { deps, rpcs } = f
     expect(await handlePlace(deps, USER, { staging_key: STAGING, item_id: 'i3', expected_version: 3 })).toEqual({ id: 'i3', version: 4 })
+    expectManagedCommit(f, 'file_replace_as')
     expect(rpcs.map((r) => `${r.as} ${r.fn}`)).toEqual(['service file_blob_register', 'user file_replace_as'])
     expect(rpcs[1]!.args).toEqual({ p_staging_key: STAGING, p_item_id: 'i3', p_as_user_id: USER, p_expected_version: 3 })
     const root = fakes({ object: pngBytes() })
     await handlePlace(root.deps, USER, placeBody())
+    expectManagedCommit(root, 'file_place_as')
     expect(root.rpcs[1]!.args).toMatchObject({ p_folder: null, p_as_user_id: USER, p_source_message_ids: [] })
   })
 
@@ -408,12 +543,13 @@ describe('直传表单、签名链接、回收', () => {
     const f = fakes({ object: bytes, claimed: [{ blob_id: 'b1', claim_token: 't1', bucket_id: 'oss', object_name: logical, content_type: 'image/png' }] })
     f.deps.oss = { ...OSS, objectPrefix: 'production' }
     f.deps.cdn = { ...CDN, objectPrefix: 'production' }
-    const up = await handleUpload(f.deps, USER)
+    const up = await handleUpload(f.deps, USER,{size_bytes:MAX_ATTACHMENT_BYTES})
     expect(up.staging_key).toBe(STAGING)
     expect(up.fields.key).toBe(`production/${STAGING}`)
     expect(JSON.parse(atob(up.fields.policy!)).conditions).toContainEqual(['eq', '$key', `production/${STAGING}`])
     await handleCommit(f.deps, USER, commitBody())
-    expect(f.calls.find(c => c.method === 'GET')!.url).toContain(`/production/${STAGING}`)
+    expectManagedCommit(f, 'attachment_commit', 3)
+    expect(f.calls.find(c => c.method === 'GET' && c.url.includes('/staging/'))!.url).toContain(`/production/${STAGING}`)
     const copy = f.calls.find(c => c.method === 'PUT')!
     expect(copy.url).toContain(`/production/${logical}`)
     expect(copy.headers['x-oss-copy-source']).toBe(`/${OSS.bucket}/production/${STAGING}`)
@@ -436,20 +572,20 @@ describe('直传表单、签名链接、回收', () => {
 
   it('upload:key 是 staging/<调用者>/<uuid>', async () => {
     const { deps } = fakes()
-    const up = await handleUpload(deps, USER)
+    const up = await handleUpload(deps, USER,{size_bytes:MAX_ATTACHMENT_BYTES})
     expect(up).toMatchObject({ staging_key: STAGING, url: 'https://gugu-files-test.oss-cn-wulanchabu.aliyuncs.com/', max_bytes: MAX_ATTACHMENT_BYTES })
     expect(up.fields.key).toBe(STAGING)
   })
 
   it('urls:OSS 的走 CDN 鉴权 A(图片另给缩略图),老对象走存储的签名链接;悄悄话附件按消息要;refs 不对就 400', async () => {
-    const { deps, rpcs } = fakes()
+    const { deps, controls } = fakes()
     const refs = [{ item_id: '44444444-4444-4444-8444-444444444444' }, { item_id: '55555555-5555-4555-8555-555555555555', version: 2 }, { message_id: 'm1' }]
     const { urls } = await handleUrls(deps, USER, { refs })
-    expect(rpcs[0]).toMatchObject({ as: 'user', fn: 'file_urls_as', args: { p_refs: refs, p_as_user_id: USER } })
-    expect(urls[0]).toMatchObject({ item_id: 'i1', version: 1, message_id: null, current_version: 3, size_bytes: 10, content_type: 'image/png', width: 640, expires_at: '2026-10-16T12:30:00.000Z' })
+    expect(controls.filter(r=>r.fn==='file_transfer_download_as').map(r=>r.args.p_ref)).toEqual(refs)
+    expect(urls[0]).toMatchObject({ item_id: refs[0]!.item_id, version: 1, message_id: null, current_version: 3, size_bytes: 10, content_type: 'image/png', width: 640, expires_at: '2026-10-16T12:01:00.000Z' })
     expect(urls[0]!.url).toMatch(new RegExp(`^https://${CDN.domain}/ab/(ab){32}\\?auth_key=\\d+-[0-9a-f]+-0-[0-9a-f]{32}$`))
     expect(urls[0]!.thumb_url).toBe(`${urls[0]!.url}&x-oss-process=${THUMB_PROCESS}`)
-    expect(urls[1]).toMatchObject({ item_id: 'i2', thumb_url: null, url: 'https://db.example/storage/v1/object/sign/workspace/c/u/x-b.pptx?expires=1800' })
+    expect(urls[1]).toMatchObject({ item_id: refs[1]!.item_id, thumb_url: null, url: 'https://db.example/storage/v1/object/sign/workspace/c/u/x-b.pptx?expires=60' })
     expect(urls[2]).toMatchObject({ item_id: null, version: null, message_id: 'm1', current_version: null, file_name: 'w.pdf', thumb_url: null })
     expect(urls[2]!.url).toMatch(new RegExp(`^https://${CDN.domain}/cd/(cd){32}\\?auth_key=`))
     const both = { item_id: '44444444-4444-4444-8444-444444444444', message_id: 'm1' }
@@ -463,8 +599,16 @@ describe('直传表单、签名链接、回收', () => {
       { blob_id: 'b1', claim_token: 't1', bucket_id: 'oss', object_name: 'ab/x', content_type: 'image/png' },
       { blob_id: 'b2', claim_token: 't2', bucket_id: 'workspace', object_name: 'c/u/old', content_type: 'application/x' },
     ]
-    const { deps, calls, rpcs, removed } = fakes({ claimed })
+    const { deps, calls, rpcs, removed, controls, order } = fakes({ claimed })
     expect(await handleGc(deps)).toEqual({ claimed: 2, deleted: 2, failed: 0 })
+    expect(controls.filter(r => r.fn === 'file_temporary_expire')).toEqual([{as:'service',fn:'file_temporary_expire',args:{p_limit:500}}])
+    expect(order.indexOf('service:file_temporary_expire')).toBeLessThan(order.indexOf('service:file_transfer_expire'))
+    // Handed-off next version copies past their window are retired before the claim, so their bytes go in this pass.
+    expect(controls.filter(r => r.fn === 'file_version_handoff_expire')).toEqual([{as:'service',fn:'file_version_handoff_expire',args:{p_limit:500}}])
+    expect(order.indexOf('service:file_version_handoff_expire')).toBeLessThan(order.indexOf('service:file_blob_gc_claim'))
+    expect(controls.filter(r => r.fn === 'file_transfer_expire')).toEqual([{as:'service',fn:'file_transfer_expire',args:{p_limit:500}}])
+    expect(order.indexOf('service:file_transfer_expire')).toBeLessThan(order.indexOf('service:file_blob_gc_claim'))
+    expect(order).not.toContain('service:file_transfer_object_gone')
     expect(calls.map((c) => `${c.method} ${c.url.replace(/\?.*$/, '')}`)).toEqual([
       'DELETE https://gugu-files-test.oss-cn-wulanchabu.aliyuncs.com/ab/x',
       'POST https://cdn.aliyuncs.com/',
@@ -473,10 +617,18 @@ describe('直传表单、签名链接、回收', () => {
     expect(removed).toEqual(['workspace/c/u/old'])
     expect(rpcs.filter((r) => r.fn === 'file_blob_gc_finish').map((r) => r.args.p_blob_id)).toEqual(['b1', 'b2'])
 
+
     const broken = fakes({ claimed })
     broken.deps.storageRemove = async () => { throw new Error('storage 500') }
     expect(await handleGc(broken.deps)).toEqual({ claimed: 2, deleted: 1, failed: 1 })
     expect(broken.rpcs.filter((r) => r.fn === 'file_blob_gc_fail').map((r) => r.args)).toEqual([{ p_blob_id: 'b2', p_claim_token: 't2', p_error: 'Error: storage 500' }])
+  })
+  it('gc removes temporary ciphertext at the same private provider without invoking CDN or weakening claim confirmation',async()=>{
+    const {deps,calls,rpcs,removed}=fakes({claimed:[{blob_id:'temporary',claim_token:'token',bucket_id:'temporary',object_name:'temporary/group/file/generation',content_type:'application/octet-stream'}]})
+    expect(await handleGc(deps)).toEqual({claimed:1,deleted:1,failed:0})
+    expect(calls.map(c=>`${c.method} ${c.url.replace(/\?.*$/,'')}`)).toEqual(['DELETE https://gugu-files-test.oss-cn-wulanchabu.aliyuncs.com/temporary/group/file/generation'])
+    expect(removed).toEqual([])
+    expect(rpcs.filter(r=>r.fn==='file_blob_gc_finish').map(r=>r.args)).toEqual([{p_blob_id:'temporary',p_claim_token:'token'}])
   })
 })
 
@@ -495,7 +647,6 @@ describe('转发', () => {
       `GET https://gugu-files-test.oss-cn-wulanchabu-internal.aliyuncs.com/${key}`,
       expect.stringMatching(/^PUT https:\/\/gugu-files-test\.oss-cn-wulanchabu\.aliyuncs\.com\/[0-9a-f]{2}\/[0-9a-f]{64}$/),
       expect.stringMatching(/^HEAD https:\/\/gugu-files-test\.oss-cn-wulanchabu\.aliyuncs\.com\/[0-9a-f]{2}\/[0-9a-f]{64}$/),
-      `DELETE https://gugu-files-test.oss-cn-wulanchabu.aliyuncs.com/${key}`,
     ])
     expect(rpcs.map((r) => `${r.as} ${r.fn}`)).toEqual(['user attachment_forward', 'user attachment_legacy_source', 'service file_blob_register', 'user attachment_forward'])
     expect(rpcs[0]!.args).not.toHaveProperty('p_staging_key')
@@ -516,5 +667,40 @@ describe('转发', () => {
     const { deps, rpcs } = fakes({ legacy: { row: { object_name: `${USER}/gone.png`, file_name: 'gone.png', content_type: 'image/png' }, bytes: null } })
     await expect(handleForward(deps, USER, forwardBody)).rejects.toMatchObject({ status: 410, code: 'source_gone' })
     expect(rpcs.map((r) => r.fn)).toEqual(['attachment_forward', 'attachment_legacy_source'])
+  })
+})
+
+
+describe('private session attachment routes', () => {
+  const id='33333333-3333-4333-8333-333333333333'
+  it('promotes the original bytes using the existing blob pipeline, without making a chat message',async()=>{
+    const bytes=new Uint8Array([0,255,12,0,128])
+    const f=fakes({object:bytes})
+    const {deps,bucket,rpcs}=f
+    const base=deps.userRpc
+    deps.userRpc=async(fn,args)=>fn==='session_attachment_commit'
+      ? (f.order.push('user:session_attachment_commit'), {data:[{attachment_id:id,file_name:args.p_file_name,sha256:await sha256Hex(bytes),size_bytes:bytes.length,content_type:'application/octet-stream'}],error:null})
+      : base(fn,args)
+    const answer=await handleSessionCommit(deps,USER,{staging_key:STAGING,attachment_id:id,sender_user_id:'sender',sender_session_id:'s',recipient_user_ids:['receiver'],file_name:'original.bin'})
+    expectManagedCommit(f, 'session_attachment_commit')
+    expect(answer).toMatchObject({attachment_id:id,size_bytes:5,sha256:await sha256Hex(bytes)})
+    expect([...bucket.finals.values()]).toEqual([bytes])
+    expect(rpcs.some(row=>row.fn==='file_blob_register')).toBe(true)
+    expect(rpcs.some(row=>row.fn==='attachment_commit')).toBe(false)
+  })
+  it('signs only database-authorized session references, with the current Agent actor',async()=>{
+    const {deps}=fakes()
+    let actor:unknown
+    deps.userRpc=async(fn,args)=>{
+      expect(fn).toBe('file_transfer_download_as');actor=args.p_as
+      return {data:args.p_as==='receiver' ? {status:'ready',source:'managed-object',attachment_id:id,file_name:'x.bin',
+        bucket_id:'oss',object_name:'ab/'+ 'ab'.repeat(32),sha256:'ab'.repeat(32),size_bytes:4,
+        content_type:'application/octet-stream',download_id:args.p_id,transfer_id:null,
+        signed_at:'2026-10-16T12:00:00Z',expires_at:'2026-10-16T12:01:00Z'} : {status:'gone'},error:null}
+    }
+    const answer=await handleSessionUrls(deps,USER,{attachment_ids:[id],as:'receiver'})
+    expect(actor).toBe('receiver')
+    expect(answer.attachments).toMatchObject([{attachment_id:id,sha256:'ab'.repeat(32),size_bytes:4,url:expect.any(String)}])
+    expect(await handleSessionUrls(deps,USER,{attachment_ids:[id],as:'other-agent'})).toEqual({attachments:[]})
   })
 })

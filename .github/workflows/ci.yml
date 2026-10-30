@@ -23,15 +23,18 @@ jobs:
         with:
           deno-version: v2.6.4
       - run: pnpm check:functions
+      - run: deno test --allow-env --allow-sys tests/deno/ossDirectUrl.test.ts tests/deno/textFileIngest.test.ts
   integration:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       GUGU_INSTALL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres?sslmode=disable
-      # The Supabase CLI pulls from public.ecr.aws by default, whose anonymous quota is shared by
-      # GitHub-hosted runner IPs and runs out ("toomanyrequests: Data limit exceeded"). Supabase
-      # mirrors the same images to GHCR, which hosted runners reach without that quota.
-      SUPABASE_INTERNAL_IMAGE_REGISTRY: ghcr.io
+      # Neither Supabase mirror holds up from hosted runners: public.ecr.aws runs out of the anonymous
+      # quota those runner IPs share ("toomanyrequests: Data limit exceeded"), and GHCR caps pulls per
+      # publishing organization, so every pull of a Supabase image anywhere draws on one budget
+      # ("toomanyrequests: ... allowed: 44000/minute"). Take the Docker Hub originals through
+      # Google's Docker Hub cache instead; the daemon falls back to Docker Hub for anything uncached.
+      SUPABASE_INTERNAL_IMAGE_REGISTRY: docker.io
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -40,6 +43,13 @@ jobs:
           node-version-file: .node-version
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Pull Docker Hub images through mirror.gcr.io
+        run: |
+          config=/etc/docker/daemon.json
+          current=$(sudo cat "$config" 2>/dev/null || echo '{}')
+          echo "$current" | jq '. + {"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee "$config"
+          sudo systemctl restart docker
+          docker info --format '{{.RegistryConfig.Mirrors}}'
       - run: pnpm test:db:start
       - run: pnpm test:installation
       - run: pnpm test:integration

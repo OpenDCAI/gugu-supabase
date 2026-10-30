@@ -4,6 +4,9 @@ import { createClient } from 'npm:@supabase/supabase-js@2.110.9'
 import {
   type AttachmentsDeps,
   handleCommit,
+  handleSessionCommit,
+  handleSessionUrls,
+  handleSessionRevoke,
   handlePlace,
   handleForward,
   handleGc,
@@ -14,6 +17,10 @@ import {
 
 import { ossObjectStorage, supabaseObjectStorage } from '../_shared/attachment-object-storage.ts'
 import { type AttachmentStorageConfig, attachmentStorageConfig, StorageConfigError } from '../_shared/attachment-storage-config.ts'
+import { handleUsageImport,handleStorageInventory,handleFileResolve } from '../_shared/file-transfer-core.ts'
+import { handleProjectFiles } from '../_shared/project-file-transfer-core.ts'
+import { ossDirectSigner } from '../_shared/oss-direct-url.ts'
+import { handleDocumentImport, WORKSPACE_TEXT_MAX_BYTES, workspaceUploadKind } from '../_shared/document-import-core.ts'
 
 const env = (key: string): string => Deno.env.get(key)?.trim() ?? ''
 
@@ -58,9 +65,27 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
     auth: { persistSession: false, autoRefreshToken: false },
   })
   const asService = createClient(url, env('SUPABASE_SERVICE_ROLE_KEY'), { db: { schema: 'chat' }, auth: { persistSession: false } })
+  const signStorage=async(bucket:string,object:string,seconds:number)=>{
+    // Storage signs the same 60-second capability; any gateway rate policy is independent.
+    if(seconds!==60) {
+      throw new Refusal(503,'not_configured','Managed Storage downloads require a 60-second capability')
+    }
+    const {data,error}=await asService.storage.from(bucket).createSignedUrl(object,seconds)
+    if(error||!data?.signedUrl) throw new Error('Could not sign a managed Storage download')
+    return publicStorageUrl(data.signedUrl,url)
+  }
   return {
+    documentReplacement: async (item, actor, body) => {
+      const base = (env('GUGU_FILES_URL') || `${env('GUGU_PUBLIC_SUPABASE_URL') || url}/files`).replace(/\/$/, '')
+      const response = await fetch(`${base}/${item}/replace`, { method: 'POST',
+        headers: { Authorization: authorization, 'X-Gugu-As-Agent': actor, 'content-type': 'application/json' },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(35_000) })
+      const answer = await response.json()
+      if (!response.ok) throw new Refusal(response.status, answer.error ?? 'replacement_failed', 'The document changed or could not be replaced')
+    },
+    textFiles: { maxBytes: WORKSPACE_TEXT_MAX_BYTES, classify: workspaceUploadKind },
     objects: storage.kind === 'oss'
-      ? ossObjectStorage({ oss: storage.oss, cdn: storage.cdn, fetch: (input, init) => fetch(input, init) })
+      ? ossObjectStorage({ oss: storage.oss, cdn: storage.cdn, directSign:ossDirectSigner(storage.oss),fetch: (input, init) => fetch(input, init) })
       : supabaseObjectStorage({
         url, serviceKey: env('SUPABASE_SERVICE_ROLE_KEY'), bucket: storage.bucket,
         fetch: (input, init) => fetch(input, init),
@@ -69,11 +94,7 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
           if (error || !data?.signedUrl) throw new Error('could not sign attachment upload')
           return publicStorageUrl(data.signedUrl, url)
         },
-        signDownload: async (key, seconds) => {
-          const { data, error } = await asService.storage.from(storage.bucket).createSignedUrl(key, seconds)
-          if (error || !data?.signedUrl) throw new Error('could not sign attachment download')
-          return publicStorageUrl(data.signedUrl, url)
-        },
+        signDownload: (key,seconds)=>signStorage(storage.bucket,key,seconds),
       }),
     fetch: (input, init) => fetch(input, init),
     userRpc: async (fn, args) => {
@@ -84,11 +105,7 @@ function depsFor(authorization: string, storage: AttachmentStorageConfig): Attac
       const { data, error } = await asService.rpc(fn, args)
       return { data, error: error ? { message: error.message, hint: error.hint, code: error.code } : null }
     },
-    storageSignedUrl: async (bucket, object, seconds) => {
-      const { data, error } = await asService.storage.from(bucket).createSignedUrl(object, seconds)
-      if (error || !data?.signedUrl) throw new Refusal(500, 'failed', `could not sign ${bucket}/${object}: ${error?.message ?? 'no url'}`)
-      return publicStorageUrl(data.signedUrl, url)
-    },
+    storageSignedUrl:signStorage,
     storageRemove: async (bucket, object) => {
       const { error } = await asService.storage.from(bucket).remove([object])
       if (error) throw new Error(`could not remove ${bucket}/${object}: ${error.message}`)
@@ -119,6 +136,14 @@ Deno.serve(async (request) => {
   const authorization = request.headers.get('Authorization') ?? ''
   try {
     const deps = depsFor(authorization, storage)
+    if (route === 'usage-import'||route==='storage-inventory'||route==='document-import') {
+      if (!sameSecret(authorization.replace(/^Bearer\s+/i,''),env('SUPABASE_SERVICE_ROLE_KEY'))) {
+        return json({error:'denied',message:'Usage ingestion is restricted to the service'},401)
+      }
+      const body=await request.json()
+      if (route==='document-import') return json(await handleDocumentImport(deps,body))
+      return json(await (route==='usage-import'?handleUsageImport(deps.serviceRpc,body):handleStorageInventory(deps.serviceRpc,body)))
+    }
     if (route === 'gc') {
       if (!sameSecret(authorization.replace(/^Bearer\s+/i, ''), env('SUPABASE_SERVICE_ROLE_KEY'))) {
         return json({ error: 'denied', message: 'gc is the server\'s own job' }, 401)
@@ -144,9 +169,18 @@ Deno.serve(async (request) => {
     const { data: who, error: whoError } = await asUser.auth.getUser()
     if (whoError || !who?.user?.id) return json({ error: 'denied', message: 'sign in first' }, 401)
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    if(route.startsWith('file-')&&route!=='file-resolve') return json(await handleProjectFiles(deps,who.user.id,route,body))
     switch (route) {
+      case 'file-resolve':
+        return json(await handleFileResolve(deps,who.user.id,body))
       case 'upload':
-        return json(await handleUpload(deps, who.user.id))
+        return json(await handleUpload(deps, who.user.id,body))
+      case 'session-commit':
+        return json({ attachment: await handleSessionCommit(deps, who.user.id, body) })
+      case 'session-revoke':
+        return json(await handleSessionRevoke(deps, who.user.id, body))
+      case 'session-urls':
+        return json(await handleSessionUrls(deps, who.user.id, body))
       case 'commit':
         return json({ message: await handleCommit(deps, who.user.id, body) })
       case 'place':
@@ -160,7 +194,7 @@ Deno.serve(async (request) => {
     }
   } catch (error) {
     if (error instanceof Refusal) return json({ error: error.code, message: error.message }, error.status)
-    log('failed', { route, error: String(error) })
+    log('failed', { route, error_type:error instanceof Error?error.name:'unknown' })
     return json({ error: 'failed', message: 'attachments failed; try again' }, 500)
   }
 })

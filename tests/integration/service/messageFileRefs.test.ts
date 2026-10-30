@@ -1,3 +1,4 @@
+import { createFixtureGroup } from '../../support/groupFixture'
 import { createHash, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -70,7 +71,7 @@ async function agentOf(ownerId: string, name: string): Promise<string> {
 async function newGroup(creator: string, initial: string[]): Promise<string> {
   const id = randomUUID()
   await asUser(creator)
-  await database.query('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
+  await createFixtureGroup(database, [
     id, 'Message file refs', creator, JSON.stringify(initial.map((user_id) => ({ user_id, role: 'member' }))),
   ])
   await asOwner()
@@ -223,7 +224,8 @@ describe('提交(chat.attachment_commit)', () => {
     const tries: [string, string, unknown[], RegExp][] = []
     const mine = await upload(owner, `m-${randomUUID()}`)
     tries.push(['别人的 agent', owner, [mine.key, randomUUID(), group, theirs, 'x.png', [], false], /Not allowed to act as/])
-    tries.push(['自己的 agent 不在这个群', owner, [mine.key, randomUUID(), bare, agent, 'x.png', [], false], /Not allowed to act as/])
+    // Delegation is valid, but the actor has no resource membership.
+    tries.push(['自己的 agent 不在这个群', owner, [mine.key, randomUUID(), bare, agent, 'x.png', [], false], /hint: workspace_not_member/])
     const out = await upload(outsider, `o-${randomUUID()}`)
     tries.push(['不是成员', outsider, [out.key, randomUUID(), group, outsider, 'x.png', [], false], /not a chat you are a member of/])
     const theirsUpload = await upload(member, `t-${randomUUID()}`)

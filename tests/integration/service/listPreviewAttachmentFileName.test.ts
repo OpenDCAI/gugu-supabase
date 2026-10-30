@@ -56,7 +56,7 @@ async function inRollback(body: () => Promise<void>): Promise<void> {
 
 const OWNER = 'a11ce000-0000-4000-8000-000000000001'
 const PEER = 'a11ce000-0000-4000-8000-000000000002'
-const CHAT = 'preview-it-chat'
+const CHAT = 'a11ce000-0000-4000-8000-000000000003'
 
 /**
  * 与客户端 formatAttachmentMetadata 同形的四行信封;URL 足够长,让「截 100 字」一定截在它中间。

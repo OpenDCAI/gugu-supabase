@@ -90,7 +90,7 @@ describe('#6036 agent inbox pagination (pull_agent_inbox_v2)', () => {
 
   it('keeps membership, join-time, whisper and ownership gates on every page', async () => rollback(async () => {
     await seed()
-    await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type,to_user_ids,is_whisper,created_at) VALUES ('6036-hidden',$1,$2,'private','text',ARRAY[$3],true,now()),('6036-old',$1,$2,'history','text',NULL,false,now()-interval '1 day')", [LAST, OWNER, OTHER])
+    await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type,to_user_ids,is_whisper,created_at) VALUES ('6036-hidden',$1,$2,'private','text',ARRAY[$3],true,now()),('6036-old',$1,$2,'history','text',ARRAY[$3],false,now()-interval '1 day')", [LAST, OWNER, OTHER])
     await asOwner()
     const rows = await db.query<Row>('SELECT * FROM identity.pull_agent_inbox_v2($1,$2,NULL,80,$3,NULL)', [AGENT, LAST, { chat_id: FIRST, seq: 800 }])
     expect(rows.rows.map((row) => row.id)).toEqual(['6036-dm'])

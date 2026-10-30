@@ -19,13 +19,14 @@
 //   · 通知:成员移出 ⇒ 断开这个人在该群所有文件上的连接(removed-from-group);文件删除 ⇒ 断开(deleted)、卸载、不再存盘。
 //     LISTEN 连接断过就把所有开着的连接重核一遍(断线期间的通知收不到)。
 //
-// 两个端口:对外口只有 /:id、/:id/edit 与 WebSocket(nginx 的 /files/ 剥掉前缀后转到这里);
+// 两个端口:对外口只有 /:id、/:id/edit、/:id/replace 与 WebSocket(nginx 的 /files/ 剥掉前缀后转到这里);
 // 内部口只有 /healthz 与 /stats,只绑回环、❌ 经 nginx 暴露。
 
 import http from 'node:http'
-import { Server } from '@hocuspocus/server'
+import { Server, isTransactionOrigin } from '@hocuspocus/server'
 import pg from 'pg'
 import * as Y from 'yjs'
+import { contentOriginOf } from '@gugu/files-core/concurrent'
 
 import {
   Denied,
@@ -43,6 +44,7 @@ import { createOpenFiles, readHead } from '@gugu/files-core/open-files'
 import { colorFor } from '@gugu/files-core/presence'
 import { errorFields } from './log.mjs'
 import { createRounds } from './rounds.mjs'
+import { replaceIncoming } from './replacement.mjs'
 
 const NAME = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})@(0|[1-9]\d{0,8})$/i
 
@@ -146,7 +148,7 @@ export function createFileService(config, { log, pool: givenPool }) {
   }
 
   // 打开的文件里和存储无关的那一半(簿记、限速与上限、presence 盖章、self、同时建合并):和桌面本地服务共用同一个包。
-  /** @type {import('@gugu/files-core/open-files').OpenFiles<{ itemId: string, epoch: number, chatId: string, contentType: string, deleted: boolean }>} */
+  /** @type {import('@gugu/files-core/open-files').OpenFiles<{ itemId: string, epoch: number, chatId: string, contentType: string, deleted: boolean, updatedBy: string | null }>} */
   const openFiles = createOpenFiles({
     maxBytes,
     limits: config,
@@ -328,18 +330,7 @@ export function createFileService(config, { log, pool: givenPool }) {
     })
   }
 
-  // ── 踢人 ────────────────────────────────────────────────────────────────────
-  function kickMember(/** @type {string} */ chatId, /** @type {string} */ userId) {
-    for (const doc of hp().documents.values()) {
-      for (const conn of doc.getConnections()) {
-        if (conn.context?.chatId === chatId && conn.context?.actorId === userId) {
-          conn.close({ code: 4403, reason: 'removed-from-group' })
-          stats.kicks.removed++
-          log.info('kicked removed member', { chatId, userId, doc: doc.name })
-        }
-      }
-    }
-  }
+  // ── 撤销文件访问 ─────────────────────────────────────────────────────────────
   function markDeleted(/** @type {string} */ itemId) {
     for (const [name, info] of docs) {
       if (info.itemId !== itemId) continue
@@ -369,30 +360,41 @@ export function createFileService(config, { log, pool: givenPool }) {
       const alive = new Set(rows.map((r) => r.id))
       for (const id of ids) if (!alive.has(id)) markDeleted(id)
     }
-    const pairs = []
+    const connections = []
     for (const doc of hp().documents.values()) {
       for (const conn of doc.getConnections()) {
-        if (conn.context?.chatId && conn.context?.actorId) pairs.push([conn.context.chatId, conn.context.actorId])
+        const c = conn.context
+        if (c?.itemId && c?.userId && c?.actorId) connections.push({ conn, itemId: c.itemId, userId: c.userId, actorId: c.actorId })
       }
     }
-    if (!pairs.length) return
+    if (!connections.length) return
+    // The item's container may have changed since authentication. Reuse the
+    // database's current item + delegated-actor authorization in one batch;
+    // cached chat membership must neither preserve nor revoke access on its own.
     const { rows } = await pool.query(
-      `SELECT m.chat_id, m.user_id FROM chat.chat_members m
-         JOIN unnest($1::text[], $2::text[]) AS p(chat_id, user_id) ON p.chat_id = m.chat_id AND p.user_id = m.user_id`,
-      [pairs.map((p) => p[0]), pairs.map((p) => p[1])],
+      `SELECT p.item_id::text, p.user_id, p.actor_id, g.chat_id
+         FROM unnest($1::uuid[], $2::text[], $3::text[]) AS p(item_id, user_id, actor_id)
+         CROSS JOIN LATERAL chat.files_authorize(p.item_id, p.user_id, p.actor_id) g`,
+      [connections.map((c) => c.itemId), connections.map((c) => c.userId), connections.map((c) => c.actorId)],
     )
-    const key = (/** @type {string} */ chatId, /** @type {string} */ userId) => `${chatId}\u0000${userId}`
-    const still = new Set(rows.map((r) => key(r.chat_id, r.user_id)))
-    const connected = new Map(pairs.map(([chatId, userId]) => [key(chatId, userId), [chatId, userId]]))
-    for (const [k, [chatId, userId]] of connected) if (!still.has(k)) kickMember(chatId, userId)
+    const key = (/** @type {string} */ itemId, /** @type {string} */ userId, /** @type {string} */ actorId) => `${itemId}\u0000${userId}\u0000${actorId}`
+    const allowed = new Map(rows.map((r) => [key(r.item_id, r.user_id, r.actor_id), r.chat_id]))
+    for (const { conn, itemId, userId, actorId } of connections) {
+      const chatId = allowed.get(key(itemId, userId, actorId))
+      if (chatId) conn.context.chatId = chatId
+      else {
+        conn.close({ code: 4403, reason: 'removed-from-group' })
+        stats.kicks.removed++
+        log.info('revoked file access', { itemId, actorId })
+      }
+    }
   }
 
   // ── LISTEN ──────────────────────────────────────────────────────────────────
   const listener = { client: /** @type {pg.Client | null} */ (null), up: false, stopped: false, timer: /** @type {NodeJS.Timeout | null} */ (null) }
   function onNotification(/** @type {pg.Notification} */ { channel, payload = '' }) {
     if (channel === 'files_member_removed') {
-      const at = payload.lastIndexOf(':')
-      if (at > 0) kickMember(payload.slice(0, at), payload.slice(at + 1))
+      recheckAll().catch((error) => log.error('member removal recheck failed', errorFields(error)))
     } else if (channel === 'files_item_deleted') {
       if (isUuid(payload)) markDeleted(payload.toLowerCase())
     } else if (channel === 'files_item_marked') {
@@ -517,6 +519,21 @@ export function createFileService(config, { log, pool: givenPool }) {
           chatId: row.chat_id,
           contentType: row.content_type,
           deleted: false,
+          updatedBy: null,
+        })
+        // Capture the authenticated actor synchronously with the actual content transaction, not
+        // the later debounced store. Passive sync and changes to Yjs structure alone do not count.
+        let lastText = readable
+        document.on('afterTransaction', (transaction) => {
+          const text = readText(document, row.content_type)
+          if (text === lastText) return
+          lastText = text
+          const origin = contentOriginOf(transaction.origin)
+          const context = isTransactionOrigin(origin)
+            ? origin.source === 'connection' ? origin.connection.context : origin.source === 'local' ? origin.context : null
+            : null
+          const info = docs.get(documentName)
+          if (info) info.updatedBy = context?.actorId ?? null
         })
         // 加载时核对:ystate 算出来的和库里的正文对不上 = 有人绕过文件服务写了正文。记下来,❌ 静默吞掉。
         if (!built && !sameContent(row.content_type, readable, text)) {
@@ -559,11 +576,12 @@ export function createFileService(config, { log, pool: givenPool }) {
       info.dirty = false
       const snap = openFiles.snapshot(documentName, document)
       const { state, text, bytes } = snap
+      const updatedBy = info.updatedBy
       if (bytes > maxBytes) log.warn('storing a file over the size limit', { doc: documentName, bytes, limit: maxBytes })
       try {
         const u = await pool.query(
-          'UPDATE chat.workspace_items SET ystate = $1, inline_text = $2, size_bytes = $3 WHERE id = $4::uuid AND epoch = $5',
-          [Buffer.from(state), text, bytes, info.itemId, info.epoch],
+          'UPDATE chat.workspace_items SET ystate = $1, inline_text = $2, size_bytes = $3, updated_by = $6 WHERE id = $4::uuid AND epoch = $5',
+          [Buffer.from(state), text, bytes, info.itemId, info.epoch, updatedBy],
         )
         openFiles.stored(documentName, snap)
         stats.stores++
@@ -682,7 +700,7 @@ export function createFileService(config, { log, pool: givenPool }) {
     for (const [name, value] of Object.entries(CORS_HEADERS)) res.setHeader(name, value)
     const url = new URL(req.url ?? '/', 'http://files')
     // 对外口没有前缀(nginx 剥掉了 /files/):路径段不是文件 id 的一律 404,不先验令牌 —— /stats、/healthz 在这里不存在。
-    const m = /^\/([^/]+)(\/edit)?$/.exec(url.pathname)
+    const m = /^\/([^/]+)(\/edit|\/replace)?$/.exec(url.pathname)
     if (!m || !isUuid(m[1])) return send(res, 404, { error: 'not-found' })
     // 预检不带凭证(浏览器就是这么发的),只回答「这条路能怎么调」。
     if (req.method === 'OPTIONS') {
@@ -726,6 +744,8 @@ export function createFileService(config, { log, pool: givenPool }) {
         if (error instanceof Denied) throw error
         throw new Denied('bad-request', 400)
       }
+      if (m[2] === '/replace') return send(res, 200, await replaceIncoming({ pool, files: openFiles, hp: hp(), itemId, identity, grant, body,
+        open: () => openDirect(itemId, grant, { userId: identity.userId, actorId: grant.actorId, chatId: grant.chatId, itemId, via: 'http' }) }))
       if (typeof body?.old !== 'string' || typeof body?.new !== 'string') throw new Denied('bad-request', 400)
       if (body.old === '') throw new Denied('empty-old', 400)
 

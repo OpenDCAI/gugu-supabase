@@ -53,6 +53,8 @@ async function expire() { return (await db.query('SELECT chat.file_transfer_expi
 async function status(message:string) {
   await user()
   const r=(await db.query('SELECT chat.file_resolve_as($1,$2) AS r',[{message_id:message},member])).rows[0].r
+  const row=(await db.query('SELECT file_metadata FROM chat.messages_view WHERE id=$1',[message])).rows[0]
+  expect(row.file_metadata.status).toBe(r.status)
   await service();return r.status as string
 }
 async function collect(blob:string) {

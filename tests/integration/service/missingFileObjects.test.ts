@@ -48,6 +48,8 @@ describe('operator-confirmed missing objects', () => {
     expect(result.metadata.code).toBeUndefined(); expect(result.download.url).toBeUndefined()
     await db.query('RESET ROLE')
     expect((await db.query('SELECT count(*)::int AS n FROM chat.file_transfer_reservations WHERE account_id=$1', [owner])).rows[0].n).toBe(0)
+    await db.query('UPDATE chat.file_transfer_storage_refs SET expired_at=NULL WHERE chat_id=$1', [group])
+    expect(await read(owner)).toEqual({ metadata: { status: 'missing', code: 'object_not_found', sha256: null }, download: { status: 'missing', code: 'object_not_found', sha256: null } })
   })
   it('does not infer physical absence from an unmarked object or an in-progress deletion', async () => {
     for (const state of ['ready', 'deleting']) {

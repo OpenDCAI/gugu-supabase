@@ -8,6 +8,9 @@
 -- On those databases chat.get_or_create_dm was also rewritten to call identity.has_agent_dm_grant, so it
 -- is put back to this repository's definition (the #509 rule) BEFORE the function it calls is dropped.
 --
+-- Grantees that were already let into someone else's agent DM lose that membership first (see the DO block),
+-- otherwise dropping the read-only policy would turn their access into read-write.
+--
 -- Everything is DROP ... IF EXISTS / CREATE OR REPLACE, so this is a no-op on a database that never had
 -- the objects (including a fresh install) and safe to run twice.
 
@@ -110,6 +113,27 @@ BEGIN
     RETURN v_chat_id;
 END;
 $$;
+
+-- Existing shared DMs. With the grants a non-owner was made a member of a DM chat with someone else's agent,
+-- and the RESTRICTIVE policy below was the only thing that kept read-only grantees from writing there.
+-- Once the policy is gone those memberships would turn into read-write access, so revoke them first: remove
+-- exactly the granted user's membership in their DM chat with the agent they were granted.
+-- (Skipped when the grants table does not exist, e.g. a fresh install.)
+DO $do$
+BEGIN
+  IF to_regclass('identity.agent_dm_grants') IS NOT NULL THEN
+    EXECUTE $q$
+      DELETE FROM chat.chat_members cm
+      USING identity.agent_dm_grants g, chat.chats c, chat.chat_members am
+      WHERE c.kind = 'dm'
+        AND cm.chat_id = c.id
+        AND cm.user_id = g.grantee_user_id
+        AND am.chat_id = c.id
+        AND am.user_id = g.agent_user_id
+    $q$;
+  END IF;
+END
+$do$;
 
 DROP POLICY IF EXISTS messages_insert_dm_read_only ON chat.messages;
 DROP FUNCTION IF EXISTS chat.dm_read_only_for(text, text);

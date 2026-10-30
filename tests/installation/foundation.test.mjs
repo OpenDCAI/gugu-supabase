@@ -199,6 +199,9 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
       return result
     }
     assert.deepEqual(await installReleases(releaseQuery), { applied: versions, versions })
+    await t.test('file resolution remains stable after all releases', async () => {
+      assert.equal((await query("SELECT provolatile FROM pg_proc WHERE oid='chat.file_resolve_as(jsonb,text)'::regprocedure"))[0].provolatile, 's')
+    })
     await t.test('installed publishers retain directory-allocated names and private grants', async () => {
       await assertAllocatedProjectPublisher(query)
     })

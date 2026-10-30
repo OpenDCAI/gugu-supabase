@@ -21,8 +21,8 @@ async function reject(sql:string,args:unknown[]=[]) {
   }
   throw Error('Expected refusal: '+sql)
 }
-/** The account's one global file storage setting, written the way the client writes it. */
-async function storage(values:Record<string,unknown>,account=host) {
+/** The account's one global file storage setting, written the way the client writes it. The sender's by default. */
+async function storage(values:Record<string,unknown>,account=member) {
   await user(account)
   await db.query(`INSERT INTO identity.user_settings(user_id,scope,config) VALUES($1,'user',jsonb_build_object('file_storage',$2::jsonb))
     ON CONFLICT(user_id,scope) DO UPDATE SET config=identity.user_settings.config||EXCLUDED.config`,[account,values])
@@ -81,10 +81,10 @@ beforeEach(async()=>{
   await db.query("INSERT INTO chat.file_transfer_limits(scope,scope_id,settings) VALUES('global','*',$1) ON CONFLICT(scope,scope_id) DO UPDATE SET settings=EXCLUDED.settings",[{...settings,storage_global_bytes:baseline+settings.storage_global_bytes}])
 })
 afterEach(async()=>{await db.query('ROLLBACK')})
-describe('project chat images expire on the host account\'s global setting',()=>{
-  it('fixes the expiry when an image is stored, from the host\'s setting, only for project chats that keep files local',async()=>{
-    // The sender's own setting is not the project's policy.
-    await storage({image_retention:'30d'},member)
+describe('project chat images expire on their sender\'s global setting',()=>{
+  it('fixes the expiry when an image is stored, from its sender\'s setting, only for project chats',async()=>{
+    // Another account's setting, the project owner's included, does not apply to what this member sends.
+    await storage({image_retention:'30d'},host)
     const week=await send()
     expect(Number((await ref(week.stored)).seconds)).toBeGreaterThan(7*86400-60)
     expect(Number((await ref(week.stored)).seconds)).toBeLessThanOrEqual(7*86400)
@@ -94,8 +94,9 @@ describe('project chat images expire on the host account\'s global setting',()=>
     // A changed setting applies to new images only; existing expiries are not rewritten.
     expect(Number((await ref(week.stored)).seconds)).toBeGreaterThan(7*86400-60)
     expect((await ref((await send(plain)).stored,plain)).expires_at).toBeNull()
-    await user();expect((await reject('SELECT chat.file_managed_upload_as($1,$2,$3,60,$4)',[randomUUID(),project,member,'application/pdf'])).hint).toBe('file_transfer_denied')
-    await service();await storage({proactive_upload:true})
+    // Any other file is uploaded as in an ordinary chat.
+    expect((await ref((await send(project,undefined,'application/pdf')).stored)).expires_at).toBeNull()
+    await storage({proactive_upload:true})
     expect((await ref((await send()).stored)).expires_at).toBeNull()
     expect(await expire()).toBe(0)
   })
@@ -143,7 +144,7 @@ describe('project chat images expire on the host account\'s global setting',()=>
     }
     await service()
     await storage({proactive_upload:false,temporary_transfer:false,retention:'read-once',image_retention:'30d'})
-    expect((await db.query('SELECT chat.file_storage_policy($1) AS p',[project])).rows[0].p)
+    expect((await db.query('SELECT chat.file_storage_of($1) AS p',[member])).rows[0].p)
       .toEqual({proactive_upload:false,temporary_transfer:false,retention:'read-once',image_retention:'30d',temporary_retention:'7d'})
   })
 })

@@ -263,7 +263,7 @@ function fakes(opts: {
     serviceRpc: async (fn, args) => {
       order.push('service:' + fn)
       if (fn==='file_managed_upload_for') {controls.push({as:'service',fn,args});return {data:{max_bytes:MAX_ATTACHMENT_BYTES},error:null}}
-      if (fn==='file_managed_upload_registered'||fn==='file_transfer_expire'||fn==='file_temporary_expire'||fn==='file_version_handoff_expire') {controls.push({as:'service',fn,args});return {data:null,error:null}}
+      if (fn==='file_managed_upload_registered'||fn==='file_transfer_expire'||fn==='file_temporary_expire') {controls.push({as:'service',fn,args});return {data:null,error:null}}
       if (fn==='file_transfer_settings') {controls.push({as:'service',fn,args});return {data:{},error:null}}
       rpcs.push({ as: 'service', fn, args })
       if (fn === 'file_blob_register') {
@@ -617,9 +617,6 @@ describe('直传表单、签名链接、回收', () => {
     expect(await handleGc(deps)).toEqual({ claimed: 2, deleted: 2, failed: 0 })
     expect(controls.filter(r => r.fn === 'file_temporary_expire')).toEqual([{as:'service',fn:'file_temporary_expire',args:{p_limit:500}}])
     expect(order.indexOf('service:file_temporary_expire')).toBeLessThan(order.indexOf('service:file_transfer_expire'))
-    // Handed-off next version copies past their window are retired before the claim, so their bytes go in this pass.
-    expect(controls.filter(r => r.fn === 'file_version_handoff_expire')).toEqual([{as:'service',fn:'file_version_handoff_expire',args:{p_limit:500}}])
-    expect(order.indexOf('service:file_version_handoff_expire')).toBeLessThan(order.indexOf('service:file_blob_gc_claim'))
     expect(controls.filter(r => r.fn === 'file_transfer_expire')).toEqual([{as:'service',fn:'file_transfer_expire',args:{p_limit:500}}])
     expect(order.indexOf('service:file_transfer_expire')).toBeLessThan(order.indexOf('service:file_blob_gc_claim'))
     expect(order).not.toContain('service:file_transfer_object_gone')

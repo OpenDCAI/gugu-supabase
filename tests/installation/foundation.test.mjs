@@ -5,7 +5,7 @@ import pg from 'pg'
 import { foundationDigest, installFoundation, installReleases, releases } from '../../scripts/foundation.mjs'
 import { topicResourcesFixture } from './topic-resources-fixture.mjs'
 import { installTopicResourcesConcurrently } from './topic-resource-concurrency.mjs'
-import { assertAllocatedProjectPublisher } from './project-publisher-contract.mjs'
+import { assertAllocatedProjectPublisher, assertNoChatFileHost } from './project-publisher-contract.mjs'
 
 // Deliberately requires an empty, disposable Supabase PostgreSQL 17 instance.
 // Never resets schemas, migration history, or user data to make a test pass.
@@ -202,6 +202,9 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     await t.test('installed publishers retain directory-allocated names and private grants', async () => {
       await assertAllocatedProjectPublisher(query)
     })
+    await t.test('no installed function knows a chat file host', async () => {
+      await assertNoChatFileHost(query)
+    })
     assert.equal((await query('SHOW row_security'))[0].row_security, 'on', 'dump settings stay local to the installation transaction')
     const before = await query('SELECT version,digest,installed_at FROM gugu_install.releases')
     assert.deepEqual(await installFoundation(query), { installed: false, digest: foundationDigest })
@@ -259,7 +262,7 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
       await db.query('ROLLBACK')
     }
     await t.test('project metadata tables are closed and only intended read/publish APIs are granted', async () => {
-      for (const table of ['file_project_policies','file_device_revisions']) {
+      for (const table of ['file_device_revisions','file_temporary_transfers']) {
         assert.equal((await query(`SELECT relrowsecurity AS enabled FROM pg_class WHERE oid='chat.${table}'::regclass`))[0].enabled, true)
         for (const role of ['anon','authenticated']) {
           for (const privilege of ['SELECT','INSERT','UPDATE','DELETE']) {
@@ -268,7 +271,7 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
         }
       }
       for (const signature of ['file_project_policy_as(text,text,text,boolean,boolean,text)','file_project_policy_for(text,text)',
-        'file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb)','file_resolve_as(jsonb,text)']) {
+        'file_device_publish(uuid,text,text,text,text,bigint,text,text,integer,uuid,jsonb,text)','file_resolve_as(jsonb,text)']) {
         assert.equal((await db.query("SELECT has_function_privilege('authenticated',$1,'EXECUTE') AS allowed", ['chat.'+signature])).rows[0].allowed, true)
         assert.equal((await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS allowed", ['chat.'+signature])).rows[0].allowed, false)
       }

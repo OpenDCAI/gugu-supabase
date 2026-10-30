@@ -33,32 +33,37 @@ async function as<T = Row>(viewer: string, sql: string, values: unknown[] = []) 
     await db.query('RELEASE SAVEPOINT viewer_role')
   }
 }
-type Fixture = { owner: string; a: string; b: string; group: string; topic: string }
+/** a、b 是 owner 自己的 agent;friend 是另一个人,x 是 friend 的 agent。 */
+type Fixture = { owner: string; a: string; b: string; friend: string; x: string; group: string; topic: string }
 async function fixture(body: (f: Fixture) => Promise<void>) {
-  const [owner, a, b, group, topic, anchor] = Array.from({ length: 6 }, () => randomUUID())
+  const [owner, a, b, friend, x, group, topic, anchor] = Array.from({ length: 8 }, () => randomUUID())
   await db.query('BEGIN')
   try {
-    await db.query("INSERT INTO identity.users(id,type,display_name) VALUES ($1,'human','owner')", [owner])
-    await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES ($1,$2,'it','it','linux')", [`dev-${owner}`, owner])
-    for (const agent of [a, b]) {
-      await db.query("INSERT INTO identity.users(id,type,display_name,owner_user_id,device_id) VALUES ($1,'agent','agent',$2,$3)", [agent, owner, `dev-${owner}`])
+    for (const human of [owner, friend]) {
+      await db.query("INSERT INTO identity.users(id,type,display_name) VALUES ($1,'human','human')", [human])
+      await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES ($1,$2,'it','it','linux')", [`dev-${human}`, human])
+    }
+    for (const [agent, keeper] of [[a, owner], [b, owner], [x, friend]]) {
+      await db.query("INSERT INTO identity.users(id,type,display_name,owner_user_id,device_id) VALUES ($1,'agent','agent',$2,$3)", [agent, keeper, `dev-${keeper}`])
     }
     await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES ($1,'group','project',$2)", [group, owner])
-    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner'),($1,$3,'member'),($1,$4,'member')", [group, owner, a, b])
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner'),($1,$3,'member'),($1,$4,'member'),($1,$5,'member'),($1,$6,'member')", [group, owner, a, b, friend, x])
     await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content) VALUES ($1,$2,$3,'anchor')", [anchor, group, a])
     await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id,source_chat_id,source_message_id) VALUES ($1,'topic','agents at work',$2,$3,$4)", [topic, a, group, anchor])
-    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner'),($1,$3,'member'),($1,$4,'member')", [topic, owner, a, b])
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES ($1,$2,'owner'),($1,$3,'member'),($1,$4,'member'),($1,$5,'member'),($1,$6,'member')", [topic, owner, a, b, friend, x])
     await db.query('UPDATE chat.chat_members SET inbox_published_at = now(), last_read_seq = 0 WHERE chat_id IN ($1,$2)', [group, topic])
     // 锚点那条在群主线上,不是这里要数的;从它之后数。
     await db.query('UPDATE chat.chat_members SET last_read_seq = (SELECT max(seq) FROM chat.messages WHERE chat_id = $1) WHERE chat_id = $1', [group])
-    await body({ owner, a, b, group, topic })
+    await body({ owner, a, b, friend, x, group, topic })
   } finally { await db.query('ROLLBACK') }
 }
-async function say(chat: string, sender: string, options: { to?: string[]; reply?: string; whisper?: boolean; root?: string; isRoot?: boolean } = {}): Promise<string> {
+async function say(chat: string, sender: string, options: { to?: string[]; reply?: string; whisper?: boolean; root?: string; isRoot?: boolean; failureCard?: boolean } = {}): Promise<string> {
   const id = randomUUID()
-  await db.query(`INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type,to_user_ids,reply_to_message_id,is_whisper,thread_root_id,is_thread_root)
-    VALUES ($1,$2,$3,'hello','text',$4,$5,$6,$7,$8)`,
-    [id, chat, sender, options.to ?? null, options.reply ?? null, options.whisper ?? false, options.root ?? null, options.isRoot ?? false])
+  // 回合失败卡:宿主以那个 agent 的身份落的 system 行,挂在引起它的那条下面(client_message_id = turn-failure:<id>:<原因>)。
+  await db.query(`INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type,to_user_ids,reply_to_message_id,is_whisper,thread_root_id,is_thread_root,client_message_id)
+    VALUES ($1,$2,$3,'hello',$9,$4,$5,$6,$7,$8,$10)`,
+    [id, chat, sender, options.to ?? null, options.reply ?? null, options.whisper ?? false, options.root ?? null, options.isRoot ?? false,
+      options.failureCard ? 'system' : 'text', options.failureCard ? `turn-failure:${id}:failed` : null])
   return id
 }
 async function counts(viewer: string, chat: string, kind: 'main' | 'thread' = 'main') {
@@ -76,15 +81,40 @@ describe('list_unread_locators.addressed_count', () => {
     expect(await counts(owner, topic)).toEqual({ unread: 3, addressed: 1 })
   }))
 
-  it('@all, a whisper to you and a reply to what you said are addressed; a reply to someone else is not', () => fixture(async ({ owner, a, b, topic }) => {
+  it('@all, a whisper to you and a reply to what you said are addressed; a reply to someone else is not', () => fixture(async ({ owner, a, b, friend, topic }) => {
     const mine = await say(topic, owner)
     const theirs = await say(topic, b)
     await say(topic, a, { reply: theirs })
     expect(await counts(owner, topic)).toEqual({ unread: 2, addressed: 0 })
-    await say(topic, a, { reply: mine })
+    await say(topic, friend, { reply: mine })
     await say(topic, b, { to: ['*'] })
     await say(topic, a, { to: [owner], whisper: true })
     expect(await counts(owner, topic)).toEqual({ unread: 5, addressed: 3 })
+  }))
+
+  // owner 10-30:自己的 agent 每轮收尾回话、回合失败卡都挂在你那条下面 —— 那是它做完了,不是在叫你;它要你回话会点名你。
+  it('your own agent replying to you is not addressed to you; its explicit @ is, and anyone else replying to you is', () => fixture(async ({ owner, a, friend, x, group }) => {
+    const mine = await say(group, owner)
+    await say(group, a, { reply: mine })
+    await say(group, a, { reply: mine, failureCard: true })
+    expect(await counts(owner, group)).toEqual({ unread: 2, addressed: 0 })
+    await say(group, a, { to: [owner] })
+    await say(group, a, { to: ['*'] })
+    expect(await counts(owner, group)).toEqual({ unread: 4, addressed: 2 })
+    await say(group, friend, { reply: mine })
+    await say(group, x, { reply: mine })
+    await say(group, x, { to: [owner] })
+    expect(await counts(owner, group)).toEqual({ unread: 7, addressed: 5 })
+  }))
+
+  it('an agent replying to its own owner still counts for the other people it replies to', () => fixture(async ({ owner, friend, x, group }) => {
+    const friends = await say(group, friend)
+    await say(group, x, { reply: friends })
+    await say(group, x, { reply: friends, failureCard: true })
+    expect(await counts(friend, group), 'their own agent: not addressed').toEqual({ unread: 2, addressed: 0 })
+    const owners = await say(group, owner)
+    await say(group, x, { reply: owners })
+    expect(await counts(owner, group), 'someone else\'s agent replying to the owner: addressed').toMatchObject({ addressed: 1 })
   }))
 
   it('thread replies are counted the same way on their own stream', () => fixture(async ({ owner, a, b, group }) => {

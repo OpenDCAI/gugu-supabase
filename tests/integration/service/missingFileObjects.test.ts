@@ -39,6 +39,16 @@ describe('operator-confirmed missing objects', () => {
   it('preserves the exact-reference ACL instead of revealing absence to a nonmember', async () => {
     expect(await read(outsider)).toEqual({ metadata: { status: 'gone' }, download: { status: 'gone' } })
   })
+  it('preserves idle expiry after GC instead of classifying an expired reference as missing', async () => {
+    await db.query(`INSERT INTO chat.file_transfer_storage_refs(storage_id,chat_id,account_id,expired_at)
+      SELECT id,$2,$3,now() FROM chat.file_transfer_storage WHERE object_name=$1
+      ON CONFLICT(storage_id,chat_id) DO UPDATE SET expired_at=excluded.expired_at`, [object, group, owner])
+    const result = await read(owner)
+    expect(result.metadata.status).toBe('expired'); expect(result.download.status).toBe('expired')
+    expect(result.metadata.code).toBeUndefined(); expect(result.download.url).toBeUndefined()
+    await db.query('RESET ROLE')
+    expect((await db.query('SELECT count(*)::int AS n FROM chat.file_transfer_reservations WHERE account_id=$1', [owner])).rows[0].n).toBe(0)
+  })
   it('does not infer physical absence from an unmarked object or an in-progress deletion', async () => {
     for (const state of ['ready', 'deleting']) {
       await db.query('RESET ROLE')

@@ -35,6 +35,13 @@ describe('streamed file inspection',()=>{
   })
 })
 describe('download input and signed throttles',()=>{
+  it('preserves an explicit missing object in individual and batched metadata without signing',async()=>{
+    const missing={status:'missing',code:'object_not_found',sha256:null}
+    const deps={userRpc:vi.fn(async()=>({data:missing,error:null}))} as unknown as AttachmentsDeps
+    const ref={message_id:'missing'}
+    expect(await handleFileResolve(deps,'reader',{ref})).toEqual(missing)
+    expect(await handleFileResolve(deps,'reader',{refs:[ref]})).toEqual({files:[{...missing,ref}]})
+  })
   it('metadata display calls only the read-only RPC and never invokes a provider or signing RPC',async()=>{
     const calls:string[]=[]
     const deps=new Proxy({userRpc:async(fn:string)=>{calls.push(fn);return {data:{status:'expired'},error:null}}},
@@ -123,5 +130,11 @@ describe('one download contract with optional provider throttling',()=>{
     const expired=fixture();expired.userRpc.mockResolvedValueOnce({data:{status:'expired'},error:null})
     expect(await handleFileDownload(expired.deps,'reader',{ref:{message_id:'m'},request_id:request})).toEqual({status:'expired'})
     expect(expired.sign).not.toHaveBeenCalled();expect(expired.deps.serviceRpc).not.toHaveBeenCalled()
+  })
+  it('returns missing before reading settings, signing or issuing a download capability',async()=>{
+    const f=fixture()
+    f.userRpc.mockResolvedValueOnce({data:{status:'missing',code:'object_not_found',sha256:null},error:null})
+    expect(await handleFileDownload(f.deps,'reader',{ref:{message_id:'m'},request_id:request})).toEqual({status:'missing',code:'object_not_found',sha256:null})
+    expect(f.sign).not.toHaveBeenCalled();expect(f.storageSignedUrl).not.toHaveBeenCalled();expect(f.deps.serviceRpc).not.toHaveBeenCalled()
   })
 })

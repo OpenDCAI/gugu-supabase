@@ -212,7 +212,7 @@ $$;
 -- A temporary copy is asked of the version's holder and kept as long as the holder's account says.
 CREATE OR REPLACE FUNCTION chat.file_temporary_request(p_ref jsonb,p_as text,p_id uuid) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path='' AS $$
-DECLARE actor text:=chat.workspace_actor_for(p_as); r jsonb; t chat.file_temporary_transfers%ROWTYPE; retention text; cfg jsonb;
+DECLARE actor text:=chat.workspace_actor_for(p_as); r jsonb; t chat.file_temporary_transfers%ROWTYPE; kept text; cfg jsonb;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtextextended('gugu:file-transfer:quota',0));
     r:=chat.file_resolve_as(p_ref,actor);
@@ -227,8 +227,8 @@ BEGIN
             RAISE EXCEPTION 'Transfer identity is immutable' USING HINT='file_transfer_conflict';
         END IF;
     ELSE
-        retention:=chat.file_storage_of(r->>'host_account_id')->>'retention'; cfg:=chat.file_transfer_settings();
-        IF retention<>'read-once' THEN
+        kept:=chat.file_storage_of(r->>'host_account_id')->>'retention'; cfg:=chat.file_transfer_settings();
+        IF kept<>'read-once' THEN
             SELECT generation.* INTO t FROM chat.file_temporary_transfers generation WHERE item_id=(r->>'item_id')::uuid AND version=(r->>'version')::integer
                 AND retention<>'read-once' AND (state='ready' AND serve_until>now() AND created_at>now()-interval '30 days'
                     OR state='requested' AND created_at>now()-make_interval(secs=>chat.file_transfer_parameter(cfg,'upload_permit_seconds')::integer)
@@ -243,7 +243,7 @@ BEGIN
                 RAISE EXCEPTION 'Too many temporary transfer requests' USING HINT='file_transfer_rate_limited';
             END IF;
             INSERT INTO chat.file_temporary_transfers(id,item_id,version,chat_id,host_device_id,reader_account,reader_actor,source_ref,retention,object_name)
-            VALUES(p_id,(r->>'item_id')::uuid,(r->>'version')::integer,r->>'chat_id',r->>'host_device_id',auth.uid()::text,actor,p_ref,retention,
+            VALUES(p_id,(r->>'item_id')::uuid,(r->>'version')::integer,r->>'chat_id',r->>'host_device_id',auth.uid()::text,actor,p_ref,kept,
                 'temporary/'||(r->>'chat_id')||'/'||(r->>'item_id')||'/'||(r->>'version')||'/'||(r->>'sha256')||'/'||p_id::text) RETURNING * INTO t;
             PERFORM realtime.send(jsonb_build_object('request_id',t.id),'files.transfer','gugu:'||t.host_device_id||':rpc',true);
         END IF;

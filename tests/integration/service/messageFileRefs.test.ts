@@ -509,6 +509,65 @@ describe('字节在哪(chat.file_urls_as)', () => {
   })
 })
 
+describe('attachment message metadata', () => {
+  const read = async (id: string, actor = member) => {
+    await asUser(actor)
+    return (await database.query<{ file_metadata: Record<string, unknown> | null }>(
+      'SELECT file_metadata FROM chat.messages_view WHERE id=$1', [id])).rows
+  }
+
+  it('carries verified dimensions and SHA in commit, history and revision arrivals without changing the envelope', async () => {
+    const group = await newGroup(owner, [member])
+    const content = `image-${randomUUID()}`
+    const sent = await commit(owner, (await upload(owner, content)).key, randomUUID(), group, owner, 'shot.png')
+    const expected = { status: 'ready', source: 'managed-object', sha256: sha(content), width: 640, height: 480 }
+    expect(sent).toMatchObject({ file_metadata: expected, content: envelope('shot.png', 'image/png', 1234) })
+    for (const actor of [owner, member]) {
+      const [row] = await read(sent.id, actor)
+      expect(row!.file_metadata).toMatchObject(expected)
+      const resolved = (await database.query<{ r: Record<string, unknown> }>(
+        "SELECT chat.file_resolve_as(jsonb_build_object('message_id',$1::text),$2) AS r", [sent.id, actor])).rows[0]!.r
+      const { bucket_id: _bucket, object_name: _object, ...display } = resolved
+      expect(row!.file_metadata).toEqual(display)
+      const page = (await database.query<{ r: { operations: { event: string; payload: { message?: { id: string; file_metadata: unknown } } }[] } }>(
+        'SELECT chat.sync_since(0,500) AS r')).rows[0]!.r
+      expect(page.operations.find(op => op.event === 'message_created' && op.payload.message?.id === sent.id)?.payload.message?.file_metadata).toEqual(display)
+    }
+    expect(await read(sent.id, outsider)).toEqual([])
+    await asOwner()
+    expect((await database.query<{ allowed: boolean }>(
+      "SELECT has_table_privilege('authenticated','chat.file_blobs','SELECT') AS allowed")).rows[0]!.allowed).toBe(false)
+  })
+
+  it('keeps the sent version after replacement and gives ordinary text no metadata', async () => {
+    const group = await newGroup(owner, [member])
+    const content = `pinned-${randomUUID()}`
+    const sent = await commit(owner, (await upload(owner, content)).key, randomUUID(), group, owner, 'shot.png')
+    const next = await object(group, owner, 'new.png')
+    await asUser(owner)
+    await database.query('SELECT * FROM chat.workspace_replace_file_as($1,$2,$3,$4,NULL,NULL)', [sent.file_item_id, owner, next, 9])
+    expect((await read(sent.id))[0]!.file_metadata).toMatchObject({ version: 1, sha256: sha(content), width: 640, height: 480 })
+    await asOwner()
+    const text = randomUUID()
+    await database.query('INSERT INTO chat.messages(id,chat_id,sender_user_id,content) VALUES($1,$2,$3,$4)', [text, group, owner, 'ordinary text'])
+    expect((await read(text))[0]!.file_metadata).toBeNull()
+  })
+
+  it('preserves whisper visibility and stops advertising a ready file after retraction or deletion', async () => {
+    const group = await newGroup(owner, [member, outsider])
+    const sent = await commit(owner, (await upload(owner, `whisper-${randomUUID()}`)).key, randomUUID(), group, owner, 'shot.png', { whisper: true, to: [member] })
+    expect((await read(sent.id))[0]!.file_metadata).toMatchObject({ status: 'ready', width: 640, height: 480 })
+    expect(await read(sent.id, outsider)).toEqual([])
+    await asOwner()
+    await database.query('UPDATE chat.messages SET retracted_at=now() WHERE id=$1', [sent.id])
+    expect((await read(sent.id))[0]!.file_metadata).toEqual({ status: 'gone' })
+    const ordinary = await commit(owner, (await upload(owner, `deleted-${randomUUID()}`)).key, randomUUID(), group, owner, 'deleted.png')
+    await asUser(owner)
+    await database.query('SELECT chat.workspace_delete_as($1,$2)', [ordinary.file_item_id, owner])
+    expect((await read(ordinary.id))[0]!.file_metadata).toEqual({ status: 'gone' })
+  })
+})
+
 describe('已经发出去的客户端与执行权', () => {
   it('messages_view 原有文件列位置不变;按参数名、不带新参数调 send_message_idempotent 照旧,重放回同一条;它只有一个签名', async () => {
     await asOwner()

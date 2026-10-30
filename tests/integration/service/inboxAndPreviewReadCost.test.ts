@@ -1,8 +1,9 @@
 // Read cost of the agent inbox pull, messages_view and the messages row policy — against a real database,
 // with structural assertions (function call counts in this transaction, grants, definitions), never wall-clock.
 //
-//   · The new definitions return exactly what the previous ones returned. The previous definitions are read
-//     from their release files and evaluated side by side, row for row, for every viewer.
+//   · Existing columns return exactly what the previous definitions returned. The attachment metadata release
+//     appends file_metadata; the text/system fixtures here must have NULL in that display-only column.
+//     Previous definitions are read from their releases and compared row for row, for every viewer.
 //   · pull_agent_inbox_v2 checks the reply preview only for the rows it returns, however long the backlog.
 //   · messages_view evaluates the reply preview only for returned rows whose reply columns are read; a query
 //     that does not read them never calls it, even when it sorts the whole chat.
@@ -187,14 +188,16 @@ describe('inbox pull, messages_view and message row policy: same results, cost b
     expect(alice).not.toContain(DELETED)
   }))
 
-  it('messages_view returns the same rows and columns as the previous view, for every viewer', async () => rollback(async () => {
+  it('messages_view preserves every previous column and appends only display metadata, for every viewer', async () => rollback(async () => {
     const { topic } = await seed()
     for (const viewer of VIEWERS) {
       const now = await as<{ row: unknown }>(viewer,
         'SELECT to_jsonb(v) AS row FROM chat.messages_view v WHERE v.chat_id = ANY($1) ORDER BY v.chat_id, v.seq', [[GROUP, topic]])
-      const before = await as<{ row: unknown }>(viewer,
+      const before = await as<{ row: Record<string, unknown> }>(viewer,
         `WITH v AS (${OLD_VIEW}) SELECT to_jsonb(v) AS row FROM v WHERE v.chat_id = ANY($1) ORDER BY v.chat_id, v.seq`, [[GROUP, topic]])
-      expect(now, `messages_view for ${viewer}`).toEqual(before)
+      // These fixtures are text/system rows. Keep all prior keys and values (including reply previews)
+      // exact; accepting an arbitrary subset would hide a breaking change to an old client's select.
+      expect(now, `messages_view for ${viewer}`).toEqual(before.map(({ row }) => ({ row: { ...row, file_metadata: null } })))
     }
     const replies = await as<{ reply_to_content: string | null }>(ALICE,
       'SELECT reply_to_content FROM chat.messages_view WHERE chat_id = $1 AND reply_to_message_id IS NOT NULL', [GROUP])
@@ -294,7 +297,8 @@ describe('inbox pull, messages_view and message row policy: same results, cost b
       columns: ['id', 'chat_id', 'sender_user_id', 'to_user_ids', 'sender_name', 'sender_avatar', 'seq', 'content', 'content_type',
         'reply_to_message_id', 'reply_to_sender_user_id', 'reply_to_sender_name', 'reply_to_content', 'deleted_at', 'deleted_for_user_ids',
         'retracted_at', 'created_at', 'forwarded_from_message_id', 'thread_root_id', 'edited_at', 'is_whisper', 'is_thread_root',
-        'client_message_id', 'is_imported_history_root', 'via_app', 'file_item_id', 'file_version', 'sent_by_agent', 'agent_sender', 'file_blob_id'],
+        'client_message_id', 'is_imported_history_root', 'via_app', 'file_item_id', 'file_version', 'sent_by_agent', 'agent_sender', 'file_blob_id',
+        'file_metadata'],
     })
   }))
 })

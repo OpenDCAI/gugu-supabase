@@ -1,6 +1,9 @@
 import { type AttachmentsDeps, call, objectStorage, Refusal } from './attachments-core.ts'
 import { inspectFileStream } from './file-inspection.ts'
-import { WORKSPACE_TEXT_MAX_BYTES, workspaceUploadKind as classifyWorkspaceUpload } from 'https://raw.githubusercontent.com/OpenDCAI/gugu/fa542adee2b424a515b12a3e2b10bbf93c43d452/packages/core/src/shared/workspaceUpload.mjs'
+// Byte-identical copies of OpenDCAI/gugu@fa542adee2b4 packages/core/src/shared/{workspaceUpload,imageMime}.mjs (same sha256 the
+// lock recorded for the remote URL). Vendored because the edge runtime fetched them from raw.githubusercontent.com at boot,
+// which is unreliable from mainland hosts; refresh both files together when the client's classifier changes.
+import { WORKSPACE_TEXT_MAX_BYTES, workspaceUploadKind as classifyWorkspaceUpload } from './client-shared/workspaceUpload.mjs'
 
 export { WORKSPACE_TEXT_MAX_BYTES }
 export function workspaceUploadKind(...args: Parameters<typeof classifyWorkspaceUpload>) {

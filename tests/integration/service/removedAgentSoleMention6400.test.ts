@@ -41,7 +41,7 @@ const BYSTANDER = '64000000-0000-4000-8000-000000000002'
 const REMOVED = 'agent-removed-it-6400'
 const ACTIVE = 'agent-active-it-6400'
 const DEVICE = 'dev-it-6400'
-const GROUP = 'group-it-6400'
+const GROUP = '64000000-0000-4000-8000-000000000003'
 
 let database: DatabaseClient
 

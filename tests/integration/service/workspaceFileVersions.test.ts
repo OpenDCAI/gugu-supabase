@@ -1,3 +1,4 @@
+import { createFixtureGroup } from '../../support/groupFixture'
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -65,7 +66,7 @@ async function agentOf(ownerId: string, name: string): Promise<string> {
 async function newGroup(creator: string, initial: string[]): Promise<string> {
   const id = randomUUID()
   await asUser(creator)
-  await database.query('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
+  await createFixtureGroup(database, [
     id, 'File versions', creator, JSON.stringify(initial.map((user_id) => ({ user_id, role: 'member' }))),
   ])
   await asService()
@@ -100,7 +101,7 @@ async function document(chatId: string, by: string): Promise<string> {
   await asService()
   return rows[0]!.id
 }
-type Replaced = { id: string; version: number; pointer: string; size_bytes: string; content_type: string; pruned_pointers: string[] }
+type Replaced = { id: string; version: number; pointer: string; size_bytes: string; content_type: string; pruned_pointers: string[]; updated_by: string | null }
 async function replace(itemId: string, caller: string, actor: string, pointer: string, size: number, expected: number | null = null): Promise<Replaced> {
   await asUser(caller)
   const { rows } = await database.query<Replaced>('SELECT * FROM chat.workspace_replace_file_as($1,$2,$3,$4,NULL,$5)', [itemId, actor, pointer, size, expected])
@@ -150,7 +151,7 @@ describe('workspace_replace_file_as', () => {
     const file = await binary(group, owner)
     const next = await object(group, member)
     const done = await replace(file.id, member, member, next, 250)
-    expect(done).toMatchObject({ id: file.id, version: 2, pointer: next, pruned_pointers: [] })
+    expect(done).toMatchObject({ id: file.id, version: 2, pointer: next, pruned_pointers: [], updated_by: member })
     expect(String(done.size_bytes)).toBe('250')
     expect(await item(file.id)).toMatchObject({ pointer: next, version: 2 })
     expect(await history(file.id)).toMatchObject([
@@ -163,7 +164,7 @@ describe('workspace_replace_file_as', () => {
     const group = await newGroup(owner, [agent, member])
     const file = await binary(group, member)
     const next = await object(group, owner)
-    expect(await replace(file.id, owner, agent, next, 9)).toMatchObject({ version: 2 })
+    expect(await replace(file.id, owner, agent, next, 9)).toMatchObject({ version: 2, updated_by: agent })
     expect((await history(file.id)).at(-1)).toMatchObject({ n: 2, made_by: agent })
 
     const other = await object(group, member)
@@ -185,7 +186,7 @@ describe('workspace_replace_file_as', () => {
     const foreign = await object(elsewhere, outsider)
     await asUser(owner)
     expect(await fails('SELECT * FROM chat.workspace_replace_file_as($1,$2,$3,1)', [file.id, owner, foreign]))
-      .toMatch(/pointer must live under/)
+      .toMatch(/not a chat you are a member of/)
     await asUser(owner)
     expect(await fails('SELECT * FROM chat.workspace_replace_file_as($1,$2,$3,1,NULL,7)', [file.id, owner, next]))
       .toMatch(/version conflict: expected 7, got 1/)
@@ -351,23 +352,36 @@ describe('桶:没人指向的对象', () => {
     expect(await inUse(next)).toBe(false)
   })
 
-  it('删除策略:成员能删别人传的、没人指向的对象;仍被指向的别人删不掉;上传者照旧能删自己的', async () => {
+  it('preserves reference/membership predicates while physical Storage reads and deletes require the managed service', async () => {
+    await database.query("SELECT set_config('storage.allow_delete_query','true',true)")
     const group = await newGroup(owner, [member])
     const file = await binary(group, owner)
     const stray = await object(group, owner, 'stray.png')
     const policy = async (who: string, name: string) => {
       await asUser(who)
+      // Evaluate the historical predicate with this actor's claims independently of the new restrictive gate.
+      // Actual authenticated Storage access is asserted separately below; this is not an allowed DELETE.
+      await asService()
       const { rows } = await database.query<{ allowed: boolean }>(
         `SELECT (bucket_id = 'workspace'
                  AND chat.is_member((storage.foldername(name))[1])
                  AND ((storage.foldername(name))[2] = auth.uid()::TEXT OR NOT chat.workspace_pointer_in_use(name))) AS allowed
-           FROM storage.objects WHERE name = $1`, [name])
+           FROM storage.objects WHERE name = $1 AND chat.is_member((storage.foldername(name))[1])`, [name])
       return rows[0]?.allowed ?? null
     }
     expect(await policy(member, stray)).toBe(true)
     expect(await policy(member, file.pointer)).toBe(false)
     expect(await policy(owner, file.pointer)).toBe(true)
     expect(await policy(outsider, stray)).toBe(null)
+    for (const who of [owner,member,outsider]) {
+      await asUser(who)
+      expect((await database.query('SELECT name FROM storage.objects WHERE name=ANY($1)',[[stray,file.pointer]])).rows).toEqual([])
+      expect((await database.query('DELETE FROM storage.objects WHERE name=ANY($1) RETURNING name',[[stray,file.pointer]])).rows).toEqual([])
+    }
+    await asUser(member)
+    expect((await database.query('SELECT id FROM chat.workspace_get_as($1,$2)',[file.id,member])).rows).toEqual([{id:file.id}])
+    await asUser(outsider)
+    expect(await fails('SELECT id FROM chat.workspace_get_as($1,$2)',[file.id,outsider])).toMatch(/workspace item not found/)
     // 策略本身就是这一句:库里的定义与上面判的式子相同
     await asService()
     const { rows } = await database.query<{ qual: string }>(

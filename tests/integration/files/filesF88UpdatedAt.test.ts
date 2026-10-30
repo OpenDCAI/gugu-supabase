@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { Text } from 'yjs'
 
-import { Fixture, filesConfig, machine, openPage, sleep, startFiles, startIssuer, waitFor, type Issuer, type Running } from './support.ts'
+import { Fixture, SUBPROTOCOL, editFile, filesConfig, machine, openPage, sleep, startFiles, startIssuer, waitFor, type Issuer, type Running } from './support.ts'
 
 /**
  * 摩擦单 F88(S24):A 只是打开 `笔记.md`、一个字没改,列表却对所有人显示「刚刚改过」。规则只有一条:正文真的变了,
@@ -12,7 +12,7 @@ let fx: Fixture
 let issuer: Issuer
 let dbUrl: string
 let chat: string
-const u = { a: '', b: '' }
+const u = { a: '', b: '', agent: '' }
 
 beforeAll(async () => {
   fx = new Fixture()
@@ -21,7 +21,8 @@ beforeAll(async () => {
   dbUrl = await fx.filesLogin()
   u.a = await fx.person('F88 A')
   u.b = await fx.person('F88 B')
-  chat = await fx.group(u.b, [u.a])
+  u.agent = await fx.agentOf(u.b, 'Content editor agent')
+  chat = await fx.group(u.b, [u.a, u.agent])
 })
 afterAll(async () => {
   await issuer?.close()
@@ -48,8 +49,8 @@ async function fileFromAnHourAgo(filename: string, text: string, kind: 'document
 }
 
 async function row(itemId: string) {
-  const { rows } = await fx.admin.query<{ updated_at: Date; inline_text: string | null; ys: number | null; epoch: number }>(
-    'SELECT updated_at, inline_text, length(ystate) AS ys, epoch FROM chat.workspace_items WHERE id = $1',
+  const { rows } = await fx.admin.query<{ updated_at: Date; updated_by: string | null; inline_text: string | null; ys: number | null; epoch: number }>(
+    'SELECT updated_at, updated_by, inline_text, length(ystate) AS ys, epoch FROM chat.workspace_items WHERE id = $1',
     [itemId],
   )
   return rows[0]!
@@ -60,8 +61,8 @@ describe('F88 只有正文变了才算改过', () => {
   afterAll(async () => svc?.close())
 
   /** A 打开这个文件,`write` 之后关掉,等到服务把它卸载(存盘在卸载之前)。 */
-  async function openAndClose(itemId: string, epoch: number, write?: (text: Text) => void) {
-    const m = machine(svc.url, await issuer.mint(u.a))
+  async function openAndClose(itemId: string, epoch: number, write?: (text: Text) => void, actor = u.a) {
+    const m = machine(svc.url, await issuer.mint(actor))
     const page = openPage(m, itemId, epoch)
     await page.synced
     if (write) write(page.doc.getText('content'))
@@ -76,12 +77,14 @@ describe('F88 只有正文变了才算改过', () => {
     const doc = await fileFromAnHourAgo('笔记.md', '三个字')
     const before = await row(doc)
     expect(before.ys).toBeNull()
+    expect(before.updated_by).toBeNull()
     expect(Buffer.byteLength(before.inline_text!)).toBe(9)
 
     await openAndClose(doc, 0)
     const pinned = await row(doc)
     expect(pinned.ys).toBeGreaterThan(0) // 这一行被 UPDATE 过(ystate 钉进库)……
     expect(pinned.inline_text).toBe('三个字')
+    expect(pinned.updated_by).toBeNull()
     expect(pinned.updated_at.getTime()).toBe(before.updated_at.getTime()) // ……但没人改正文
 
     await openAndClose(doc, 0)
@@ -94,7 +97,100 @@ describe('F88 只有正文变了才算改过', () => {
     await openAndClose(doc, 0, (text) => text.insert(text.length, '!'))
     const after = await row(doc)
     expect(after.inline_text).toBe('三个字!')
-    expect(after.updated_at.getTime()).toBeGreaterThan(before.updated_at.getTime() + 30 * 60_000)
+    expect(after.updated_at.getTime()).toBeGreaterThan(before.updated_at.getTime())
+    expect(after.updated_by).toBe(u.a)
+  })
+
+  it('opening after another person edited preserves that editor; a real edit changes it', async () => {
+    const doc = await fileFromAnHourAgo('human-editor.md', '三个字')
+    await openAndClose(doc, 0, (text) => text.insert(text.length, ' A'))
+    const edited = await row(doc)
+    expect(edited.updated_by).toBe(u.a)
+    await openAndClose(doc, 0, undefined, u.b)
+    expect((await row(doc)).updated_by).toBe(u.a)
+    expect((await row(doc)).updated_at).toEqual(edited.updated_at)
+    await openAndClose(doc, 0, (text) => text.insert(text.length, ' B'), u.b)
+    expect(await row(doc)).toMatchObject({ inline_text: '三个字 A B', updated_by: u.b })
+  })
+
+  it.each([false, true])('pending store keeps the actual content writer when the next transaction changes content=%s', async (contentChanged) => {
+    const doc = await fileFromAnHourAgo(`pending-editor-${contentChanged}.md`, '三个字')
+    const a = machine(svc.url, await issuer.mint(u.a))
+    const b = machine(svc.url, await issuer.mint(u.b))
+    const pa = openPage(a, doc, 0), pb = openPage(b, doc, 0)
+    try {
+      await Promise.all([pa.synced, pb.synced])
+      const live = svc.service.hocuspocus.documents.get(`${doc}@0`)!
+      // Hold the actual persistence mutex, then flush A's pending callback into its queue.
+      // B changes the live document before that callback can take its content snapshot.
+      const release = await live.saveMutex.acquire()
+      let pending: Promise<unknown> | undefined
+      try {
+        pa.doc.getText('content').insert(0, 'A ')
+        expect(await waitFor(() => pb.text() === 'A 三个字')).toBeGreaterThanOrEqual(0)
+        const key = `onStoreDocument-${doc}@0`
+        expect(await waitFor(() => svc.service.hocuspocus.debouncer.isDebounced(key) || svc.service.hocuspocus.debouncer.isCurrentlyExecuting(key))).toBeGreaterThanOrEqual(0)
+        pending = svc.service.hocuspocus.debouncer.executeNow(key)
+        expect(await waitFor(() => svc.service.hocuspocus.debouncer.isCurrentlyExecuting(key))).toBeGreaterThanOrEqual(0)
+        if (contentChanged) pb.doc.getText('content').insert(0, 'B ')
+        else pb.doc.getText('content').format(0, 1, { bold: true })
+        // Waiting for the server's transaction (including formatting) makes the order explicit.
+        expect(await waitFor(() => contentChanged ? pa.text() === 'B A 三个字' : pa.doc.getText('content').toDelta().some((d) => d.attributes?.bold))).toBeGreaterThanOrEqual(0)
+        expect((await row(doc)).inline_text).toBe('三个字')
+      } finally { release() }
+      await pending
+      expect(await waitFor(async () => (await row(doc)).inline_text === (contentChanged ? 'B A 三个字' : 'A 三个字'))).toBeGreaterThanOrEqual(0)
+      expect((await row(doc)).updated_by).toBe(contentChanged ? u.b : u.a)
+    } finally {
+      pa.close(); pb.close()
+      a.socket.destroy(); b.socket.destroy()
+    }
+  })
+
+  it('WebSocket and HTTP delegated edits record the agent, and metadata RPCs return the same author', async () => {
+    const doc = await fileFromAnHourAgo('actor-metadata.md', '三个字')
+    const owner = await issuer.mint(u.b)
+    const m = machine(svc.url, owner, { protocols: [SUBPROTOCOL, `bearer.${owner}`, `as.${u.agent}`] })
+    const page = openPage(m, doc, 0)
+    let closed = false
+    try {
+      await page.synced
+      page.doc.getText('content').insert(3, '!')
+      page.close(); closed = true
+      expect(await waitFor(() => !svc.service.hocuspocus.documents.has(`${doc}@0`))).toBeGreaterThanOrEqual(0)
+      expect((await row(doc)).updated_by).toBe(u.agent)
+    } finally { if (!closed) page.close(); m.socket.destroy() }
+    expect((await editFile(svc.url, await issuer.mint(u.a), doc, '三个字!', 'human edit')).status).toBe(200)
+    expect((await row(doc)).updated_by).toBe(u.a)
+    expect((await editFile(svc.url, owner, doc, 'human edit', 'agent edit', u.agent)).status).toBe(200)
+    expect(await row(doc)).toMatchObject({ inline_text: 'agent edit', updated_by: u.agent })
+
+    await fx.admin.query('BEGIN')
+    try {
+      await fx.admin.query('SET LOCAL role TO authenticated')
+      await fx.admin.query("SELECT set_config('request.jwt.claims', $1, true)", [JSON.stringify({ sub: u.b, role: 'authenticated' })])
+      await fx.admin.query('SELECT chat.workspace_note_open($1)', [doc])
+      const reads: [string, unknown[]][] = [
+        ['SELECT created_by,updated_by FROM chat.workspace_get_as($1,$2)', [doc, u.b]],
+        ['SELECT created_by,updated_by FROM chat.workspace_list_as($1,$2,p_name=>$3,p_exact=>true)', [chat, u.b, 'actor-metadata.md']],
+        ['SELECT created_by,updated_by FROM chat.workspace_search($1,NULL,50,$2) WHERE id=$3', ['actor-metadata.md', u.b, doc]],
+        ['SELECT created_by,updated_by FROM chat.workspace_recent(50,$1) WHERE id=$2', [u.b, doc]],
+      ]
+      for (const [sql, values] of reads) expect((await fx.admin.query(sql, values)).rows).toEqual([{ created_by: u.b, updated_by: u.agent }])
+    } finally { await fx.admin.query('ROLLBACK') }
+  })
+
+  it('recreated metadata RPCs stay closed to anonymous callers and the author column stays service-written', async () => {
+    for (const signature of [
+      'chat.workspace_list_as(text,text,integer,integer,text,text,text,boolean)', 'chat.workspace_get_as(text,text)',
+      'chat.workspace_search(text,text[],integer,text)', 'chat.workspace_recent(integer,text)',
+      'chat.workspace_replace_file_as(text,text,text,bigint,text,integer)', 'chat.file_replace_as(text,text,text,integer)',
+    ]) {
+      const { rows } = await fx.admin.query("SELECT has_function_privilege('authenticated',$1,'EXECUTE') AS allowed, has_function_privilege('anon',$1,'EXECUTE') AS anonymous", [signature])
+      expect(rows).toEqual([{ allowed: true, anonymous: false }])
+    }
+    const { rows } = await fx.admin.query("SELECT has_column_privilege('gugu_files','chat.workspace_items','updated_by','UPDATE') AS writer, has_column_privilege('authenticated','chat.workspace_items','updated_by','UPDATE') AS reader")
+    expect(rows).toEqual([{ writer: true, reader: false }])
   })
 
   it('写了又删回去(ystate 变、正文没变),卸载时冷压缩换代:都不算改过', async () => {
@@ -118,6 +214,7 @@ describe('F88 只有正文变了才算改过', () => {
     expect(after.epoch).toBe(before.epoch + 1) // 换了一代
     expect(after.inline_text).toBe('三个字')
     expect(after.updated_at.getTime()).toBe(before.updated_at.getTime())
+    expect(after.updated_by).toBe(before.updated_by)
   })
 
   it('库里的规则本身:改名、来源消息、清 created_by、显式写 updated_at 都不动它;正文、文件的字节(blob)动它', async () => {
@@ -134,8 +231,13 @@ describe('F88 只有正文变了才算改过', () => {
       await fx.admin.query(`UPDATE chat.workspace_items SET created_by = NULL WHERE id = $1`, [doc])
       await fx.admin.query(`UPDATE chat.workspace_items SET filename = '规则 3.md', updated_at = now() WHERE id = $1`, [doc])
       expect(await at(doc)).toBe(hourAgo)
-      await fx.admin.query(`UPDATE chat.workspace_items SET inline_text = '正文改了' WHERE id = $1`, [doc])
-      expect(await at(doc)).toBeGreaterThan(hourAgo + 30 * 60_000)
+      await fx.admin.query(`UPDATE chat.workspace_items SET inline_text = '正文改了', updated_by = $2 WHERE id = $1`, [doc, u.a])
+      expect((await row(doc)).updated_by).toBe(u.a)
+      const editedAt = await at(doc)
+      await fx.admin.query(`UPDATE chat.workspace_items SET filename = 'same-content.md', updated_by = $2 WHERE id = $1`, [doc, u.b])
+      expect((await row(doc)).updated_by).toBe(u.a)
+      expect(await at(doc)).toBe(editedAt)
+      expect(await at(doc)).toBeGreaterThan(hourAgo)
 
       const fileHourAgo = await at(file)
       await fx.admin.query(`UPDATE chat.workspace_items SET filename = '图 2.png' WHERE id = $1`, [file])
@@ -144,8 +246,9 @@ describe('F88 只有正文变了才算改过', () => {
       await fx.admin.query(`UPDATE chat.workspace_items SET version = version + 1 WHERE id = $1`, [file])
       expect(await at(file)).toBe(fileHourAgo)
       // 文件的字节只随新版本变(20261017012120 的守卫,与 workspace_replace_file_as 同):换 blob 同时升版本。
-      await fx.admin.query(`UPDATE chat.workspace_items SET blob_id = chat.file_blob_for_pointer(chat.file_blob_pointer(blob_id) || '.v2', size_bytes, content_type, created_by), version = version + 1 WHERE id = $1`, [file])
-      expect(await at(file)).toBeGreaterThan(fileHourAgo + 30 * 60_000)
+      await fx.admin.query(`UPDATE chat.workspace_items SET blob_id = chat.file_blob_for_pointer(chat.file_blob_pointer(blob_id) || '.v2', size_bytes, content_type, created_by), version = version + 1, updated_by = $2 WHERE id = $1`, [file, u.b])
+      expect((await row(file)).updated_by).toBe(u.b)
+      expect(await at(file)).toBeGreaterThan(fileHourAgo)
     } finally {
       await fx.admin.query('ROLLBACK')
     }

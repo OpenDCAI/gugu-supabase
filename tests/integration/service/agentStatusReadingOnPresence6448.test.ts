@@ -83,7 +83,7 @@ describe('#6448 presence 行带上宿主写下的读数', () => {
   it('同群 human 收到状态 revision 和 wake，agent 只按需读快照而不收这两种写入', async () => fixture(async (f) => {
     const human = randomUUID()
     const agentViewer = randomUUID()
-    const chat = `presence-viewers-${randomUUID()}`
+    const chat = randomUUID()
     const topics = [f.owner, human, agentViewer].map((id) => `gugu:user:${id}:events`)
     const wakeCounts = async (): Promise<Record<string, number>> => {
       const { rows } = await db.query<{ topic: string; count: string }>(

@@ -36,7 +36,7 @@ afterAll(async () => { await db?.end() })
 beforeEach(async () => {
   await db.query('BEGIN')
   human = randomUUID(); agent = randomUUID(); sourceAgent = randomUUID()
-  chat = `human-events-${randomUUID()}`; device = `human-events-${randomUUID()}`
+  chat = randomUUID(); device = `human-events-${randomUUID()}`
   await db.query('INSERT INTO auth.users(id,email) VALUES ($1::uuid,$2)', [human, `${human}@example.test`])
   await db.query("INSERT INTO identity.users(id,type,display_name) VALUES ($1,'human','event owner') ON CONFLICT (id) DO NOTHING", [human])
   await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform,status) VALUES ($1,$2,'event test','isolated','linux','online')", [device, human])

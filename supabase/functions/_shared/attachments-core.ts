@@ -4,14 +4,16 @@
 //
 //   POST upload   → 一张直传 OSS 的 PostObject 表单:key = staging/<调用者>/<uuid>,25 MiB 由 OSS 管。
 //   POST commit   → 读暂存对象(内网)、自己算 sha256 和类型 → 服务端复制到 <aa>/<sha256>(只复制读到的那一份)
-//                   → 登记(service_role)→ 删暂存 → 以调用者的身份 attachment_commit(放进「附件」、发消息,一个事务)。
+//                   → 登记(service_role)→ 删暂存 → 以调用者的身份 attachment_commit(放进「附件」、发消息,一个事务;
+//                   带 item_id + expected_version 就是那个文件的下一版)。
 //   POST forward  → 以调用者的身份 attachment_forward。
 //   POST urls     → 以调用者的身份 file_urls_as(条目的某一版,或悄悄话附件那条消息),再签:OSS 的走 CDN 鉴权 A(图片另给缩略图链接),老对象走存储的签名链接。
 //   POST gc       → 只认 service_role(pg_cron + pg_net 每 10 分钟叫一次):领一批该回收的,删对象、清 CDN、报完成 / 失败。
 
 import { ossObjectStorage } from './attachment-object-storage.ts'
-import { type AttachmentObjectStorage, ObjectStorageError, type ReadObject } from './object-storage.ts'
+import { type AttachmentObjectStorage, ObjectStorageError, type InspectedObject } from './object-storage.ts'
 import { hasThumbnail, objectHeaders, sniff } from './blob-sniff.ts'
+import { fileRef, handleFileDownload } from './file-transfer-core.ts'
 import {
   CDN_SIGN_TTL_SECONDS,
   type CdnConfig,
@@ -19,7 +21,6 @@ import {
   IMMUTABLE,
   MAX_ATTACHMENT_BYTES,
   type OssConfig,
-  sha256Hex,
 } from './oss.ts'
 
 export interface DbError {
@@ -30,6 +31,12 @@ export interface DbError {
 export type Rpc = (fn: string, args: Record<string, unknown>) => Promise<{ data: unknown; error: DbError | null }>
 
 export interface AttachmentsDeps {
+  /** The same classifier used for local files and App data, pinned by the Edge entry point. */
+  textFiles: {
+    maxBytes: number
+    classify(name: string, contentType: string | null, bytes: Uint8Array):
+      { kind: 'document'; text: string; contentType: string } | { kind: 'file'; why: string }
+  }
   objects?: AttachmentObjectStorage
   oss?: OssConfig
   cdn?: CdnConfig
@@ -39,16 +46,18 @@ export interface AttachmentsDeps {
   /** 以 service_role 调(登记上传、领回收任务)。 */
   serviceRpc: Rpc
   /** 老对象(Supabase 存储里的 workspace / chat-media 桶):签名链接(本栈公网域上的,客户端拿得到)、删除。 */
-  storageSignedUrl(bucket: string, object: string, seconds: number): Promise<string>
+  storageSignedUrl(bucket: string, object: string, seconds: number, trafficBits?:number): Promise<string>
   storageRemove(bucket: string, object: string): Promise<void>
   now(): Date
   uuid(): string
   log(stage: string, extra?: Record<string, unknown>): void
   /** 撞上正在回收的 blob 时,重试之间等多久(测试里给 0)。 */
   retryDelayMs?: number
+  /** Drain/finish an inspected incoming replacement, using the original caller's authorization. */
+  documentReplacement?(item: string, actor: string, body: { key: string; expected: number; finish: boolean }): Promise<void>
 }
 
-function objectStorage(deps: AttachmentsDeps): AttachmentObjectStorage {
+export function objectStorage(deps: AttachmentsDeps): AttachmentObjectStorage {
   if (deps.objects) return deps.objects
   if (!deps.oss || !deps.cdn) throw new Error('Attachment object storage is not configured')
   return ossObjectStorage({ oss: deps.oss, cdn: deps.cdn, fetch: deps.fetch })
@@ -71,7 +80,14 @@ const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,127}
  * 500 以外按 400 / 403 分。
  */
 export function refusalFromDb(error: DbError): Refusal {
+  if (error.hint?.startsWith('file_transfer_')) {
+    const code=error.hint.slice('file_transfer_'.length)
+    const status=code==='invalid'?400:code.endsWith('_full')||code==='rate_limited'?429:code==='denied'?403:code==='expired'?410:
+      ['not_configured','inventory_required','paused','unavailable'].includes(code)?503:code==='too_large'?413:409
+    return new Refusal(status,code,error.message)
+  }
   const byHint: Record<string, [number, string]> = {
+    session_attachment_denied: [403, 'denied'],
     attachment_upload_not_found: [404, 'upload_not_found'],
     attachment_upload_used: [409, 'upload_used'],
     attachment_source_not_found: [404, 'source_not_found'],
@@ -96,10 +112,22 @@ export function refusalFromDb(error: DbError): Refusal {
   return new Refusal(500, 'failed', error.message)
 }
 
-async function call(rpc: Rpc, fn: string, args: Record<string, unknown>): Promise<unknown> {
+export async function call(rpc: Rpc, fn: string, args: Record<string, unknown>): Promise<unknown> {
   const { data, error } = await rpc(fn, args)
   if (error) throw refusalFromDb(error)
   return data
+}
+
+async function writeFile(deps: AttachmentsDeps, fn: string, args: Record<string, unknown>) {
+  const item = args.p_item_id as string | undefined
+  const actor = (args.p_sender_user_id ?? args.p_as_user_id) as string
+  const entry = item ? await call(deps.userRpc, 'workspace_get_as', { p_item_id: item, p_as_user_id: actor }) as { kind: string }[] : []
+  if (entry[0]?.kind !== 'document') return await call(deps.userRpc, fn, args)
+  if (!deps.documentReplacement) throw new Refusal(503, 'not_configured', 'Document replacement requires the file service')
+  const body = { key: args.p_staging_key as string, expected: args.p_expected_version as number, finish: false }
+  await deps.documentReplacement!(item!, actor, body)
+  try { return await call(deps.userRpc, fn, args) }
+  finally { await deps.documentReplacement!(item!, actor, { ...body, finish: true }).catch(() => deps.log('replacement_finish_failed', { item })) }
 }
 
 const str = (body: Record<string, unknown>, key: string, required = true): string | null => {
@@ -120,7 +148,7 @@ const bool = (body: Record<string, unknown>, key: string) => {
 const int = (body: Record<string, unknown>, key: string): number | null => {
   const v = body[key]
   if (v === undefined || v === null) return null
-  if (typeof v !== 'number' || !Number.isInteger(v) || v < 1) throw new Refusal(400, 'invalid', `${key} must be a whole number from 1`)
+  if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 1) throw new Refusal(400, 'invalid', `${key} must be a whole number from 1`)
   return v
 }
 const strings = (body: Record<string, unknown>, key: string): string[] => {
@@ -131,10 +159,39 @@ const strings = (body: Record<string, unknown>, key: string): string[] => {
 }
 
 // ── upload ───────────────────────────────────────────────────────────────────────
-export async function handleUpload(deps: AttachmentsDeps, userId: string) {
-  const key = `staging/${userId}/${deps.uuid()}`
-  const form = await objectStorage(deps).upload(key, deps.now())
-  return { staging_key: key, url: form.url, fields: form.fields, ...(form.method ? { method: form.method } : {}), ...(form.headers ? { headers: form.headers } : {}), expires_at: form.expiresAt, max_bytes: MAX_ATTACHMENT_BYTES }
+async function issueUpload(deps: AttachmentsDeps, userId: string, body: Record<string,unknown> = {}) {
+  const id=str(body,'request_id',false)??deps.uuid()
+  if (!UUID.test(id)) throw new Refusal(400,'invalid','request_id must be a uuid')
+  const declared=int(body,'size_bytes')
+  // Clients from before the budget release send an empty body; they cannot upload here, so tell their person to update.
+  if (!declared) throw new Refusal(426,'client_outdated','Update Gugu to send files (this version does not declare the file size)')
+  const chat=str(body,'chat_id',false),actor=str(body,'as',false)??userId
+  const contentType=str(body,'content_type',false)
+  const prepared=await call(deps.userRpc,'file_managed_upload_prepare',{p_chat:chat,p_as:actor,p_bytes:declared,p_content_type:contentType}) as {
+    max_bytes:number;permit_seconds:number
+  }
+  const store=objectStorage(deps)
+  let bounds:{maxBytes:number;expiresSeconds:number}
+  try { bounds=await store.uploadBounds(declared,Number(prepared.permit_seconds)) }
+  catch(error) {
+    if (error instanceof ObjectStorageError&&error.status===503) throw new Refusal(503,'not_configured',error.message)
+    throw error
+  }
+  if (!Number.isSafeInteger(bounds.maxBytes)||bounds.maxBytes<declared||bounds.maxBytes>Number(prepared.max_bytes)
+      ||bounds.expiresSeconds!==Number(prepared.permit_seconds)) {
+    throw new Refusal(503,'not_configured','The upload provider size ceiling and lifetime must match deployment policy')
+  }
+  const permit=await call(deps.userRpc,'file_managed_upload_as',{
+    p_id:id,p_chat:chat,p_as:actor,p_bytes:bounds.maxBytes,p_content_type:contentType,
+  }) as { staging_key:string; signed_at:string; expires_at:string; max_bytes:number }
+  const seconds=(Date.parse(permit.expires_at)-Date.parse(permit.signed_at))/1000
+  const form=await store.upload(permit.staging_key,new Date(permit.signed_at),{maxBytes:Number(permit.max_bytes),expiresSeconds:seconds})
+  return { staging_key:permit.staging_key,url:form.url,fields:form.fields,...(form.method?{method:form.method}:{}),
+    ...(form.headers?{headers:form.headers}:{}),expires_at:form.expiresAt,max_bytes:Number(permit.max_bytes) }
+}
+
+export async function handleUpload(deps: AttachmentsDeps,userId:string,body:Record<string,unknown> = {}) {
+  return await issueUpload(deps,userId,body)
 }
 
 // ── commit ───────────────────────────────────────────────────────────────────────
@@ -148,6 +205,9 @@ function blobType(declared: string | null, bytes: Uint8Array) {
 
 export async function handleCommit(deps: AttachmentsDeps, userId: string, body: Record<string, unknown>) {
   const stagingKey = stagingOf(body, userId)
+  const keep = keepOf(body)
+  await call(deps.userRpc,'file_managed_upload_scope',{p_key:stagingKey,p_as:str(body,body.friend_user_id?'agent_user_id':'sender_user_id'),
+    p_chat:str(body,'chat_id',false),p_item:null})
   // agent 代主人把文件发给主人的好友(message_send_file_as_owner):库里那一半照 send_friend_message_as_owner 的规矩。
   if (str(body, 'friend_user_id', false)) {
     const ownerArgs = {
@@ -158,10 +218,11 @@ export async function handleCommit(deps: AttachmentsDeps, userId: string, body: 
       p_request_id: str(body, 'request_id'),
       p_caption: str(body, 'caption', false),
     }
-    await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false))
+    await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name')!)
     return await call(deps.userRpc, 'send_friend_file_as_owner', ownerArgs)
   }
   const caption = str(body, 'caption', false)
+  const itemId = str(body, 'item_id', false)
   const commitArgs = {
     p_staging_key: stagingKey,
     p_message_id: str(body, 'message_id'),
@@ -177,10 +238,30 @@ export async function handleCommit(deps: AttachmentsDeps, userId: string, body: 
     // 图配文字:库把它接在信封后面(首尾空白去掉,空的就没有)。没有说明就不带这个键:函数先于迁移落地时,
     // 老库的 attachment_commit 没有 p_caption,带上键(哪怕是 null)PostgREST 就找不到函数。
     ...(caption != null ? { p_caption: caption } : {}),
+    // 这份字节是群文件夹里一个文件的下一版(item_id + 它基于的 expected_version);同上,不给就不带这两个键。
+    ...(itemId != null ? { p_item_id: itemId, p_expected_version: int(body, 'expected_version') } : {}),
   }
-  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false))
-  const rows = (await call(deps.userRpc, 'attachment_commit', commitArgs)) as unknown[]
-  return rows[0] ?? null
+  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name')!)
+  const rows = (await writeFile(deps, 'attachment_commit', commitArgs)) as unknown[]
+  const message = rows[0] as { id?: string } | undefined
+  if (message?.id) await keepAs(deps, keep, { message_id: message.id }, commitArgs.p_sender_user_id)
+  return message ?? null
+}
+
+/**
+ * How long the copy that just joined a chat stays (the uploader's 「临时 / 保留」): the same mark the person makes later, applied
+ * as they upload. Not given: unchanged. A failure is the request's: the commit is idempotent, so the retry marks it again.
+ */
+async function keepAs(deps: AttachmentsDeps, keep: Keep, ref: { message_id: string } | { item_id: string }, as: string | null) {
+  if (keep) await call(deps.userRpc, 'file_storage_mark_as', { p_refs: [ref], p_action: keep, p_as: as })
+}
+
+type Keep = 'temporary' | 'permanent' | null
+/** Read before anything is stored: a wrong value refuses the request, never a file sent without its class. */
+function keepOf(body: Record<string, unknown>): Keep {
+  const keep = str(body, 'keep', false)
+  if (keep != null && keep !== 'temporary' && keep !== 'permanent') throw new Refusal(400, 'invalid', 'keep is temporary or permanent')
+  return keep as Keep
 }
 
 // ── place ────────────────────────────────────────────────────────────────────────
@@ -188,9 +269,11 @@ export async function handleCommit(deps: AttachmentsDeps, userId: string, body: 
 // expected_version 对不上就拒);不给 ⇒ 在 folder(不给 = 根)里建一个文件。字节的登记和提交是同一步。
 export async function handlePlace(deps: AttachmentsDeps, userId: string, body: Record<string, unknown>) {
   const stagingKey = stagingOf(body, userId)
+  const keep = keepOf(body)
   const itemId = str(body, 'item_id', false)
   // 以谁的身份写:调用者自己,或它自己的 agent(as_user_id;库照 *_as 的规矩核)。
   const as = str(body, 'as_user_id', false) ?? userId
+  await call(deps.userRpc,'file_managed_upload_scope',{p_key:stagingKey,p_as:as,p_chat:str(body,'chat_id',false),p_item:itemId})
   const args = itemId
     ? { fn: 'file_replace_as', args: { p_staging_key: stagingKey, p_item_id: itemId, p_as_user_id: as, p_expected_version: int(body, 'expected_version') } }
     : {
@@ -204,9 +287,11 @@ export async function handlePlace(deps: AttachmentsDeps, userId: string, body: R
           p_source_message_ids: strings(body, 'source_message_ids'),
         },
       }
-  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false))
-  const rows = (await call(deps.userRpc, args.fn, args.args)) as unknown[]
-  return rows[0] ?? null
+  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name', false) ?? '')
+  const rows = (await writeFile(deps, args.fn, args.args)) as unknown[]
+  const item = rows[0] as { id?: string } | undefined
+  if (item?.id) await keepAs(deps, keep, { item_id: item.id }, as)
+  return item ?? null
 }
 
 function stagingOf(body: Record<string, unknown>, userId: string): string {
@@ -216,19 +301,26 @@ function stagingOf(body: Record<string, unknown>, userId: string): string {
 }
 
 /** 暂存的字节:算哈希、存进 OSS 的最终位置、登记成 blob(提交和放进文件夹共用)。暂存已经没了 ⇒ 交给库认上一次的登记。 */
-async function registerStaged(deps: AttachmentsDeps, userId: string, stagingKey: string, declaredType: string | null) {
-  let read: ReadObject | null = null
+async function registerStaged(deps: AttachmentsDeps, userId: string, stagingKey: string, declaredType: string | null, fileName: string) {
+  const permit=await call(deps.serviceRpc,'file_managed_upload_for',{p_key:stagingKey,p_user:userId}) as { max_bytes:number }
+  const store=objectStorage(deps)
+  let read: InspectedObject | null = null
   try {
-    read = await objectStorage(deps).read(stagingKey, MAX_ATTACHMENT_BYTES)
+    if (!store.inspect) throw new Refusal(503,'not_configured','Object inspection is not configured')
+    read=await store.inspect(stagingKey,Number(permit.max_bytes),deps.textFiles.maxBytes + 1)
   } catch (error) {
-    if (error instanceof ObjectStorageError && error.status === 413) throw new Refusal(413, 'too_large', 'an attachment is at most 25 MiB')
+    if (error instanceof ObjectStorageError && error.status === 413) throw new Refusal(413, 'too_large', 'file exceeds its upload reservation')
     // 暂存对象没了:要么没传上来,要么上一次已经登记过、删了暂存(重试)—— 交给库认那次登记。
     if (!(error instanceof ObjectStorageError && error.status === 404)) throw error
   }
   if (read) {
-    const { bytes, etag } = read
-    if (bytes.length === 0) throw new Refusal(400, 'invalid', 'an attachment has at least one byte')
-    const sha = await sha256Hex(bytes)
+    const { bytes, etag, sizeBytes } = read
+    if (sizeBytes === 0) throw new Refusal(400, 'invalid', 'an attachment has at least one byte')
+    if (bytes.length < Math.min(sizeBytes, deps.textFiles.maxBytes + 1)) {
+      throw new Refusal(503, 'not_configured', 'Object inspection did not retain the complete bounded text')
+    }
+    const document = deps.textFiles.classify(fileName, declaredType, bytes.subarray(0, deps.textFiles.maxBytes + 1))
+    const sha = read.sha256
     const type = blobType(declaredType, bytes)
     const finalKey = `${sha.slice(0, 2)}/${sha}`
     const headers = objectHeaders(type, IMMUTABLE)
@@ -250,7 +342,7 @@ async function registerStaged(deps: AttachmentsDeps, userId: string, stagingKey:
         p_uploader: userId,
         p_staging_key: stagingKey,
         p_sha256: sha,
-        p_size_bytes: bytes.length,
+        p_size_bytes: sizeBytes,
         p_content_type: type.contentType,
         p_width: type.width,
         p_height: type.height,
@@ -265,8 +357,10 @@ async function registerStaged(deps: AttachmentsDeps, userId: string, stagingKey:
     // 新建的一行:复制和登记之间,回收可能把同一个 sha 的旧 blob 整个收完(连对象一起删了)。这时上传登记已经引用着
     // 新的一行,回收领不走它 —— 删暂存之前看一眼,对象不在就再复制一次。
     if (created && !(await objectStorage(deps).exists(finalKey))) await copy()
-    // 暂存对象用完了(桶上另有一天过期的 lifecycle 兜着)。
-    await objectStorage(deps).remove(stagingKey).catch((error) => deps.log('staging_delete_failed', { stagingKey, error: String(error) }))
+    await call(deps.serviceRpc,'file_managed_upload_registered',{p_key:stagingKey,p_user:userId,
+      p_document:document.kind === 'document' ? {text:document.text,content_type:document.contentType} : null})
+    // Keep staging immutable until the permit closes: an early delete would let the same policy recreate it.
+    // Cleanup retains the reservation until terminal upload evidence and physical deletion are confirmed.
   }
 }
 
@@ -301,80 +395,33 @@ export async function handleForward(deps: AttachmentsDeps, userId: string, body:
     if (!legacy) throw error
     const stagingKey = `staging/${userId}/${messageId}`
     if (!STAGING.test(stagingKey)) throw new Refusal(400, 'invalid', 'message_id is a uuid')
-    const res = await deps.fetch(await deps.storageSignedUrl(LEGACY_BUCKET, legacy.object_name, 300))
+    const download=await handleFileDownload(deps,userId,{ref:{message_id:sourceId},as:str(body,'sender_user_id'),request_id:deps.uuid()}) as {
+      status:string;url?:string;size_bytes?:number
+    }
+    if (download.status!=='ready'||!download.url) throw new Refusal(410,'source_gone','The source file is no longer available')
+    if (!Number.isSafeInteger(Number(download.size_bytes))||Number(download.size_bytes)>MAX_ATTACHMENT_BYTES) {
+      throw new Refusal(413,'too_large','Historical attachment exceeds the promotion limit')
+    }
+    const res = await deps.fetch(download.url)
     if (res.status === 400 || res.status === 404) throw new Refusal(410, 'source_gone', `the file of message ${sourceId} is not in ${LEGACY_BUCKET} any more`)
     if (!res.ok) throw new Error(`reading ${LEGACY_BUCKET}/${legacy.object_name}: ${res.status}`)
     const bytes = new Uint8Array(await res.arrayBuffer())
     if (bytes.length > MAX_ATTACHMENT_BYTES) throw new Refusal(413, 'too_large', 'an attachment is at most 25 MiB')
+    await call(deps.userRpc,'file_managed_upload_as',{p_id:messageId,p_chat:str(body,'chat_id'),
+      p_as:str(body,'sender_user_id'),p_bytes:bytes.length})
     await objectStorage(deps).put(stagingKey, bytes)
-    await registerStaged(deps, userId, stagingKey, legacy.content_type)
+    await registerStaged(deps, userId, stagingKey, legacy.content_type, legacy.file_name)
     rows = await forward(stagingKey)
   }
   return rows[0] ?? null
 }
 
 // ── urls ─────────────────────────────────────────────────────────────────────────
-interface Located {
-  item_id: string | null
-  version: number | null
-  /** 悄悄话附件:按消息要的那一行(条目那两列是空的)。 */
-  message_id: string | null
-  /** 条目现在是第几版(聊天记录里钉的那一版不是最新的,客户端另外提示);按消息要的没有。 */
-  current_version: number | null
-  chat_id: string
-  file_name: string
-  bucket_id: string
-  object_name: string
-  sha256: string | null
-  size_bytes: number | string | null
-  content_type: string
-  width: number | null
-  height: number | null
-}
-
 export async function handleUrls(deps: AttachmentsDeps, userId: string, body: Record<string, unknown>) {
-  const refs = body.refs
-  if (!Array.isArray(refs) || refs.length === 0 || refs.length > 200) throw new Refusal(400, 'invalid', 'refs is a list of 1 to 200 {item_id, version} or {message_id}')
-  for (const ref of refs) {
-    const r = ref as Record<string, unknown>
-    const item = typeof r?.item_id === 'string' && UUID.test(r.item_id) && (r.version === undefined || r.version === null || Number.isInteger(r.version)) && r.message_id === undefined
-    const message = typeof r?.message_id === 'string' && r.message_id !== '' && r.item_id === undefined && r.version === undefined
-    if (!item && !message) throw new Refusal(400, 'invalid', 'each ref is {item_id, version?} or {message_id}')
-  }
-  const as = str(body, 'as', false) ?? userId
-  const rows = ((await call(deps.userRpc, 'file_urls_as', { p_refs: refs, p_as_user_id: as })) ?? []) as Located[]
-  const now = deps.now()
-  const urls = await Promise.all(rows.map(async (row) => {
-    const image = hasThumbnail(row.content_type)
-    let url: string
-    let thumbUrl: string | null = null
-    let expiresAt: string
-    if (row.bucket_id === 'oss') {
-      const signed = await objectStorage(deps).sign(row.object_name, image, now)
-      url = signed.url
-      thumbUrl = signed.thumbUrl
-      expiresAt = signed.expiresAt
-    } else {
-      url = await deps.storageSignedUrl(row.bucket_id, row.object_name, CDN_SIGN_TTL_SECONDS)
-      expiresAt = new Date(now.getTime() + CDN_SIGN_TTL_SECONDS * 1000).toISOString()
-    }
-    return {
-      item_id: row.item_id,
-      version: row.version,
-      message_id: row.message_id,
-      current_version: row.current_version,
-      file_name: row.file_name,
-      sha256: row.sha256,
-      size_bytes: row.size_bytes === null ? null : Number(row.size_bytes),
-      content_type: row.content_type,
-      width: row.width,
-      height: row.height,
-      url,
-      thumb_url: thumbUrl,
-      expires_at: expiresAt,
-    }
-  }))
-  return { urls }
+  if (!Array.isArray(body.refs)||!body.refs.length||body.refs.length>200) throw new Refusal(400,'invalid','refs is a list of 1 to 200 file references')
+  const refs=body.refs.map(fileRef)
+  const urls=await Promise.all(refs.map(ref=>handleFileDownload(deps,userId,{ref,as:body.as??userId,request_id:deps.uuid()})))
+  return {urls:urls.filter(row=>row.status!=='gone')}
 }
 
 // ── gc ───────────────────────────────────────────────────────────────────────────
@@ -387,15 +434,18 @@ interface Claimed {
 }
 
 export async function handleGc(deps: AttachmentsDeps) {
+  await call(deps.serviceRpc, 'file_temporary_expire', { p_limit: 500 })
+  await call(deps.serviceRpc, 'file_version_handoff_expire', { p_limit: 500 })
+  await call(deps.serviceRpc, 'file_transfer_expire', { p_limit: 500 })
   const claimed = ((await call(deps.serviceRpc, 'file_blob_gc_claim', { p_limit: 50, p_stale_seconds: 600 })) ?? []) as Claimed[]
   let deleted = 0
   let failed = 0
   for (const job of claimed) {
     try {
-      if (job.bucket_id === 'oss') {
+      if (job.bucket_id === 'oss' || job.bucket_id === 'temporary') {
         await objectStorage(deps).remove(job.object_name)
         // 清边缘缓存只是清理(见 refreshCdn):失败了记一行,不挡回收。
-        await objectStorage(deps).invalidate(job.object_name, hasThumbnail(job.content_type))
+        if (job.bucket_id === 'oss') await objectStorage(deps).invalidate(job.object_name, hasThumbnail(job.content_type))
           .catch((error) => deps.log('cdn_refresh_failed', { blob: job.blob_id, error: String(error) }))
       } else {
         await deps.storageRemove(job.bucket_id, job.object_name)
@@ -410,4 +460,39 @@ export async function handleGc(deps: AttachmentsDeps) {
     }
   }
   return { claimed: claimed.length, deleted, failed }
+}
+
+
+/** A session handoff grants the named Agents access; it never creates a chat. */
+export async function handleSessionCommit(deps: AttachmentsDeps, userId: string, body: Record<string, unknown>) {
+  const stagingKey = stagingOf(body, userId)
+  await call(deps.userRpc,'file_managed_upload_scope',{p_key:stagingKey,p_as:str(body,'sender_user_id'),p_chat:null,p_item:null})
+  const id = str(body, 'attachment_id')!
+  if (!UUID.test(id)) throw new Refusal(400, 'invalid', 'attachment_id must be a uuid')
+  const args = {
+    p_staging_key: stagingKey, p_attachment_id: id,
+    p_sender_user_id: str(body, 'sender_user_id'), p_sender_session_id: str(body, 'sender_session_id'),
+    p_recipient_user_ids: strings(body, 'recipient_user_ids'), p_file_name: str(body, 'file_name'),
+  }
+  await registerStaged(deps, userId, stagingKey, str(body, 'content_type', false), str(body, 'file_name')!)
+  const rows = await call(deps.userRpc, 'session_attachment_commit', args) as unknown[]
+  if (!rows?.[0]) throw new Refusal(500, 'failed', 'session attachment commit returned no receipt')
+  return rows[0]
+}
+
+export async function handleSessionUrls(deps: AttachmentsDeps, userId: string, body: Record<string, unknown>) {
+  const ids=strings(body,'attachment_ids')
+  if (!ids.length||ids.length>32||ids.some(id=>!UUID.test(id))) throw new Refusal(400,'invalid','expected 1 to 32 attachment ids')
+  const rows=await Promise.all(ids.map(attachment_id=>handleFileDownload(deps,userId,{
+    ref:{attachment_id},as:body.as??userId,request_id:deps.uuid(),
+  })))
+  return {attachments:rows.filter(row=>row.status!=='gone')}
+}
+
+
+export async function handleSessionRevoke(deps: AttachmentsDeps, _userId: string, body: Record<string, unknown>) {
+  const id = str(body, 'attachment_id')!
+  if (!UUID.test(id)) throw new Refusal(400, 'invalid', 'attachment_id must be a uuid')
+  await call(deps.userRpc, 'session_attachment_revoke', { p_id: id, p_as_user_id: str(body, 'as') })
+  return { revoked: true }
 }

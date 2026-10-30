@@ -14,6 +14,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
+import { randomUUID } from 'node:crypto'
 
 const envOf = (k: string) => (process.env[k] ?? '').trim()
 
@@ -38,7 +39,7 @@ const OWNER_PASSWORD = 'GuguJoinGate-fixture-pw1' // gitleaks:allow -- fixture p
 /** F = founding,消息之前入群;L = late,消息之后入群。 */
 const AGENT_F = id('agent-f')
 const AGENT_L = id('agent-l')
-const CHAT = id('chat')
+const CHAT = randomUUID()
 const H2 = id('human2')
 const DEV = id('dev')
 

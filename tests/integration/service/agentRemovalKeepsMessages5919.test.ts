@@ -35,8 +35,8 @@ const OWNER = '59190000-0000-4000-8000-000000000001'
 const BYSTANDER = '59190000-0000-4000-8000-000000000002'
 const AGENT = 'agent-it-5919'
 const DEVICE = 'dev-it-5919'
-const GROUP = 'group-it-5919'
-const DM = 'dm-it-5919'
+const GROUP = '59190000-0000-4000-8000-000000000003'
+const DM = '59190000-0000-4000-8000-000000000004'
 
 let database: DatabaseClient
 

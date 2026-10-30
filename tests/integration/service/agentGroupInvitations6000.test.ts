@@ -43,7 +43,7 @@ async function newGroup(maxMembers = 100) {
   const id = randomUUID()
   await asUser(owner)
   await database.query('SELECT chat.create_gugu_group($1, $2, $3, $4::jsonb)', [
-    id, 'Invitation consent', owner, JSON.stringify([{ user_id: ownAgent, role: 'member' }]),
+    id, 'Invitation consent', owner, JSON.stringify([{ user_id: ownAgent, role: 'admin' }]),
   ])
   await asService()
   await database.query('UPDATE chat.chats SET max_members = $2 WHERE id = $1', [id, maxMembers])
@@ -55,15 +55,15 @@ async function members(chatId: string) {
 }
 async function invite(chatId: string, invitee = externalAgent) {
   await asUser(owner)
-  return result<Decision>('SELECT chat.request_agent_group_invitation($1,$2,$3,$4) AS result', [chatId, ownAgent, invitee, '请协助评审'])
+  return result<Decision>('SELECT chat.request_group_invitation_as($1,$3,$4,$2) AS result', [chatId, ownAgent, invitee, '请协助评审'])
 }
 async function decide(actor: string, id: string, accept: boolean) {
   await asUser(actor)
-  return result<Decision>('SELECT chat.decide_agent_group_invitation($1,$2) AS result', [id, accept])
+  return result<Decision>('SELECT chat.decide_group_invitation_as($1,$2,auth.uid()::text) AS result', [id, accept])
 }
 async function decisionError(actor: string, id: string, accept: boolean) {
   await asUser(actor)
-  return reject('SELECT chat.decide_agent_group_invitation($1,$2)', [id, accept])
+  return reject('SELECT chat.decide_group_invitation_as($1,$2,auth.uid()::text)', [id, accept])
 }
 
 beforeAll(async () => {
@@ -111,7 +111,7 @@ describe('Agent group invitation consent', () => {
     const group = await newGroup()
     const invitation = await invite(group)
     expect(invitation.status).toBe('pending')
-    const sent = await database.query<{ id: string }>('SELECT * FROM chat.list_agent_group_invitations($1)', [ownAgent])
+    const sent = await database.query<{ id: string }>('SELECT * FROM chat.list_group_invitations_as($1,true,false)', [ownAgent])
     expect(sent.rows.map((row) => row.id)).toEqual([invitation.invitation_id])
     const messageId = randomUUID()
     await asUser(owner)
@@ -122,10 +122,10 @@ describe('Agent group invitation consent', () => {
     expect(await members(group)).toEqual([owner, ownAgent].sort())
     expect((await invite(group)).invitation_id).toBe(invitation.invitation_id)
     await asUser(receiver)
-    const inbox = await database.query<{ id: string; owner_will_join: boolean }>('SELECT * FROM chat.list_agent_group_invitations()')
+    const inbox = await database.query<{ id: string; owner_will_join: boolean }>('SELECT * FROM chat.list_group_invitations_as(auth.uid()::text,false,false)')
     expect(inbox.rows).toEqual(expect.arrayContaining([expect.objectContaining({ id: invitation.invitation_id, owner_will_join: true })]))
-    expect(await decisionError(outsider, invitation.invitation_id, true)).toMatch(/not addressed/)
-    expect(await decisionError(owner, invitation.invitation_id, true)).toMatch(/not addressed/)
+    expect(await decisionError(outsider, invitation.invitation_id, true)).toMatch(/invitation_not_addressed_to_actor/)
+    expect(await decisionError(owner, invitation.invitation_id, true)).toMatch(/invitation_not_addressed_to_actor/)
     expect(await members(group)).toEqual([owner, ownAgent].sort())
     await decide(receiver, invitation.invitation_id, true)
     await decide(receiver, invitation.invitation_id, true)
@@ -141,7 +141,7 @@ describe('Agent group invitation consent', () => {
     await decide(receiver, invitation.invitation_id, false)
     await decide(receiver, invitation.invitation_id, false)
     expect(await members(group)).toEqual([owner, ownAgent].sort())
-    expect(await decisionError(receiver, invitation.invitation_id, true)).toMatch(/already decided/)
+    expect(await decisionError(receiver, invitation.invitation_id, true)).toMatch(/invitation_already_decided/)
   })
   it('lists decided invitations only when asked, with their status (#6704)', async () => {
     const declined = await invite(await newGroup(), receiver)
@@ -149,7 +149,7 @@ describe('Agent group invitation consent', () => {
     const waiting = await invite(await newGroup(), receiver)
     const inbox = async (includeDecided: boolean) => {
       await asUser(receiver)
-      const { rows } = await database.query<{ id: string; status: string }>('SELECT id, status FROM chat.list_agent_group_invitations(NULL, $1)', [includeDecided])
+      const { rows } = await database.query<{ id: string; status: string }>('SELECT id, status FROM chat.list_group_invitations_as(auth.uid()::text,false,$1)', [includeDecided])
       return Object.fromEntries(rows.map((row) => [row.id, row.status]))
     }
     expect(await inbox(false)).toEqual({ [waiting.invitation_id]: 'pending' })
@@ -164,7 +164,7 @@ describe('Agent group invitation consent', () => {
   it('counts both external Agent and owner against the member limit without partial joins', async () => {
     const group = await newGroup(3)
     const invitation = await invite(group)
-    expect(await decisionError(receiver, invitation.invitation_id, true)).toMatch(/member limit/)
+    expect(await decisionError(receiver, invitation.invitation_id, true)).toMatch(/member_limit_reached/)
     expect(await members(group)).toEqual([owner, ownAgent].sort())
     const { rows } = await database.query<{ status: string }>('SELECT status FROM chat.group_invitations WHERE id = $1', [invitation.invitation_id])
     expect(rows[0]!.status).toBe('pending')
@@ -175,13 +175,13 @@ describe('Agent group invitation consent', () => {
     await invite(group, siblingAgent)
     await asService()
     await database.query('DELETE FROM chat.chat_members WHERE chat_id = $1 AND user_id = $2', [group, ownAgent])
-    expect(await decisionError(receiver, invitation.invitation_id, true)).toMatch(/must both be group members/)
+    expect(await decisionError(receiver, invitation.invitation_id, true)).toMatch(/actor_not_member/)
     expect(await members(group)).not.toContain(receiver)
     await decide(receiver, invitation.invitation_id, false)
   })
   it('adds an owned Agent through the same capacity-checked path', async () => {
     const group = await newGroup(3)
-    expect((await invite(group, siblingAgent)).status).toBe('accepted')
+    expect((await invite(group, siblingAgent)).status).toBe('joined')
     expect(await members(group)).toEqual([owner, ownAgent, siblingAgent].sort())
   })
   it('publishes an invitation revision that reaches an offline owner on catch-up', async () => {

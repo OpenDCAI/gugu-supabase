@@ -1,3 +1,4 @@
+import { createFixtureGroup } from '../../support/groupFixture'
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -92,10 +93,6 @@ async function isMember(chatId: string, userId: string): Promise<boolean> {
   await asService()
   return (await database.query('SELECT 1 FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [chatId, userId])).rows.length === 1
 }
-async function insertMember(actor: string, chatId: string, userId: string, role = 'member') {
-  await asUser(actor)
-  await database.query('INSERT INTO chat.chat_members (chat_id,user_id,role) VALUES ($1,$2,$3)', [chatId, userId, role])
-}
 async function insertFails(actor: string, chatId: string, userId: string, role = 'member') {
   await asUser(actor)
   return fails('INSERT INTO chat.chat_members (chat_id,user_id,role) VALUES ($1,$2,$3)', [chatId, userId, role])
@@ -128,115 +125,70 @@ afterEach(async () => {
   }
 })
 
-describe('① 统一的「能否加此人」(RLS 直插)', () => {
-  it('管理员不受「允许成员邀请」约束;普通成员受(开关一开即放行)', async () => {
+describe('① 统一 admission RPC, no authenticated direct member writes', () => {
+  async function inviteHuman(actor: string, group: string, target: string) {
+    await asUser(actor)
+    return (await database.query<{ result: { invitation_id: string; status: string } }>(
+      "SELECT chat.request_group_invitation_as($1,$2,'请加入',auth.uid()::text) AS result", [group, target])).rows[0]!.result
+  }
+  async function accept(actor: string, invitation: string) {
+    await asUser(actor)
+    await database.query('SELECT chat.decide_group_invitation_as($1,true,auth.uid()::text)', [invitation])
+  }
+  async function addAgent(actor: string, group: string, agent: string) {
+    await asUser(actor)
+    return (await database.query<{ result: { status: string } }>('SELECT chat.add_group_agent($1,$2,NULL,auth.uid()::text) AS result', [group, agent])).rows[0]!.result
+  }
+  it('admins can invite, ordinary members follow the switch, and a human joins only after consent', async () => {
     const group = await newGroup({ allow_member_invite: false })
-    await insertMember(admin, group, friend)
-    expect(await isMember(group, friend)).toBe(true)
+    const invitation = await inviteHuman(admin, group, friend)
+    expect(invitation.status).toBe('pending'); expect(await isMember(group, friend)).toBe(false)
+    await accept(friend, invitation.invitation_id); expect(await isMember(group, friend)).toBe(true)
     const other = await human('Other')
-    expect(await insertFails(member, group, other)).toMatch(/row-level security/)
-    await asService()
-    await database.query('UPDATE chat.chats SET allow_member_invite = true WHERE id = $1', [group])
-    await insertMember(member, group, other)
+    await asUser(member)
+    expect(await fails("SELECT chat.request_group_invitation_as($1,$2,'请加入',auth.uid()::text)", [group, other])).toMatch(/member_invite_disabled/)
+    await asService(); await database.query('UPDATE chat.chats SET allow_member_invite=true WHERE id=$1', [group])
+    await accept(other, (await inviteHuman(member, group, other)).invitation_id)
     expect(await isMember(group, other)).toBe(true)
   })
-
-  it('普通成员不能直接写 role=admin(即使允许邀请);管理员可以', async () => {
+  it('all direct inserts are denied, including owner, admin and topic creator', async () => {
     const group = await newGroup({ allow_member_invite: true })
-    expect(await insertFails(member, group, friend, 'admin')).toMatch(/row-level security/)
-    expect(await insertFails(member, group, friend, 'owner')).toMatch(/row-level security/)
-    await insertMember(admin, group, friend, 'admin')
-    await asService()
-    const role = (await database.query<{ role: string }>('SELECT role FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [group, friend])).rows[0]?.role
-    expect(role).toBe('admin')
+    for (const actor of [owner, admin, member, outsider]) {
+      expect(await insertFails(actor, group, friend)).toMatch(/permission denied/)
+    }
   })
-
-  it('上限对群主同样生效(以前创建者整条豁免)', async () => {
-    const group = await newGroup({ max_members: 4 }) // owner + ownerAgent + admin + member = 4
-    // BEFORE INSERT 触发器(①b)先于 RLS WITH CHECK 执行,所以满员报的是它的稳定标识。
-    expect(await insertFails(owner, group, friend)).toMatch(/member_limit_reached/)
-    await asService()
-    await database.query('UPDATE chat.chats SET max_members = 5 WHERE id = $1', [group])
-    await insertMember(owner, group, friend)
-    expect(await isMember(group, friend)).toBe(true)
+  it('member limit is rechecked when the human accepts, atomically', async () => {
+    const group = await newGroup({ max_members: 4 })
+    const invitation = await inviteHuman(owner, group, friend)
+    await asUser(friend)
+    expect(await fails('SELECT chat.decide_group_invitation_as($1,true,auth.uid()::text)', [invitation.invitation_id])).toMatch(/member_limit_reached/)
+    expect(await isMember(group, friend)).toBe(false)
+    await asService(); await database.query('UPDATE chat.chats SET max_members=5 WHERE id=$1', [group])
+    await accept(friend, invitation.invitation_id); expect(await isMember(group, friend)).toBe(true)
   })
-
-  it('「agent 加入需审批」拦普通成员加自己的 agent;关掉即放行;管理员不受拦', async () => {
+  it('own-agent admission queues only for members when approval is enabled', async () => {
     const group = await newGroup({ agent_join_approval: true })
-    expect(await insertFails(member, group, memberAgent)).toMatch(/row-level security/)
-    const adminAgent = await agentOf(admin, 'Admin Agent')
-    await insertMember(admin, group, adminAgent)
-    expect(await isMember(group, adminAgent)).toBe(true)
-    await asService()
-    await database.query('UPDATE chat.chats SET agent_join_approval = false WHERE id = $1', [group])
-    await insertMember(member, group, memberAgent)
-    expect(await isMember(group, memberAgent)).toBe(true)
-  })
-
-  it('管理员 / 群主也不能把别人的 agent 直插进群(agent_not_owned);管理员加自己的 agent 不受审批开关限制', async () => {
-    const group = await newGroup({ agent_join_approval: true, allow_member_invite: true })
-    // 别人的 agent:主人在群里(member)与不在群里(outsider)两种,管理员与群主都拒。
-    expect(await insertFails(admin, group, memberAgent)).toMatch(/row-level security/)
-    expect(await insertFails(admin, group, outsiderAgent)).toMatch(/row-level security/)
-    expect(await insertFails(owner, group, memberAgent)).toMatch(/row-level security/)
+    expect((await addAgent(member, group, memberAgent)).status).toBe('pending_approval')
     expect(await isMember(group, memberAgent)).toBe(false)
-    expect(await isMember(group, outsiderAgent)).toBe(false)
-    // 判据本身:拒因是归属,不是审批开关 —— 关掉审批仍拒。
-    await asService()
-    expect((await database.query<{ denial: string }>('SELECT chat.group_add_denial($1,$2,$3) AS denial', [group, memberAgent, admin])).rows[0]?.denial)
-      .toBe('agent_not_owned')
-    await database.query('UPDATE chat.chats SET agent_join_approval = false WHERE id = $1', [group])
-    expect(await insertFails(admin, group, memberAgent)).toMatch(/row-level security/)
-    // 正对照:管理员自己的 agent 在开着审批的群里照样直接进;主人自己加自己的 agent 也进。
-    await asService()
-    await database.query('UPDATE chat.chats SET agent_join_approval = true WHERE id = $1', [group])
     const adminAgent = await agentOf(admin, 'Admin Agent')
-    await insertMember(admin, group, adminAgent)
-    expect(await isMember(group, adminAgent)).toBe(true)
-    await asService()
-    await database.query('UPDATE chat.chats SET agent_join_approval = false WHERE id = $1', [group])
-    await insertMember(member, group, memberAgent)
-    expect(await isMember(group, memberAgent)).toBe(true)
+    expect((await addAgent(admin, group, adminAgent)).status).toBe('joined')
+    await asService(); await database.query('UPDATE chat.chats SET agent_join_approval=false WHERE id=$1', [group])
+    expect((await addAgent(member, group, memberAgent)).status).toBe('joined')
   })
-
-  it('create_gugu_group:初始成员里带别人的 agent ⇒ agent_not_owned;自己的 agent 正常', async () => {
-    await asUser(owner)
-    expect(await fails('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
-      randomUUID(), 'Foreign agent', owner, JSON.stringify([{ user_id: outsiderAgent, role: 'member' }]),
-    ])).toMatch(/agent_not_owned/)
-    await database.query('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
-      randomUUID(), 'Own agent', owner, JSON.stringify([{ user_id: ownerAgent, role: 'member' }]),
-    ])
-  })
-
-  it('非成员什么都加不进去', async () => {
+  it('even admins require the external agent owner’s consent; own-agent path cannot be used', async () => {
     const group = await newGroup({ allow_member_invite: true })
-    expect(await insertFails(outsider, group, outsider)).toMatch(/row-level security/)
-    expect(await insertFails(outsider, group, outsiderAgent)).toMatch(/row-level security/)
-  })
-
-  it('话题直插只收来源线成员(以前话题创建者能把任何人塞进来)', async () => {
-    const group = await newGroup()
-    const source = randomUUID()
+    await asUser(admin)
+    expect(await fails('SELECT chat.add_group_agent($1,$2,NULL,auth.uid()::text)', [group, outsiderAgent])).toMatch(/agent_not_owned/)
     await asService()
-    await database.query(`INSERT INTO chat.messages (id,chat_id,sender_user_id,content,content_type)
-      VALUES ($1,$2,$3,'anchor','text')`, [source, group, owner])
-    await asUser(owner)
-    const topic = (await database.query<{ chat_id: string }>('SELECT * FROM chat.create_topic($1,$2)', [group, source])).rows[0]!.chat_id
-    expect(await insertFails(owner, topic, outsider)).toMatch(/row-level security/)
-    await insertMember(owner, topic, member)
-    expect(await isMember(topic, member)).toBe(true)
+    expect((await database.query<{ denial: string }>('SELECT chat.group_add_denial($1,$2,$3) AS denial', [group, outsiderAgent, admin])).rows[0]?.denial).toBe('agent_not_owned')
   })
-
-  it('create_gugu_group:初始成员不能带 owner 角色', async () => {
+  it('creation admits only related initial members and protects the owner role', async () => {
     await asUser(owner)
-    const message = await fails('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
-      randomUUID(), 'Two owners', owner, JSON.stringify([{ user_id: friend, role: 'owner' }]),
-    ])
-    expect(message).toMatch(/cannot have role owner/)
-    await database.query('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
-      randomUUID(), 'Admin ok', owner, JSON.stringify([{ user_id: friend, role: 'admin' }]),
-    ])
+    for (const target of [friend, outsiderAgent]) {
+      expect(await fails('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [randomUUID(), 'External', owner, JSON.stringify([{ user_id: target, role: 'member' }])])).toMatch(/initial_member_requires_invitation/)
+    }
+    expect(await fails('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [randomUUID(), 'Two owners', owner, JSON.stringify([{ user_id: ownerAgent, role: 'owner' }])])).toMatch(/cannot have role owner/)
+    await database.query('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [randomUUID(), 'Own agent', owner, JSON.stringify([{ user_id: ownerAgent, role: 'admin' }])])
   })
 })
 
@@ -408,7 +360,7 @@ describe('①b 人数上限在并发下不被击穿(两条连接各开一个事�
     const id = randomUUID()
     await a.query('BEGIN')
     await as(a, raceOwner)
-    await a.query('SELECT chat.create_gugu_group($1,$2,$3,$4::jsonb)', [
+    await createFixtureGroup(a, [
       id, 'Race 3641', raceOwner, JSON.stringify([{ user_id: raceMember, role: 'member' }]),
     ])
     await a.query('COMMIT')
@@ -446,19 +398,22 @@ describe('①b 人数上限在并发下不被击穿(两条连接各开一个事�
     }
   })
 
-  it('RLS 直插:管理员两条连接各加一个人抢最后一个座位 ⇒ 后一笔等锁、提交后被拒,群不超上限', async () => {
+  it('two invitation acceptances race for the last seat: the second waits, then fails without joining', async () => {
     const { id, raceAdmin } = await committedFullMinusOne()
-    const x = await committedHuman('Race X')
-    const y = await committedHuman('Race Y')
-
+    const x = await committedHuman('Race X'), y = await committedHuman('Race Y')
     await a.query('BEGIN'); await as(a, raceAdmin)
-    await a.query(`INSERT INTO chat.chat_members (chat_id,user_id,role) VALUES ($1,$2,'member')`, [id, x])
-    await b.query('BEGIN'); await as(b, raceAdmin)
-    const second = b.query(`INSERT INTO chat.chat_members (chat_id,user_id,role) VALUES ($1,$2,'member')`, [id, y])
-    await expectBlocked(second)
+    const invitations: string[] = []
+    for (const target of [x,y]) {
+      const row = await a.query<{ result: { invitation_id: string } }>("SELECT chat.request_group_invitation_as($1,$2,'请加入',auth.uid()::text) AS result", [id,target])
+      invitations.push(row.rows[0]!.result.invitation_id)
+    }
     await a.query('COMMIT')
-    await expect(second).rejects.toThrow(/member_limit_reached/)
-    await b.query('ROLLBACK')
+    await a.query('BEGIN'); await as(a, x)
+    await a.query('SELECT chat.decide_group_invitation_as($1,true,auth.uid()::text)', [invitations[0]])
+    await b.query('BEGIN'); await as(b, y)
+    const second = b.query('SELECT chat.decide_group_invitation_as($1,true,auth.uid()::text)', [invitations[1]])
+    await expectBlocked(second); await a.query('COMMIT')
+    await expect(second).rejects.toThrow(/member_limit_reached/); await b.query('ROLLBACK')
     expect(await count(id)).toBe(4)
   })
 

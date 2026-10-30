@@ -226,7 +226,7 @@ describe('#5856 agent 数量线:可设置、群与话题都生效(对着真库�
       }
       const { rows: pids } = await second.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
       const pid = pids[0]!.pid
-      const insert = `INSERT INTO chat.chat_members (chat_id, user_id, role) VALUES ($1, $2, 'member')`
+      const insert = 'SELECT chat.add_group_agent($1,$2,NULL,auth.uid()::text)'
       await first.query(insert, [chatId, room.agents[initial]])
       let settled = false
       pending = second.query(insert, [chatId, room.agents[initial + 1]])
@@ -365,7 +365,7 @@ describe('#5856 agent 数量线:可设置、群与话题都生效(对着真库�
         `SELECT id FROM chat.agent_flood_adjustments WHERE chat_id = $1`, [room.group],
       )
       await asUser(room.owner)
-      await database.query(`SELECT * FROM chat.undo_agent_flood_adjustment($1)`, [rows[0]!.id])
+      await database.query(`SELECT * FROM chat.undo_agent_flood_adjustment($1,auth.uid()::text)`, [rows[0]!.id])
       await asService()
       expect(await listenModes(room.group)).toEqual(['active', 'active', 'active'])
 
@@ -472,7 +472,7 @@ describe('#5856 agent 数量线:可设置、群与话题都生效(对着真库�
         `SELECT id FROM chat.agent_flood_adjustments WHERE chat_id = $1`, [room.group],
       )
       await asUser(room.owner)
-      await database.query(`SELECT * FROM chat.undo_agent_flood_adjustment($1)`, [rows[0]!.id])
+      await database.query(`SELECT * FROM chat.undo_agent_flood_adjustment($1,auth.uid()::text)`, [rows[0]!.id])
       await asService()
       // 阳控:一键全撤把**四个**都还原了,包括后来进来的那个。
       expect(await listenModes(room.group)).toEqual(Array(4).fill('active'))

@@ -247,7 +247,11 @@ function fakes(opts: {
         opts.document!.snapshotted = args.p_text as string
         return { data: 8, error: null }
       }
-      if (fn === 'attachment_share') return { data: [{ id: args.p_message_id, file_item_id: args.p_item_id, file_version: args.p_version }], error: null }
+      if (fn === 'attachment_share') {
+        // A document's version without bytes (20261030120000): the share refuses it, as the database does.
+        if (opts.document && args.p_version !== 7 && args.p_version !== 8) return { data: null, error: { message: '周报 is a text document: send it through attachments/share', hint: 'attachment_forward_needs_bytes', code: 'P0001' } }
+        return { data: [{ id: args.p_message_id, file_item_id: args.p_item_id, file_version: args.p_version }], error: null }
+      }
       if (fn === 'file_storage_mark_as') return { data: 1, error: null }
       if (fn === 'file_place_as') return { data: [{ id: 'i9', version: 1, path: args.p_file_name }], error: null }
       if (fn === 'file_replace_as') return { data: [{ id: args.p_item_id, version: 4 }], error: null }
@@ -657,7 +661,7 @@ describe('按引用发(share)', () => {
   it('编辑器里改过的文本文件(没有带字节的一版):正文放进暂存(按这条新消息起名)→ 和提交同一步登记 → 定成一版 → 钉住那一版', async () => {
     const text = '# 周报\n\n第二版'
     const { deps, calls, rpcs, controls } = fakes({ document: { text, snapshotted: null } })
-    await expect(handleShare(deps, USER, { ...shareBody, version: 2 })).resolves.toMatchObject({ id: SHARE, file_version: 8 })
+    await expect(handleShare(deps, USER, shareBody)).resolves.toMatchObject({ id: SHARE, file_version: 8 })
     const key = `staging/${USER}/${SHARE}`
     expect(calls.filter((c) => c.method === 'PUT').map((c) => c.url)).toContainEqual(`https://gugu-files-test.oss-cn-wulanchabu-internal.aliyuncs.com/${key}`)
     expect(rpcs.map((r) => `${r.as} ${r.fn}`)).toEqual([
@@ -665,9 +669,18 @@ describe('按引用发(share)', () => {
     expect(rpcs[0]!.args).toEqual({ p_item_id: 'item-1', p_as_user_id: USER, p_text: text, p_staging_key: null })
     expect(rpcs[1]!.args).toMatchObject({ p_staging_key: key, p_size_bytes: new TextEncoder().encode(text).length, p_sha256: createHash('sha256').update(text).digest('hex') })
     expect(rpcs[2]!.args).toMatchObject({ p_text: text, p_staging_key: key })
-    // The version the list showed (2) means nothing for a document: the snapshot's is pinned.
+    // No version asked: the text as it is now, the snapshot's version is pinned.
     expect(rpcs[3]!.args).toMatchObject({ p_item_id: 'item-1', p_version: 8 })
     expect(controls.find((c) => c.fn === 'file_managed_upload_as')!.args).toMatchObject({ p_id: SHARE, p_chat: 'c1', p_as: USER })
+  })
+
+  it('文本文件给了版本:钉住那一版(发过、带字节的),不读正文、不定新版;没有字节的那一版说清楚,从不换成现在的正文', async () => {
+    const { deps, calls, rpcs } = fakes({ document: { text: '# 周报 现在', snapshotted: null } })
+    await expect(handleShare(deps, USER, { ...shareBody, version: 7 })).resolves.toMatchObject({ file_version: 7 })
+    expect(rpcs.map((r) => `${r.as} ${r.fn}`)).toEqual(['user attachment_share'])
+    await expect(handleShare(deps, USER, { ...shareBody, version: 2 })).rejects.toMatchObject({ status: 409, code: 'version_unavailable' })
+    expect(rpcs.map((r) => r.fn)).not.toContain('attachment_document_snapshot')
+    expect(calls).toEqual([])
   })
 
   it('同一段正文再发一次:就是上次那一版,不再上传、不再登记', async () => {

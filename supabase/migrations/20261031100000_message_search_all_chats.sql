@@ -17,19 +17,23 @@ BEGIN
         RAISE EXCEPTION 'p_before_seq pages one chat; a search across chats has no single sequence';
     END IF;
     RETURN QUERY
+    -- The chats searched, each with the actor's history floor, taken once per chat (not once per message).
+    WITH searched AS MATERIALIZED (
+        SELECT c.chat_id, chat.history_floor(c.chat_id, v_actor) AS floor
+          FROM (SELECT p_chat_id AS chat_id WHERE p_chat_id IS NOT NULL
+                UNION ALL
+                SELECT am.chat_id FROM chat.active_members am WHERE p_chat_id IS NULL AND am.user_id = v_actor) c
+    )
     SELECT m.id, m.seq::BIGINT, m.sender_user_id, COALESCE(u.display_name, '未知用户'), m.content,
            m.content_type, m.thread_root_id, m.created_at, m.file_item_id, m.file_version, m.chat_id
-      FROM chat.messages m
-      JOIN LATERAL (SELECT chat.history_floor(m.chat_id, v_actor) AS floor) h ON true
+      FROM searched s
+      JOIN chat.messages m ON m.chat_id = s.chat_id
       LEFT JOIN identity.users u ON u.id = m.sender_user_id
-     WHERE (CASE WHEN p_chat_id IS NULL
-                 THEN m.chat_id IN (SELECT cm.chat_id FROM chat.active_members cm WHERE cm.user_id = v_actor)
-                 ELSE m.chat_id = p_chat_id END)
-       AND m.deleted_at IS NULL
+     WHERE m.deleted_at IS NULL
        AND m.content ILIKE v_pattern
        AND (p_before_seq IS NULL OR m.seq < p_before_seq)
        -- The one visibility rule, against the chat's own history floor for the actor.
-       AND chat.message_visible_at(h.floor, m.created_at, m.is_whisper, m.sender_user_id, m.to_user_ids, v_actor)
+       AND chat.message_visible_at(s.floor, m.created_at, m.is_whisper, m.sender_user_id, m.to_user_ids, v_actor)
      ORDER BY (CASE WHEN p_chat_id IS NULL THEN m.created_at END) DESC, m.seq DESC
      LIMIT LEAST(GREATEST(COALESCE(p_limit, 20), 1), 100);
 END;

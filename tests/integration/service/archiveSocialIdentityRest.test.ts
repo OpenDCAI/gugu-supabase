@@ -72,24 +72,27 @@ describe('archive through authenticated PostgREST and private realtime', () => {
     expect(unauthorized.error?.code).toBe('42501')
 
     let eventResolve!: (value: unknown) => void
+    let probeResolve!: () => void
+    const probe = new Promise<void>(resolve => { probeResolve = resolve })
     const event = new Promise<unknown>(resolve => { eventResolve = resolve })
     const channel = owner.channel('gugu:identity:lifecycle', { config: { private: true } })
       .on('broadcast', { event: 'identity_removed' }, message => { if (message.payload.id === agent) eventResolve(message.payload) })
+      .on('broadcast', { event: 'stream_probe' }, () => probeResolve())
     await new Promise<void>((resolve, reject) => {
       channel.subscribe(status => {
         if (status === 'SUBSCRIBED') resolve()
         if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') reject(new Error(`Private identity channel: ${status}`))
       })
     })
-    // Realtime opens its database-broadcast stream only after the first join; a row
-    // written before the slot is streaming is never delivered. Wait for the stream.
+    // A cold Realtime opens (and on a fresh database reopens) its database-broadcast
+    // stream after the first join; rows written before it streams are never delivered.
+    // Probe through the same database path until one arrives.
     const database = new Client({ connectionString: process.env.GUGU_INTEGRATION_DATABASE_URL })
     await database.connect()
     try {
       for (;;) {
-        const { rows } = await database.query("SELECT 1 FROM pg_replication_slots WHERE slot_name LIKE 'supabase_realtime_messages_replication_slot%' AND active")
-        if (rows.length) break
-        await new Promise(resolve => setTimeout(resolve, 100))
+        await database.query("SELECT realtime.send('{}'::jsonb,'stream_probe','gugu:identity:lifecycle',true)")
+        if (await Promise.race([probe.then(() => true), new Promise<false>(resolve => setTimeout(() => resolve(false), 500))])) break
       }
     } finally { await database.end() }
     try {

@@ -224,6 +224,11 @@ describe('topic authority comes from the source, while settings belong to the pa
     expect(await present(adminAgent, room)).toBe(true)
     expect((await rpc('remove_group_member_as', { p_chat_id: topic, p_member_user_id: human }, owner)).status).toBe('removed')
     expect(await present(human, room)).toBe(true)
+    await service()
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'member')", [topic, owner])
+    await rpc('remove_group_member_as', { p_chat_id: topic, p_member_user_id: owner }, agentOwner, adminAgent)
+    expect(await present(owner, topic)).toBe(false)
+    expect(await present(owner, room)).toBe(true)
     expect((await rpc('remove_group_member_as', { p_chat_id: topic, p_member_user_id: agentOwner }, agentOwner)).status).toBe('removed')
   })
   it('keeps pin/mute personal and does not reopen direct role or listen-mode writes', async () => {

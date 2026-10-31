@@ -275,6 +275,8 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
         assert.equal((await db.query("SELECT has_function_privilege('authenticated',$1,'EXECUTE') AS allowed", ['chat.'+signature])).rows[0].allowed, true)
         assert.equal((await db.query("SELECT has_function_privilege('anon',$1,'EXECUTE') AS allowed", ['chat.'+signature])).rows[0].allowed, false)
       }
+      // A later release that replaces file resolution must keep it read-only (STABLE), or the planner calls it per row.
+      assert.equal((await query("SELECT provolatile FROM pg_proc WHERE oid='chat.file_resolve_as(jsonb,text)'::regprocedure"))[0].provolatile, 's')
     })
     await t.test('workspace metadata is an object and its atomic helper has no API grants', async () => {
       const column = (await db.query("SELECT is_nullable,column_default,data_type FROM information_schema.columns WHERE table_schema='chat' AND table_name='workspace_items' AND column_name='metadata'")).rows[0]

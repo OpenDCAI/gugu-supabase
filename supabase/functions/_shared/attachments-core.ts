@@ -421,15 +421,17 @@ export async function handleForward(deps: AttachmentsDeps, userId: string, body:
 
 // ── share ────────────────────────────────────────────────────────────────────────
 // 群文件夹里的一个文件按引用发出去(以调用者的身份 attachment_share):不传字节,消息钉住那个文件的一版。存的文件钉住
-// 给的那一版(不给 = 现在的)。文本文件(document)的一版只有文字:先把它此刻的正文定成带字节的一版
-// (attachment_document_snapshot;正文没变就是上次那一版,字节按 sha256 存、不另存一份),再钉住那一版。
+// 给的那一版(不给 = 现在的)。文本文件(document)不给版本:先把它此刻的正文定成带字节的一版
+// (attachment_document_snapshot;正文没变就是上次那一版,字节按 sha256 存、不另存一份),再钉住那一版;给了版本:
+// 钉住那一版,只有发过、带着字节的那几版钉得住 —— 其余的说清楚,从不悄悄换成现在的正文。
 export async function handleShare(deps: AttachmentsDeps, userId: string, body: Record<string, unknown>) {
   const itemId = str(body, 'item_id')!
   const sender = str(body, 'sender_user_id')!
   const messageId = str(body, 'message_id')!
   const caption = str(body, 'caption', false)
   const entry = ((await call(deps.userRpc, 'workspace_get_as', { p_item_id: itemId, p_as_user_id: sender })) as SharedEntry[])[0]
-  const version = entry?.kind === 'document' ? await documentSnapshot(deps, userId, sender, messageId, entry) : int(body, 'version')
+  const asked = int(body, 'version')
+  const version = entry?.kind === 'document' && asked === null ? await documentSnapshot(deps, userId, sender, messageId, entry) : asked
   const rows = (await call(deps.userRpc, 'attachment_share', {
     p_item_id: itemId,
     p_version: version,
@@ -442,6 +444,11 @@ export async function handleShare(deps: AttachmentsDeps, userId: string, body: R
     p_is_thread_root: bool(body, 'is_thread_root'),
     p_via_app: str(body, 'via_app', false),
     ...(caption != null ? { p_caption: caption } : {}),
+  }).catch((error) => {
+    // A document's version as text only (never sent, so never given bytes): what was asked for cannot be pinned.
+    if (!(entry?.kind === 'document' && error instanceof Refusal && error.code === 'needs_bytes')) throw error
+    throw new Refusal(409, 'version_unavailable',
+      `${entry.filename} is a text document: version ${version} has no saved copy to send. Leave out the version to send its text as it is now.`)
   })) as unknown[]
   return rows[0] ?? null
 }

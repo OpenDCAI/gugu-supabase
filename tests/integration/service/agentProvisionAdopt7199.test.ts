@@ -528,7 +528,7 @@ describe('开通 saga 收养已有的 agent(搬家)', () => {
 
     it('开通助理(带 first_task)也发欢迎模板,英文界面写英文;重放 already = true、不再发', async () => {
       await world(async (w) => {
-        expect(await provisionWithLocale(w, 'en-US', '你刚开通。')).toEqual(['I\'m Gugu, ready to go. Just tell me what you need.'])
+        expect(await provisionWithLocale(w, 'en-US', '你刚开通。')).toEqual(['I\'m Gugu, ready to help. Tell me what you need.'])
       })
     })
 

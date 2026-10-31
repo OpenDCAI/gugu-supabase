@@ -7,10 +7,10 @@ CREATE FUNCTION identity.provision_template_message(p_display_name text, p_agent
     SET search_path TO 'pg_catalog'
     AS $$
     SELECT CASE WHEN p_locale = 'en-US' THEN
-        'I''m ' || COALESCE(NULLIF(btrim(p_display_name), ''), 'your agent') || ', ready to go. '
+        'I''m ' || COALESCE(NULLIF(btrim(p_display_name), ''), 'your agent') || ', ready to help. '
         || CASE WHEN NULLIF(btrim(coalesce(p_special_focus,'')), '') IS NOT NULL
                 THEN 'My focus: ' || btrim(p_special_focus) || '. ' ELSE '' END
-        || 'Just tell me what you need.'
+        || 'Tell me what you need.'
     ELSE
         '我是'
         || CASE WHEN COALESCE(NULLIF(btrim(p_display_name), ''), '你的 Agent') ~ '^[A-Za-z0-9]' THEN ' ' ELSE '' END

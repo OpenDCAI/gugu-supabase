@@ -1,10 +1,11 @@
 -- Group authority belongs to the source group; participation settings belong to each topic.
+-- Membership reads use chat.active_members (live identities); writes target chat.chat_members.
 SET LOCAL lock_timeout = '5s';
 
 CREATE OR REPLACE FUNCTION chat.group_is_manager(p_chat_id TEXT, p_actor TEXT)
 RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
     SELECT EXISTS (
-        SELECT 1 FROM chat.chats c JOIN chat.chat_members m ON m.chat_id = c.id
+        SELECT 1 FROM chat.chats c JOIN chat.active_members m ON m.chat_id = c.id
         WHERE c.id = p_chat_id AND c.kind = 'group' AND c.status <> 'archived'
           AND m.user_id = p_actor AND m.role IN ('owner', 'admin')
     );
@@ -24,7 +25,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
         END
       FROM chat.chats c
       JOIN chat.chats s ON s.id = CASE WHEN c.kind = 'topic' THEN c.source_chat_id ELSE c.id END
-      LEFT JOIN chat.chat_members m ON m.chat_id = s.id AND m.user_id = p_actor
+      LEFT JOIN chat.active_members m ON m.chat_id = s.id AND m.user_id = p_actor
       LEFT JOIN identity.users creator ON creator.id = c.creator_user_id
       LEFT JOIN identity.users actor ON actor.id = p_actor
      WHERE c.id = p_chat_id;
@@ -95,7 +96,7 @@ BEGIN
     IF NOT FOUND THEN RAISE EXCEPTION 'group_roles_require_source_group' USING ERRCODE = '42501'; END IF;
     v_actor := chat.require_group_manager(p_chat_id, p_as_user_id);
     IF p_role IS NULL OR p_role NOT IN ('admin', 'member') THEN RAISE EXCEPTION 'invalid_group_role'; END IF;
-    SELECT role INTO v_role FROM chat.chat_members WHERE chat_id = p_chat_id AND user_id = p_member_user_id FOR UPDATE;
+    SELECT role INTO v_role FROM chat.active_members WHERE chat_id = p_chat_id AND user_id = p_member_user_id FOR UPDATE;
     IF v_role IS NULL THEN RAISE EXCEPTION 'group_member_not_found'; END IF;
     IF v_role = 'owner' THEN RAISE EXCEPTION 'group_owner_role_protected'; END IF;
     IF v_role <> p_role THEN
@@ -141,7 +142,7 @@ BEGIN
         RETURN;
     END IF;
     RETURN QUERY SELECT cm.user_id, COALESCE(a.my_role, 'member'), cm.listen_mode
-                   FROM chat.chat_members cm
+                   FROM chat.active_members cm
                    LEFT JOIN LATERAL chat.management_authority(p_chat_id, cm.user_id) a ON true
                   WHERE cm.chat_id = p_chat_id;
 END;
@@ -160,7 +161,7 @@ BEGIN
     SELECT * INTO v_authority FROM chat.management_authority(p_chat_id, v_actor);
     -- Use the same source-before-topic lock order as source departure.
     PERFORM 1 FROM chat.chats s WHERE s.id = v_authority.source_chat_id FOR SHARE;
-    PERFORM 1 FROM chat.chat_members m
+    PERFORM 1 FROM chat.active_members m
      WHERE m.chat_id = v_authority.source_chat_id AND m.user_id = v_actor FOR SHARE;
     SELECT * INTO v_topic FROM chat.chats WHERE id = p_chat_id AND kind = 'topic' FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'Topic not found' USING ERRCODE = '22023'; END IF;
@@ -356,7 +357,7 @@ BEGIN
 
     -- Lock the existing source seat: a concurrent source departure cannot
     -- invalidate the owner's eligibility before this admission commits.
-    PERFORM 1 FROM chat.chat_members m JOIN identity.users u ON u.id = m.user_id AND u.type = 'human'
+    PERFORM 1 FROM chat.active_members m JOIN identity.users u ON u.id = m.user_id AND u.type = 'human'
      WHERE m.chat_id = v_topic.source_chat_id AND m.user_id = v_owner FOR KEY SHARE OF m;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'The Agent''s human owner cannot join this topic because they are not a member of its source conversation'
@@ -371,6 +372,62 @@ BEGIN
 END;
 $$;
 REVOKE ALL ON FUNCTION chat.enroll_topic_agent_owner() FROM PUBLIC, anon, authenticated;
+-- Decisions follow the same management resolver: a topic's local seat role is not authority.
+CREATE OR REPLACE FUNCTION chat.gugu_decision_events_vote_scope_chk() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'chat', 'identity', 'public', 'pg_catalog'
+    AS $$
+DECLARE
+    caller_user_id TEXT;
+    is_admin_or_owner BOOLEAN;
+BEGIN
+    IF identity.is_trusted_decision_erasure_update(OLD, NEW) THEN
+        NEW.updated_at := now();
+        RETURN NEW;
+    END IF;
+
+    caller_user_id := (SELECT auth.uid()::text);
+    IF caller_user_id IS NULL THEN
+        RAISE EXCEPTION 'no auth.uid() — cannot identify caller';
+    END IF;
+
+    is_admin_or_owner := chat.can_manage_group_members(NEW.chat_id);
+
+    IF OLD.status = 'pending' AND NEW.status = 'cancelled' THEN
+        IF NOT is_admin_or_owner THEN
+            RAISE EXCEPTION 'only owner/admin can cancel decision';
+        END IF;
+        NEW.updated_at := now();
+        RETURN NEW;
+    END IF;
+
+    IF OLD.status <> 'pending' THEN
+        RAISE EXCEPTION 'cannot modify decision in status=%', OLD.status;
+    END IF;
+
+    IF NOT chat._keys_diff_owned_by(NEW.user_task_decisions, OLD.user_task_decisions, caller_user_id)
+       OR NOT chat._keys_diff_owned_by(NEW.user_resource_states, OLD.user_resource_states, caller_user_id)
+       OR NOT chat._keys_diff_owned_by(NEW.user_rationales, OLD.user_rationales, caller_user_id) THEN
+        RAISE EXCEPTION 'supervisors can only modify their own vote keys';
+    END IF;
+
+    IF NEW.chat_id IS DISTINCT FROM OLD.chat_id
+       OR NEW.event_type IS DISTINCT FROM OLD.event_type
+       OR NEW.created_by_user_id IS DISTINCT FROM OLD.created_by_user_id THEN
+        RAISE EXCEPTION 'chat_id/event_type/created_by_user_id are immutable';
+    END IF;
+
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION chat.gugu_decision_events_vote_scope_chk() FROM PUBLIC;
+ALTER POLICY gugu_decision_events_manager_update ON chat.gugu_decision_events
+    USING (chat.can_manage_group_members(chat_id)) WITH CHECK (chat.can_manage_group_members(chat_id));
+ALTER POLICY gugu_decision_events_owner_write ON chat.gugu_decision_events
+    WITH CHECK (chat.can_manage_group_members(chat_id));
+
 -- Retire the former topic hierarchy without changing participation or preferences.
 UPDATE chat.chat_members m SET role = 'member'
   FROM chat.chats c WHERE c.id = m.chat_id AND c.kind = 'topic' AND m.role <> 'member';

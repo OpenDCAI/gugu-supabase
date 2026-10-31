@@ -241,11 +241,23 @@ describe('topic authority comes from the source, while settings belong to the pa
     expect((await db.query('SELECT is_pinned,notification_level FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [topic, human])).rows[0])
       .toEqual({ is_pinned: true, notification_level: 'none' })
   })
+  it('authorizes topic decisions from source management, not topic seat roles', async () => {
+    await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'member')", [topic, owner])
+    const write = (account: string) => async () => {
+      await asUser(account)
+      await db.query("INSERT INTO chat.gugu_decision_events(chat_id,event_type,created_by_user_id) VALUES($1,'group_stop',$2)", [topic, account])
+    }
+    await write(owner)()
+    expect(await rejected(write(human))).toContain('row-level security')
+    await service()
+  })
   it.each(['dm', 'ai'])('retains human creator management inside a %s source without a topic owner role', async (kind) => {
     const source = randomUUID(), anchor = randomUUID()
     await db.query('INSERT INTO chat.chats(id,kind,creator_user_id) VALUES($1,$2,$3)', [source, kind, agentOwner])
     await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'member'),($1,$3,'member')", [source, agentOwner, human])
     await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content) VALUES($1,$2,$3,'Private source')", [anchor, source, agentOwner])
+    // A topic Agent must belong to the source; this private source seats only the two humans.
+    await db.query('DELETE FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [topic, adminAgent])
     await db.query('UPDATE chat.chats SET source_chat_id=$1,source_message_id=$2 WHERE id=$3', [source, anchor, topic])
     expect((await rpc('update_group_as', { p_chat_id: topic, p_changes: { name: 'Creator edited' } }, agentOwner)).can_manage).toBe(true)
     expect(await rejected(() => rpc('update_group_as', { p_chat_id: topic, p_changes: { name: 'Peer denied' } }, human))).toContain('group_manager_required')

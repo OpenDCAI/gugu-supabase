@@ -497,33 +497,54 @@ describe('开通 saga 收养已有的 agent(搬家)', () => {
       })
     })
 
-    it('带 first_task 的助理:complete 不插欢迎模板(它自己开口问候),message_id / client_message_id 为 NULL,重放 already = true', async () => {
+    // 欢迎模板是开通一完成就秒回的那一句:每个 agent 都发,助理也发;写成开通时的界面语言(blueprint.locale)。
+    const provisionWithLocale = async (w: World, locale: string | null, firstTask: string | null) => {
+      const provision = randomUUID()
+      const op = randomUUID()
+      const m = {
+        provision_id: provision, member_key: 'single', display_name: 'Gugu', agent_type: 'claude-code',
+        project_path: '', inherit_memory: false, history_import_required: false,
+      }
+      const blueprint = { kind: 'single', members: [m], ...(locale ? { locale } : {}) }
+      await asUser(w.owner, async () => {
+        await db.query(
+          'SELECT identity.start_agent_provision_operation($1, $2, $3::jsonb, NULL, NULL, NULL, NULL, NULL, $4, $5)',
+          [op, w.newDevice, JSON.stringify(blueprint), firstTask ? 'claude' : null, firstTask],
+        )
+        await db.query('SELECT identity.claim_provision_slots($1)', [op])
+        await db.query('SELECT identity.prepare_agent_provision($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, NULL)', [provision, op, 'single', w.newDevice, 'Gugu', 'claude-code', ''])
+      })
+      const r = await row(provision)
+      await finishCreate(provision)
+      expect(await settle(w, provision)).toBe('ready')
+      const complete = () => asUser(w.owner, async () =>
+        (await db.query<{ message_id: string | null; already: boolean }>('SELECT * FROM identity.complete_agent_provision($1)', [provision])).rows[0])
+      const first = await complete()
+      expect(first.already).toBe(false)
+      expect(await complete()).toEqual({ ...first, already: true })
+      const { rows } = await db.query<{ content: string }>('SELECT content FROM chat.messages WHERE sender_user_id = $1', [r.agent_user_id])
+      return rows.map(row => row.content)
+    }
+
+    it('开通助理(带 first_task)也发欢迎模板,英文界面写英文;重放 already = true、不再发', async () => {
       await world(async (w) => {
-        const provision = randomUUID()
-        const op = randomUUID()
-        const m = {
-          provision_id: provision, member_key: 'single', display_name: '新助理', agent_type: 'claude-code',
-          project_path: '', inherit_memory: false, history_import_required: false,
-        }
-        await asUser(w.owner, async () => {
-          await db.query(
-            'SELECT identity.start_agent_provision_operation($1, $2, $3::jsonb, NULL, NULL, NULL, NULL, NULL, $4, $5)',
-            [op, w.newDevice, JSON.stringify({ kind: 'single', members: [m] }), 'claude', '你刚开通。'],
-          )
-          await db.query('SELECT identity.claim_provision_slots($1)', [op])
-          await db.query('SELECT identity.prepare_agent_provision($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, NULL)', [provision, op, 'single', w.newDevice, '新助理', 'claude-code', ''])
-        })
-        const r = await row(provision)
-        await finishCreate(provision)
-        expect(await settle(w, provision)).toBe('ready')
-        const complete = () => asUser(w.owner, async () =>
-          (await db.query<{ message_id: string | null; client_message_id: string | null; already: boolean }>(
-            'SELECT * FROM identity.complete_agent_provision($1)', [provision])).rows[0])
-        expect(await complete()).toEqual({ message_id: null, client_message_id: null, already: false })
-        expect(await complete()).toEqual({ message_id: null, client_message_id: null, already: true })
-        expect((await row(provision)).phase).toBe('completed')
-        const { rows: msgs } = await db.query('SELECT 1 FROM chat.messages WHERE sender_user_id = $1', [r.agent_user_id])
-        expect(msgs).toHaveLength(0)
+        expect(await provisionWithLocale(w, 'en-US', '你刚开通。')).toEqual(['I\'m Gugu, ready to go. Just tell me what you need.'])
+      })
+    })
+
+    it('普通 agent:中文界面写中文;没带 locale(旧客户端)照旧中文', async () => {
+      await world(async (w) => {
+        expect(await provisionWithLocale(w, 'zh-CN', null)).toEqual(['我是 Gugu，已就位。有什么可以帮你的，直接说。'])
+        expect(await provisionWithLocale(w, null, null)).toEqual(['我是 Gugu，已就位。有什么可以帮你的，直接说。'])
+      })
+    })
+
+    it('blueprint.locale 只认 zh-CN / en-US', async () => {
+      await world(async (w) => {
+        const m = { provision_id: randomUUID(), member_key: 'single', display_name: 'Gugu', agent_type: 'claude-code',
+          project_path: '', inherit_memory: false, history_import_required: false }
+        await asUser(w.owner, () => rejectsKeepingTransaction(() => db.query('SELECT identity.start_agent_provision_operation($1, $2, $3::jsonb)',
+          [randomUUID(), w.newDevice, JSON.stringify({ kind: 'single', members: [m], locale: 'fr-FR' })]), /blueprint\.locale must be zh-CN\|en-US/))
       })
     })
   })

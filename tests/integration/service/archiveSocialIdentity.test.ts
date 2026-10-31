@@ -115,6 +115,17 @@ describe('archive terminates identity without touching seats or history', () => 
     expect((await db.query('SELECT identity.user_is_live($1) AS yes', [peer])).rows[0].yes).toBe(false)
     expect((await db.query('SELECT * FROM identity.friendships WHERE user_a_id=$1 OR user_b_id=$1', [peer])).rows).toHaveLength(1)
   })
+  it('restoration provisions a new identity into only its project group, never the old seats', async () => {
+    await archive()
+    const fresh = randomUUID()
+    await user()
+    const minted = (await db.query(`SELECT * FROM identity.provision_taskpage_agent($1,'Restored 1','serial','claude-code',$2,'/fixture/project',$3,NULL,'Project')`, [fresh, device, rooms[0]])).rows[0]
+    expect(minted.agent_id).toBe(fresh)
+    await admin()
+    expect((await db.query('SELECT chat_id FROM chat.active_members WHERE user_id=$1 ORDER BY chat_id', [fresh])).rows).toEqual([{ chat_id: rooms[0] }])
+    expect((await db.query('SELECT removed_at FROM identity.users WHERE id=$1', [agent])).rows[0].removed_at).not.toBeNull()
+    expect((await denied(`SELECT * FROM identity.provision_taskpage_agent($1,'Old 1','serial','claude-code',$2)`, [agent, device])).code).toBe('55000')
+  })
   it('installed functions and policies do not bypass live membership', async () => {
     const functions = (await db.query(`SELECT n.nspname||'.'||p.proname AS name,p.prosrc FROM pg_proc p
       JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_language l ON l.oid=p.prolang

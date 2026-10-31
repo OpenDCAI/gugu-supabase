@@ -23,7 +23,7 @@ BEGIN
       JOIN LATERAL (SELECT chat.history_floor(m.chat_id, v_actor) AS floor) h ON true
       LEFT JOIN identity.users u ON u.id = m.sender_user_id
      WHERE (CASE WHEN p_chat_id IS NULL
-                 THEN m.chat_id IN (SELECT cm.chat_id FROM chat.chat_members cm WHERE cm.user_id = v_actor)
+                 THEN m.chat_id IN (SELECT cm.chat_id FROM chat.active_members cm WHERE cm.user_id = v_actor)
                  ELSE m.chat_id = p_chat_id END)
        AND m.deleted_at IS NULL
        AND m.content ILIKE v_pattern

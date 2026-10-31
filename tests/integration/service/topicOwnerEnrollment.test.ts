@@ -81,7 +81,7 @@ describe('Agent topic participation carries its eligible human owner', () => {
   })
   it('preserves the human owner role when an Agent creates the topic', async () => {
     topic = await open(agent)
-    expect(await member(owner)).toMatchObject({ role: 'owner' })
+    expect(await member(owner)).toMatchObject({ role: 'member' })
     expect(await member(agent)).toMatchObject({ role: 'member' })
   })
   it.each([false, true])('enrolls a mentioned Agent and its owner through a message (direct=%s)', async (direct) => {

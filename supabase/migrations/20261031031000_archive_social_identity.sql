@@ -239,8 +239,9 @@ BEGIN
         definition := regexp_replace(definition,'\mBEGIN\M',
           'BEGIN' || chr(10) || '    IF TG_OP = ''UPDATE'' AND OLD.removed_at IS DISTINCT FROM NEW.removed_at THEN RETURN NEW; END IF;');
       WHEN 'identity.build_agent_presence_payload(text)' THEN
-        definition := replace(definition, '''account_status'',       ''active''',
-          '''account_status'',       CASE WHEN u.removed_at IS NULL THEN ''active'' ELSE ''removed'' END');
+        definition := replace(definition, 'AND u.type = ''agent'';', 'AND u.type = ''agent'' AND identity.user_is_live(u.id);');
+        definition := replace(definition, 'FROM identity.agent_lifecycle_tombstones t',
+          'FROM (SELECT agent_user_id,removed_at FROM identity.agent_lifecycle_tombstones UNION ALL SELECT id,removed_at FROM identity.users WHERE removed_at IS NOT NULL AND type=''agent'') t');
       WHEN 'identity.search_users(text)' THEN
         definition := replace(definition,'WHERE u.id <> COALESCE(v_me, '''')',
           'WHERE identity.user_is_live(u.id) AND u.id <> COALESCE(v_me, '''')');
@@ -275,9 +276,16 @@ BEGIN
       'identity.settle_provision_cancellation(uuid)'::regprocedure,
       'chat.group_add_denial(text,text,text,boolean,boolean)'::regprocedure,
       'chat.gugu_can_send_as(text,text,text)'::regprocedure)
+      OR (p.pronamespace='identity'::regnamespace
+        AND p.proname IN ('create_owned_agent','provision_taskpage_agent')
+        AND p.prolang=(SELECT oid FROM pg_language WHERE lanname='plpgsql'))
   LOOP
     definition:=pg_get_functiondef(r.oid); previous:=definition;
     CASE
+      WHEN r.signature::text LIKE 'identity.create_owned_agent(%'
+        OR r.signature::text LIKE 'identity.provision_taskpage_agent(%' THEN
+        definition:=regexp_replace(definition,'\mBEGIN\M','BEGIN' || chr(10) ||
+          '  IF EXISTS (SELECT 1 FROM identity.users u WHERE u.id=p_agent_id::text AND u.removed_at IS NOT NULL) THEN RAISE EXCEPTION ''identity_removed: restoring requires a new identity'' USING ERRCODE = ''55000''; END IF;');
       WHEN r.signature::text LIKE 'identity.set_agent_session_archival(%' THEN
         definition:=regexp_replace(definition,'\mBEGIN\M','BEGIN' || chr(10) ||
           '  IF NOT identity.user_is_live(p_agent_user_id) THEN RAISE EXCEPTION ''identity_removed: restoring requires a new identity'' USING ERRCODE = ''55000''; END IF;');

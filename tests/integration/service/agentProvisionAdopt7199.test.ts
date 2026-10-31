@@ -496,6 +496,36 @@ describe('开通 saga 收养已有的 agent(搬家)', () => {
         expect(completed.already).toBe(false)
       })
     })
+
+    it('带 first_task 的助理:complete 不插欢迎模板(它自己开口问候),message_id / client_message_id 为 NULL,重放 already = true', async () => {
+      await world(async (w) => {
+        const provision = randomUUID()
+        const op = randomUUID()
+        const m = {
+          provision_id: provision, member_key: 'single', display_name: '新助理', agent_type: 'claude-code',
+          project_path: '', inherit_memory: false, history_import_required: false,
+        }
+        await asUser(w.owner, async () => {
+          await db.query(
+            'SELECT identity.start_agent_provision_operation($1, $2, $3::jsonb, NULL, NULL, NULL, NULL, NULL, $4, $5)',
+            [op, w.newDevice, JSON.stringify({ kind: 'single', members: [m] }), 'claude', '你刚开通。'],
+          )
+          await db.query('SELECT identity.claim_provision_slots($1)', [op])
+          await db.query('SELECT identity.prepare_agent_provision($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, NULL)', [provision, op, 'single', w.newDevice, '新助理', 'claude-code', ''])
+        })
+        const r = await row(provision)
+        await finishCreate(provision)
+        expect(await settle(w, provision)).toBe('ready')
+        const complete = () => asUser(w.owner, async () =>
+          (await db.query<{ message_id: string | null; client_message_id: string | null; already: boolean }>(
+            'SELECT * FROM identity.complete_agent_provision($1)', [provision])).rows[0])
+        expect(await complete()).toEqual({ message_id: null, client_message_id: null, already: false })
+        expect(await complete()).toEqual({ message_id: null, client_message_id: null, already: true })
+        expect((await row(provision)).phase).toBe('completed')
+        const { rows: msgs } = await db.query('SELECT 1 FROM chat.messages WHERE sender_user_id = $1', [r.agent_user_id])
+        expect(msgs).toHaveLength(0)
+      })
+    })
   })
 
   it('设备命令类型认 agent.retire,别的陌生类型照旧被拒', async () => {

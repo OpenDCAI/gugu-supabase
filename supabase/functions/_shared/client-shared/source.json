@@ -1,0 +1,8 @@
+{
+  "repository": "OpenDCAI/gugu",
+  "commit": "24b4313217a0f8f63dd2178ddaa938f6b8d39c13",
+  "files": {
+    "workspaceUpload.mjs": "packages/core/src/shared/workspaceUpload.mjs",
+    "imageMime.mjs": "packages/core/src/shared/imageMime.mjs"
+  }
+}

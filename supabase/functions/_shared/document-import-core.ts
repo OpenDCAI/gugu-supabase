@@ -1,9 +1,8 @@
 import { type AttachmentsDeps, call, objectStorage, Refusal } from './attachments-core.ts'
 import { inspectFileStream } from './file-inspection.ts'
 import { ObjectStorageError } from './object-storage.ts'
-// Byte-identical copies of OpenDCAI/gugu@043cd650de96e4ee0fdd3d78c33632fa5dbfbcae
-// packages/core/src/shared/{workspaceUpload,imageMime}.mjs. Vendored for Edge runtime reliability; refresh both together
-// when the client's classifier changes.
+// Byte-identical copies of the client's packages/core/src/shared/{workspaceUpload,imageMime}.mjs at the commit pinned in
+// client-shared/source.json (tests/unit/client-shared checks the bytes). Vendored for Edge runtime reliability.
 import { WORKSPACE_TEXT_MAX_BYTES, workspaceUploadKind } from './client-shared/workspaceUpload.mjs'
 
 export { WORKSPACE_TEXT_MAX_BYTES }

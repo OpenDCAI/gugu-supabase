@@ -107,8 +107,8 @@ CREATE POLICY contacts_live ON chat.contacts AS RESTRICTIVE FOR ALL TO authentic
 CREATE POLICY contact_group_members_live ON identity.contact_group_members AS RESTRICTIVE FOR ALL TO authenticated
   USING (identity.user_is_live(contact_user_id)) WITH CHECK (identity.user_is_live(contact_user_id));
 CREATE POLICY contact_overrides_live ON identity.contact_overrides AS RESTRICTIVE FOR ALL TO authenticated
-  USING (identity.user_is_live(owner_user_id) AND identity.user_is_live(contact_user_id))
-  WITH CHECK (identity.user_is_live(owner_user_id) AND identity.user_is_live(contact_user_id));
+  USING (identity.user_is_live(owner_user_id) AND (target_kind='group' OR identity.user_is_live(contact_user_id)))
+  WITH CHECK (identity.user_is_live(owner_user_id) AND (target_kind='group' OR identity.user_is_live(contact_user_id)));
 
 -- Move installed SQL/PLpgSQL read sites, retaining their complete predecessor
 -- bodies, signatures, volatility, owners and ACLs. Published release files are
@@ -139,6 +139,8 @@ BEGIN
         '\1__archive_member_delete_target__', 'gi');
       definition := regexp_replace(definition,
         '(\m(FROM|JOIN|USING)[[:space:]]+)chat\.chat_members\M', '\1chat.active_members', 'gi');
+      -- Unaliased column qualifiers belong to the redirected relation too.
+      definition := regexp_replace(definition, '\mchat_members\.', 'active_members.', 'g');
       definition := replace(definition, '__archive_member_delete_target__', 'chat.chat_members');
     END IF;
     definition := regexp_replace(definition,

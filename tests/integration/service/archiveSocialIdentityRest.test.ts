@@ -63,6 +63,7 @@ afterAll(async () => {
 
 describe('archive through authenticated PostgREST and private realtime', () => {
   it('defaults true; one hint invalidates three groups, historical identity remains and old identity cannot send', async () => {
+    console.info('archive REST: reading retained seats')
     const before = await must<unknown[]>(admin.schema('chat').from('chat_members').select('*').eq('user_id', agent).order('chat_id'))
     expect(before).toHaveLength(4)
     const noRemoval = await must<{ removed_at: null }>(owner.schema('identity').rpc('archive_user', { p_user_id: agent, p_remove_social_identity: false }))
@@ -74,16 +75,21 @@ describe('archive through authenticated PostgREST and private realtime', () => {
     const event = new Promise<unknown>(resolve => { eventResolve = resolve })
     const channel = owner.channel('gugu:identity:lifecycle', { config: { private: true } })
       .on('broadcast', { event: 'identity_removed' }, message => { if (message.payload.id === agent) eventResolve(message.payload) })
+    console.info('archive REST: subscribing private identity channel')
     await new Promise<void>((resolve, reject) => {
       channel.subscribe(status => {
+        console.info('archive REST: private channel status', status)
         if (status === 'SUBSCRIBED') resolve()
         if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') reject(new Error(`Private identity channel: ${status}`))
       })
     })
     try {
+      console.info('archive REST: channel subscribed; requesting removal')
       const receipt = await must<{ removed_at: string }>(owner.schema('identity').rpc('archive_user', { p_user_id: agent }))
       expect(receipt.removed_at).toBeTruthy()
+      console.info('archive REST: committed removal receipt; awaiting broadcast')
       expect(await event).toEqual({ id: agent, removed_at: receipt.removed_at })
+      console.info('archive REST: broadcast received; checking authoritative projections')
       expect(await must(owner.schema('identity').rpc('archive_user', { p_user_id: agent }))).toEqual(receipt)
       expect(await must(admin.schema('chat').from('chat_members').select('*').eq('user_id', agent).order('chat_id'))).toEqual(before)
       for (const room of rooms) {

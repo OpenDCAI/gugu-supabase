@@ -137,6 +137,30 @@ describe('任务 agent 进群', () => {
     expect(await joinNotices(group)).toEqual([])
   })
 
+  it('rolls back a newly created group after a seat insert error, keeping the identity usable', async () => {
+    const group = randomUUID()
+    const agentId = randomUUID()
+    await asService()
+    await database.query(`CREATE FUNCTION pg_temp.reject_task_seat() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'task seat fixture failure'; END $$;
+      CREATE TRIGGER reject_task_seat BEFORE INSERT ON chat.chat_members FOR EACH ROW
+      WHEN (NEW.user_id = '${agentId}') EXECUTE FUNCTION pg_temp.reject_task_seat()`)
+    const { row } = await provision(group, agentId)
+    expect(row).toMatchObject({ group_chat_id: '', group_created: false, prior_group_state: 'join_failed' })
+    expect(await seat(group, agentId)).toBeUndefined()
+    expect((await database.query('SELECT id FROM chat.chats WHERE id=$1', [group])).rows).toEqual([])
+    await asUser(owner)
+    expect((await database.query<{ id: string }>(
+      'SELECT id FROM identity.users WHERE id=$1 AND owner_user_id=auth.uid()::text', [agentId],
+    )).rows).toEqual([{ id: agentId }])
+    // Retry the same identity after the group failure clears; the public address is unchanged.
+    await asService()
+    await database.query('DROP TRIGGER reject_task_seat ON chat.chat_members')
+    const retry = await provision(group, agentId)
+    expect(retry.row).toMatchObject({ group_chat_id: group, group_created: true, prior_group_state: 'missing' })
+    expect(await seat(group, agentId)).toEqual({ listen_mode: 'active' })
+  })
+
   it('已经在群里的座位不动:主人改成被动之后再 provision 一次,仍是被动', async () => {
     const group = await ownerOnlyGroup()
     const { agentId } = await provision(group)

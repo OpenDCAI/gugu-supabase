@@ -18,7 +18,13 @@ BEGIN
        'SELECT count(*) INTO v_count FROM chat.active_members cm JOIN identity.users u ON u.id = cm.user_id WHERE cm.chat_id = NEW.chat_id AND u.session_archived_at IS NULL;'),
       ('chat.decide_group_invitation_as(text,boolean,text)'::regprocedure,
        'SELECT count(*) INTO v_count FROM chat.active_members WHERE chat_id=v_group.id;',
-       'SELECT count(*) INTO v_count FROM chat.active_members m JOIN identity.users u ON u.id = m.user_id WHERE m.chat_id = v_group.id AND u.session_archived_at IS NULL;')
+       'SELECT count(*) INTO v_count FROM chat.active_members m JOIN identity.users u ON u.id = m.user_id WHERE m.chat_id = v_group.id AND u.session_archived_at IS NULL;'),
+      ('chat.join_public_group(integer,text)'::regprocedure,
+       'from chat.active_members where active_members.chat_id = v_chat_id;',
+       'from chat.active_members m join identity.users u on u.id = m.user_id where m.chat_id = v_chat_id and u.session_archived_at is null;'),
+      ('chat.request_group_join(integer,text,text)'::regprocedure,
+       'from chat.active_members where chat_id = v_chat_id;',
+       'from chat.active_members m join identity.users u on u.id = m.user_id where m.chat_id = v_chat_id and u.session_archived_at is null;')
     ) AS definitions(signature, prior_sql, replacement_sql)
     LOOP
         SELECT pg_get_functiondef(p.oid), COALESCE(p.proacl, acldefault('f', p.proowner))

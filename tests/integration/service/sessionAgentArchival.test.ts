@@ -157,6 +157,31 @@ describe('reversible agent session archival', () => {
     await db.query('SET CONSTRAINTS ALL IMMEDIATE')
   })
 
+  it.each(['join_public_group', 'request_group_join'])('releases capacity for %s after archive', async (entry) => {
+    const token = randomUUID()
+    await db.query("UPDATE chat.chats SET max_members=4,join_mode='open',invite_link_enabled=true,join_token=$2 WHERE id=$1", [group, token])
+    const publicId = (await db.query('SELECT public_id FROM chat.chats WHERE id=$1', [group])).rows[0].public_id
+    const joining = randomUUID()
+    await db.query(`INSERT INTO auth.users(id,aud,role,email,raw_app_meta_data,raw_user_meta_data,created_at,updated_at)
+      VALUES($1,'authenticated','authenticated',$2,'{}','{}',now(),now())`, [joining, `${joining}@session-archive.invalid`])
+    const join = async () => {
+      await asUser(joining)
+      const result = await db.query(entry === 'join_public_group'
+        ? 'SELECT * FROM chat.join_public_group($1,$2)'
+        : 'SELECT chat.request_group_join($1,$2,NULL) AS outcome', [publicId, token])
+      await db.query('RESET ROLE')
+      return result.rows[0]
+    }
+    expect(await denied(join)).toContain('Group member limit reached')
+    await archive()
+    const result = await join()
+    if (entry === 'join_public_group') expect(result).toMatchObject({ is_member: true, member_count: 5 })
+    else expect(result.outcome).toBe('joined')
+    expect((await db.query('SELECT user_id FROM chat.chat_members WHERE chat_id=$1 AND user_id=ANY($2)', [group, [agent, joining]])).rows)
+      .toHaveLength(2)
+    await db.query('SET CONSTRAINTS ALL IMMEDIATE')
+  })
+
   it.each([
     { mode: 'passive', route: 'mention', admitted: true },
     { mode: 'active', route: 'mention', admitted: true },

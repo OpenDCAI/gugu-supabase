@@ -69,8 +69,8 @@ describe('widget message SQL contract', () => {
     await post(encode())
     await post(encode({ data: {}, future: { id: 'nested-is-allowed', title: 'also allowed' } }))
     await post(encode({ text: '😀'.repeat(200) }))
-    const dataLimit = encode({ data: { p: 'x'.repeat(4087) } })
-    expect((await database.query("SELECT octet_length(($1::jsonb->'data')::text) AS bytes", [dataLimit])).rows[0].bytes).toBe(4096)
+    const dataLimit = encode({ data: { p: 'x'.repeat(4088) } })
+    expect((await database.query("SELECT octet_length(($1::json->'data')::text) AS bytes", [dataLimit])).rows[0].bytes).toBe(4096)
     await post(dataLimit)
     const base = encode({ text: '字'.repeat(200) })
     const contentLimit = base + ' '.repeat(6144 - Buffer.byteLength(base))
@@ -91,7 +91,7 @@ describe('widget message SQL contract', () => {
     ...[1, '2', null].map((v) => ['wrong version', encode({ v })]),
     ...['', null, 1, [], {}, '字'.repeat(201)].map((text) => ['invalid text', encode({ text })]),
     ...['app', 'view'].flatMap((field) => ['', null, 1, [], {}].map((value) => ['invalid ' + field, encode({ [field]: value })])),
-    ...[null, [], 'data', 1, { p: 'x'.repeat(4088) }, { p: '字'.repeat(1363) }].map((data) => ['invalid data', encode({ data })]),
+    ...[null, [], 'data', 1, { p: 'x'.repeat(4089) }, { p: '字'.repeat(1363) }].map((data) => ['invalid data', encode({ data })]),
     ...['id', 'title'].map((field) => ['reserved ' + field, encode({ [field]: null })]),
     ['both reserved fields', encode({ id: 'old', title: 'Old' })],
     ['jsonb-invalid escape', '{"v":2,"text":"\\u0000","app":"app","view":"view"}'],

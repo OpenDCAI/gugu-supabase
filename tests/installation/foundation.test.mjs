@@ -40,7 +40,7 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
         await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','Widget upgrade',$2)", [group, owner])
         await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner')", [group, owner])
         await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,'<div>old widget</div>','widget')", [legacy, group, owner])
-        const preview = () => query("SELECT oid,proacl::text,provolatile,prosecdef,proconfig,prosrc FROM pg_proc WHERE oid='chat.message_preview(text,text)'::regprocedure")
+        const preview = () => query("SELECT oid,(SELECT array_agg(acl::text ORDER BY acl::text) FROM unnest(proacl) AS acl) AS proacl,provolatile,prosecdef,proconfig,prosrc FROM pg_proc WHERE oid='chat.message_preview(text,text)'::regprocedure")
         const before = await preview()
         const widget = JSON.stringify({ v: 2, text: 'Build status', app: 'build-board', view: 'board' })
         assert.equal((await db.query("SELECT chat.message_preview($1,'widget') AS preview", [widget])).rows[0].preview, widget.slice(0, 100))

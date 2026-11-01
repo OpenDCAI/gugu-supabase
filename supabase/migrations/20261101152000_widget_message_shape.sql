@@ -47,7 +47,7 @@ ALTER TABLE chat.messages ADD CONSTRAINT messages_widget_shape CHECK (
             AND NOT (content::jsonb ?| ARRAY['id', 'title'])
             AND (NOT (content::jsonb ? 'data') OR (
                 jsonb_typeof(content::jsonb -> 'data') = 'object'
-                AND octet_length((content::jsonb -> 'data')::text) <= 4096
+                AND octet_length((content::json -> 'data')::text) <= 4096
             ))
         ) IS TRUE
         ELSE false

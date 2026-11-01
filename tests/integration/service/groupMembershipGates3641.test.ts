@@ -259,8 +259,9 @@ describe('③ provision_taskpage_agent 只往调用者自己所在的群里加',
     await asUser(owner)
     // profile_whoami and message_conversations use this actor-scoped RPC.
     expect((await database.query('SELECT * FROM chat.list_my_chats_as($1)', [full.agentId])).rows).toEqual([])
-    expect(await fails('SELECT * FROM chat.message_history_as($1,$2)', [group, full.agentId]))
-      .toMatch(/Not allowed to act as/)
+    expect((await database.query('SELECT allowed FROM (SELECT chat.can_act_as($1,$2) AS allowed) AS admission', [full.agentId, group])).rows)
+      .toEqual([{ allowed: false }])
+    expect((await database.query('SELECT * FROM chat.message_history_as($1,$2)', [group, full.agentId])).rows).toEqual([])
   })
   it('普通成员在「agent 加入需审批」的群里起会话 ⇒ 不绕过审批:进审批队列,这次不入群(20260924074100)', async () => {
     const group = await newGroup({ agent_join_approval: true })

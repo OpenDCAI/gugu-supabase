@@ -152,6 +152,10 @@ describe('temporary and kept copies on the reference ledger',()=>{
     expect(r.expiring.map((e:{class:string})=>e.class)).toEqual(['image','temporary'])
     expect(r.expiring[0]).toMatchObject({chat_id:project,item_id:expect.any(String),file_name:expect.any(String)})
     expect(r.machines).toEqual([])
+    // The idle-expiry policy the panel states: none set → null; set → exactly what chat.file_transfer_expire reads.
+    expect(r.expiry).toBeNull()
+    await db.query("UPDATE chat.file_transfer_limits SET settings=settings||'{\"large_file_bytes\":1048576,\"large_file_idle_seconds\":2592000}' WHERE scope='global' AND scope_id='*'")
+    expect((await overview()).expiry).toEqual({large_file_bytes:1048576,idle_seconds:2592000})
     void image;void kept
     // The owner's machine keeps the local files it sent: counted, not in the cloud.
     await user(host)

@@ -144,12 +144,11 @@ describe('one actor authority for people and Agents', () => {
     expect(await rejected(() => rpc('set_group_member_role_as', { p_chat_id: room, p_member_user_id: owner, p_role: 'member' }, owner)))
       .toContain('group_owner_role_protected')
   })
-  it('only the actual human owner may choose an Agent listen mode', async () => {
+  it('allows the human owner and actual group manager to choose an Agent listen mode', async () => {
     expect((await rpc('set_agent_listen_mode_as', { p_chat_id: room, p_agent_user_id: memberAgent, p_mode: 'passive' }, owner)).listen_mode).toBe('passive')
-    expect(await rejected(() => rpc('set_agent_listen_mode_as', { p_chat_id: room, p_agent_user_id: memberAgent, p_mode: 'active' }, agentOwner, adminAgent)))
-      .toContain('agent_owner_required')
+    expect((await rpc('set_agent_listen_mode_as', { p_chat_id: room, p_agent_user_id: memberAgent, p_mode: 'active' }, agentOwner, adminAgent)).listen_mode).toBe('active')
     expect(await rejected(() => rpc('set_agent_listen_mode_as', { p_chat_id: room, p_agent_user_id: memberAgent, p_mode: 'active' }, owner, memberAgent)))
-      .toContain('agent_owner_required')
+      .toContain('agent_owner_or_group_manager_required')
   })
   it('revokes the old table mutations even for a group owner, but keeps personal preferences', async () => {
     await asUser(owner)
@@ -200,9 +199,10 @@ describe('topic authority comes from the source, while settings belong to the pa
     await service()
     expect((await db.query<{ chat_id: string; listen_mode: string }>('SELECT chat_id,listen_mode FROM chat.chat_members WHERE user_id=$1 AND chat_id=ANY($2::text[])', [adminAgent, [room, topic]])).rows)
       .toEqual(expect.arrayContaining([{ chat_id: topic, listen_mode: 'passive' }, { chat_id: room, listen_mode: 'active' }]))
-    for (const [account, actor] of [[human, human], [owner, owner], [agentOwner, adminAgent]]) {
-      expect(await rejected(() => rpc('set_agent_listen_mode_as', { p_chat_id: topic, p_agent_user_id: adminAgent, p_mode: 'active' }, account, actor)))
-        .toContain('agent_owner_required')
+    expect(await rejected(() => rpc('set_agent_listen_mode_as', { p_chat_id: topic, p_agent_user_id: adminAgent, p_mode: 'active' }, human)))
+      .toContain('agent_owner_or_group_manager_required')
+    for (const [account, actor] of [[owner, owner], [agentOwner, adminAgent]]) {
+      expect((await rpc('set_agent_listen_mode_as', { p_chat_id: topic, p_agent_user_id: adminAgent, p_mode: 'active' }, account, actor)).listen_mode).toBe('active')
     }
   })
   it('lets source managers administer a topic without participation, then observes source revocation', async () => {

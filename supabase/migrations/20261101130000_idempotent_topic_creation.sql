@@ -181,6 +181,8 @@ $$;
 REVOKE ALL ON FUNCTION chat.create_topic(TEXT, TEXT, TEXT, TEXT[], TEXT, TEXT) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION chat.create_topic(TEXT, TEXT, TEXT, TEXT[], TEXT, TEXT) TO authenticated, service_role;
 
+COMMENT ON FUNCTION chat.create_topic(text, text, text, text[], text, text) IS 'Open a topic from an existing message, including source provenance and ordinary creator admission. A supplied topic id makes retries idempotent.';
+
 -- Forwarded text uses the canonical idempotent writer. Validate a new source
 -- there, where deletion, retraction and message visibility are authoritative.
 DO $migration$
@@ -200,7 +202,6 @@ BEGIN
             SELECT 1 FROM chat.messages source
             WHERE source.id = p_forwarded_from_message_id
               AND source.deleted_at IS NULL AND source.retracted_at IS NULL
-              AND chat.can_read_message(source.id, p_sender_user_id)
         ) THEN
             RAISE EXCEPTION 'Original message is missing, retracted, or not readable';
         END IF;

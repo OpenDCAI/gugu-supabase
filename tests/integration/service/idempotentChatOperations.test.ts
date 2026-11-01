@@ -75,6 +75,15 @@ it('text forwarding refuses missing and retracted sources, but accepted ids repl
     expect(await denied(owner, `SELECT * FROM chat.send_message_idempotent($1,$2,$3,NULL,'Forwarded','text',NULL,NULL,false,false,NULL,NULL,NULL,$4)`, [randomUUID(), destination, owner, source])).toMatch(/Original message/)
   }
 })
+it('forwarding as an owned agent uses the authenticated callers source access', async () => {
+  const agent = randomUUID(), id = randomUUID(), device = `outbox-${randomUUID()}`
+  await db.query("INSERT INTO identity.gugu_devices(device_id,user_id,label,hostname,platform) VALUES($1,$2,'Outbox fixture','fixture','linux')", [device, owner])
+  await db.query("INSERT INTO identity.users(id,type,display_name,owner_user_id,device_id,agent_public) VALUES($1,'agent','Outbox agent',$2,$3,true)", [agent, owner, device])
+  await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'member')", [destination, agent])
+  const rows = await as(owner, `SELECT * FROM chat.send_message_idempotent($1,$2,$3,NULL,'Forwarded','text',NULL,NULL,false,false,NULL,NULL,NULL,$4)`, [id, destination, agent, anchor])
+  expect(rows[0]).toMatchObject({ id, sender_user_id: agent })
+  expect((await db.query('SELECT user_id FROM chat.chat_members WHERE chat_id=$1 AND user_id=$2', [origin, agent])).rows).toEqual([])
+})
 it.each([false, true])('attachment forward replay publishes only one message and file (whisper=%s)', async whisper => {
   const blob = randomUUID(), hash = randomUUID().replaceAll('-', '').repeat(2), key = `staging/${owner}/${randomUUID()}`, source = randomUUID(), id = randomUUID()
   await db.query("INSERT INTO chat.file_blobs(id,bucket_id,object_name,sha256,size_bytes,content_type) VALUES($1,'oss',$2,$3,3,'text/plain')", [blob, hash.slice(0, 2) + '/' + hash, hash])
@@ -112,6 +121,38 @@ it('concurrent topic deliveries converge on one topic id', async () => {
     for (const client of clients) { await client.query('ROLLBACK').catch(() => {}); await client.end() }
     await db.query('DELETE FROM chat.chats WHERE id=ANY($1::text[])', [[id, origin, destination]])
     await db.query('DELETE FROM auth.users WHERE id=ANY($1::uuid[])', [[owner, reader, outsider]])
+    await db.query('BEGIN')
+  }
+})
+
+it('concurrent attachment forwards place one file for the same message id', async () => {
+  const blob = randomUUID(), hash = randomUUID().replaceAll('-', '').repeat(2), source = randomUUID(), id = randomUUID(), key = `staging/${owner}/${randomUUID()}`
+  await db.query("INSERT INTO chat.file_blobs(id,bucket_id,object_name,sha256,size_bytes,content_type) VALUES($1,'oss',$2,$3,3,'text/plain')", [blob, hash.slice(0, 2) + '/' + hash, hash])
+  await db.query('INSERT INTO chat.file_blob_uploads(staging_key,uploader,blob_id) VALUES($1,$2,$3)', [key, owner, blob])
+  await as(owner, 'SELECT * FROM chat.attachment_commit($1,$2,$3,$4,$5,$6,NULL,NULL,false,false)', [key, source, origin, owner, 'concurrent.txt', []])
+  await db.query('COMMIT')
+  const clients = [new Client({ connectionString: process.env.GUGU_INTEGRATION_DATABASE_URL }), new Client({ connectionString: process.env.GUGU_INTEGRATION_DATABASE_URL })]
+  try {
+    await Promise.all(clients.map(async client => {
+      await client.connect()
+      await client.query('BEGIN')
+      await client.query('SET LOCAL ROLE authenticated')
+      await client.query("SELECT set_config('request.jwt.claims',$1,true)", [JSON.stringify({ sub: owner, role: 'authenticated' })])
+    }))
+    const results = await Promise.all(clients.map(async client => {
+      const result = await client.query('SELECT * FROM chat.attachment_forward($1,$2,$3,$4,ARRAY[]::text[],NULL,false,false,NULL)', [source, id, destination, owner])
+      await client.query('COMMIT')
+      return result.rows[0]
+    }))
+    expect(results[0].id).toBe(id)
+    expect(results[1]).toMatchObject({ id, file_item_id: results[0].file_item_id, file_blob_id: results[0].file_blob_id })
+    expect((await db.query("SELECT id,blob_id FROM chat.workspace_items WHERE chat_id=$1 AND kind='file'", [destination])).rows).toEqual([{ id: results[0].file_item_id, blob_id: blob }])
+  } finally {
+    for (const client of clients) { await client.query('ROLLBACK').catch(() => {}); await client.end() }
+    await db.query('DELETE FROM chat.chats WHERE id=ANY($1::text[])', [[origin, destination]])
+    await db.query('DELETE FROM auth.users WHERE id=ANY($1::uuid[])', [[owner, reader, outsider]])
+    await db.query('DELETE FROM chat.file_blob_uploads WHERE blob_id=$1', [blob])
+    await db.query('DELETE FROM chat.file_blobs WHERE id=$1', [blob])
     await db.query('BEGIN')
   }
 })

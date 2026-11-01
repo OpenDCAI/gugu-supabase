@@ -18,13 +18,14 @@ BEGIN
     RETURN (
     SELECT coalesce(jsonb_agg(jsonb_build_object(
         'id', latest.id, 'status', latest.status, 'error', latest.error,
-        'result', jsonb_build_object('reply_notice', latest.result->'reply_notice'),
-        'payload', jsonb_build_object('agent_user_id', latest.payload->'agent_user_id'),
+        'result', jsonb_build_object('reply_notice', latest.reply_notice),
+        'payload', jsonb_build_object('agent_user_id', latest.agent_user_id),
         'created_at', latest.created_at, 'completed_at', latest.completed_at
     ) ORDER BY latest.created_at DESC, latest.id DESC), '[]'::jsonb)
     FROM (
         SELECT DISTINCT ON (c.payload->>'agent_user_id')
-               c.id, c.status, c.error, c.result, c.payload, c.created_at, c.completed_at
+               c.id, c.status, c.error, c.result->'reply_notice' AS reply_notice,
+               c.payload->>'agent_user_id' AS agent_user_id, c.created_at, c.completed_at
         FROM identity.gugu_device_commands c
         WHERE c.user_id = v_owner
           AND c.type = 'agent.deliver'

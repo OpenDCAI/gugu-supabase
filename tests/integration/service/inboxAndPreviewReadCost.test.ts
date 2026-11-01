@@ -246,7 +246,9 @@ describe('inbox pull, messages_view and message row policy: same results, cost b
     ]
     for (const args of cases) {
       // Positional comparison: the previous query's columns are unnamed duplicates (rm.sender_user_id, rm.content).
-      const now = await as<{ row: string }>(OWNER, 'SELECT p::text AS row FROM identity.pull_agent_inbox_v2($1,$2,$3,$4,$5,$6) p', args)
+      // Only the columns the previous query had: group_rules and named_identities were appended later
+      // (inboxPullDeliveryContext.test.ts covers them).
+      const now = await as<{ row: string }>(OWNER, 'SELECT ROW(p.chat_id, p.chat_kind, p.chat_public_id, p.chat_name, p.chat_creator_user_id, p.listen_mode, p.notification_level, p.last_read_seq, p.id, p.seq, p.sender_user_id, p.sender_type, p.sender_display_name, p.sender_gugu_number, p.content, p.content_type, p.to_user_ids, p.is_whisper, p.reply_to_message_id, p.reply_to_sender_user_id, p.reply_to_content, p.thread_root_id, p.is_thread_root, p.created_at, p.scan_max_ingest_seq, p.via_app, p.file_item_id, p.file_version, p.file_blob_id)::text AS row FROM identity.pull_agent_inbox_v2($1,$2,$3,$4,$5,$6) p', args)
       const before = await as<{ row: string }>(OWNER, `SELECT p::text AS row FROM (${OLD_PULL}) p`, args, 'postgres')
       expect(now, `pull ${JSON.stringify(args.slice(1, 5))}`).toEqual(before)
     }

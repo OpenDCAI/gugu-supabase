@@ -81,6 +81,30 @@ describe('pull_agent_inbox_v2 delivery context', () => {
     expect((await pull()).get(message)?.group_rules).toBe('')
   })
 
+  it('judges blank rules by exactly the characters the hosts trim', async () => {
+    // Every BMP code point but NUL (which text cannot hold) and the lone surrogates (which UTF-8 cannot).
+    const points = Array.from({ length: 0x10000 }, (_, point) => point).filter((point) => point > 0 && (point < 0xd800 || point > 0xdfff))
+    const { rows } = await db.query<{ point: number; present: boolean }>(
+      'SELECT point, chat.group_prompt_present(chr(point)) AS present FROM unnest($1::int[]) AS point', [points])
+    const disagree = rows.filter((row) => row.present !== (String.fromCodePoint(row.point).trim() !== '')).map((row) => row.point)
+    expect(rows).toHaveLength(points.length)
+    expect(disagree).toEqual([])
+    expect((await db.query("SELECT chat.group_prompt_present(NULL) AS a, chat.group_prompt_present('') AS b")).rows[0]).toEqual({ a: false, b: false })
+  })
+
+  it('stores no blank rules from any writer, keeps text as given, and a topic with blank rules inherits', async () => {
+    const blank = '\n\t\u00a0\u3000\ufeff '
+    const topic = await topicIn(group, blank)
+    const stored = async (id: string) => (await db.query('SELECT group_prompt FROM chat.chats WHERE id=$1', [id])).rows[0]?.group_prompt
+    expect(await stored(topic)).toBeNull()
+    const inTopic = await send(topic, [agent])
+    expect((await pull()).get(inTopic)?.group_rules).toBe('Group rules')
+    await db.query('UPDATE chat.chats SET group_prompt=$2 WHERE id=$1', [group, blank])
+    expect(await stored(group)).toBeNull()
+    await db.query('UPDATE chat.chats SET group_prompt=$2 WHERE id=$1', [group, '\n  Rules with an edge \n'])
+    expect(await stored(group)).toBe('\n  Rules with an edge \n')
+  })
+
   it('names the recipients and the quoted sender, never the sender itself', async () => {
     const quoted = await send(group, null, { sender: peer })
     const message = await send(group, [agent, peer, '*'], { sender: outsider, replyTo: quoted })

@@ -29,15 +29,16 @@ GRANT EXECUTE ON FUNCTION chat.message_preview(text, text) TO authenticated, ser
 COMMENT ON FUNCTION chat.message_preview(text, text) IS
     'Shared list and notification preview: widget text, attachment filename, otherwise the first 100 characters.';
 
--- CASE guards every cast; malformed JSON is a check violation, not a cast error.
--- IS TRUE closes SQL NULL results from missing required fields. Old rows are
--- left untouched, while every subsequent INSERT or UPDATE must satisfy the check.
+-- Only the numeric v=2 marker opts into the new contract. Legacy messages must
+-- remain deletable, retractable and editable, even though CHECK runs on UPDATE.
+-- CASE guards every cast; IS TRUE closes missing fields within the v2 shape.
 ALTER TABLE chat.messages ADD CONSTRAINT messages_widget_shape CHECK (
     CASE
         WHEN content_type <> 'widget' THEN true
-        WHEN octet_length(content) <= 6144 AND pg_input_is_valid(content, 'jsonb') THEN (
-            jsonb_typeof(content::jsonb) = 'object'
-            AND content::jsonb -> 'v' = '2'::jsonb
+        WHEN pg_input_is_valid(content, 'jsonb') THEN CASE
+          WHEN content::jsonb -> 'v' = '2'::jsonb THEN (
+            octet_length(content) <= 6144
+            AND jsonb_typeof(content::jsonb) = 'object'
             AND jsonb_typeof(content::jsonb -> 'text') = 'string'
             AND length(content::jsonb ->> 'text') BETWEEN 1 AND 200
             AND jsonb_typeof(content::jsonb -> 'app') = 'string'
@@ -50,6 +51,7 @@ ALTER TABLE chat.messages ADD CONSTRAINT messages_widget_shape CHECK (
                 AND octet_length((content::json -> 'data')::text) <= 4096
             ))
         ) IS TRUE
-        ELSE false
+          ELSE true END
+        ELSE true
     END
 ) NOT VALID;

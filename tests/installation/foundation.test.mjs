@@ -39,7 +39,8 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
         await db.query("INSERT INTO identity.users(id,type,display_name) VALUES($1,'human','Widget upgrade fixture')", [owner])
         await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','Widget upgrade',$2)", [group, owner])
         await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner')", [group, owner])
-        await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,'<div>old widget</div>','widget')", [legacy, group, owner])
+        const legacyContent = JSON.stringify({ id: 'legacy', title: 'Legacy widget', html: '<p>Old widget</p>' })
+        await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [legacy, group, owner, legacyContent])
         const preview = () => query("SELECT oid,(SELECT array_agg(acl::text ORDER BY acl::text) FROM unnest(proacl) AS acl) AS proacl,provolatile,prosecdef,proconfig,prosrc FROM pg_proc WHERE oid='chat.message_preview(text,text)'::regprocedure")
         const before = await preview()
         const widget = JSON.stringify({ v: 2, text: 'Build status', app: 'build-board', view: 'board' })
@@ -55,7 +56,7 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
           assert.deepEqual({ ...after[0], prosrc: before[0].prosrc }, before[0])
           assert.equal((await query("SELECT convalidated FROM pg_constraint WHERE conrelid='chat.messages'::regclass AND conname='messages_widget_shape'"))[0].convalidated, false)
           assert.equal((await db.query("SELECT chat.message_preview($1,'widget') AS preview", [widget])).rows[0].preview, 'Build status')
-          assert.equal((await db.query('SELECT content,chat.message_preview(content,content_type) AS preview FROM chat.messages WHERE id=$1', [legacy])).rows[0].content, '<div>old widget</div>')
+          assert.equal((await db.query('SELECT content FROM chat.messages WHERE id=$1', [legacy])).rows[0].content, legacyContent)
           assert.equal((await db.query('SELECT chat.message_preview(content,content_type) AS preview FROM chat.messages WHERE id=$1', [legacy])).rows[0].preview, '[Widget]')
           assert.equal((await query("SELECT has_function_privilege('anon','chat.message_preview(text,text)','EXECUTE') AS allowed"))[0].allowed, false)
           for (const role of ['authenticated', 'service_role']) {
@@ -63,10 +64,11 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
           }
           await query('BEGIN')
           try {
-            await assert.rejects(db.query('UPDATE chat.messages SET updated_at=now() WHERE id=$1', [legacy]), { code: '23514', constraint: 'messages_widget_shape' })
+            await query('SET LOCAL ROLE authenticated')
+            await db.query("SELECT set_config('request.jwt.claim.sub',$1,true)", [owner])
+            await db.query('UPDATE chat.messages SET edited_at=now(),retracted_at=now() WHERE id=$1', [legacy])
+            assert.equal((await db.query('SELECT * FROM chat.delete_message($1)', [legacy])).rows[0].globally_deleted, true)
           } finally { await query('ROLLBACK') }
-          // Repairing the old row remains possible; NOT VALID exempts only pre-existing tuples.
-          await db.query("UPDATE chat.messages SET content_type='text' WHERE id=$1", [legacy])
         })
         await db.query('DELETE FROM chat.chats WHERE id=$1', [group])
         await db.query('DELETE FROM identity.users WHERE id=$1', [owner])

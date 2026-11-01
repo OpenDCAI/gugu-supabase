@@ -77,25 +77,21 @@ describe('widget message SQL contract', () => {
     expect(Buffer.byteLength(contentLimit)).toBe(6144)
     await post(contentLimit)
     await rejected("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [randomUUID(), chat, owner, contentLimit + ' '])
-    // CHECK applies only to widget messages; ordinary content retains its existing contract.
+    // Ordinary content retains its existing contract.
     await post('{not json ' + 'x'.repeat(6144), 'text')
   })
 
   const invalid = [
-    ['SQL null', null], ['bad JSON', '{'], ['JSON null', 'null'], ['array', '[]'],
-    ['missing fields', '{}'], ['old widget', '{"id":"old","title":"Old"}'],
-    ...['v', 'text', 'app', 'view'].map((field) => {
+    ['missing fields', '{"v":2}'],
+    ...['text', 'app', 'view'].map((field) => {
       const missing: Record<string, unknown> = { ...widget }; delete missing[field]
       return ['missing ' + field, JSON.stringify(missing)]
     }),
-    ...[1, '2', null].map((v) => ['wrong version', encode({ v })]),
     ...['', null, 1, [], {}, '字'.repeat(201)].map((text) => ['invalid text', encode({ text })]),
     ...['app', 'view'].flatMap((field) => ['', null, 1, [], {}].map((value) => ['invalid ' + field, encode({ [field]: value })])),
     ...[null, [], 'data', 1, { p: 'x'.repeat(4089) }, { p: '字'.repeat(1363) }].map((data) => ['invalid data', encode({ data })]),
     ...['id', 'title'].map((field) => ['reserved ' + field, encode({ [field]: null })]),
     ['both reserved fields', encode({ id: 'old', title: 'Old' })],
-    ['jsonb-invalid escape', '{"v":2,"text":"\\u0000","app":"app","view":"view"}'],
-    ['jsonb-invalid number', encode().slice(0, -1) + ',"future":1e1000000}'],
   ] as Array<[string, string | null]>
   it.each(invalid)('rejects %s with the named CHECK instead of a cast exception', async (_name, content) => {
     await rejected("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [randomUUID(), chat, owner, content])
@@ -106,11 +102,44 @@ describe('widget message SQL contract', () => {
     await database.query("SELECT set_config('request.jwt.claim.sub',$1,true)", [owner])
     const id = await post(encode())
     await rejected('UPDATE chat.messages SET content=$1 WHERE id=$2', [encode({ text: '' }), id])
-    await rejected("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [randomUUID(), chat, owner, '{'])
+    await rejected("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [randomUUID(), chat, owner, '{"v":2}'])
     await database.query('UPDATE chat.messages SET content=$1 WHERE id=$2', [encode({ text: 'Updated text' }), id])
     await database.query('RESET ROLE')
     expect((await database.query('SELECT content FROM chat.messages WHERE id=$1', [id])).rows[0].content).toBe(encode({ text: 'Updated text' }))
     await database.query('SET LOCAL ROLE service_role')
     await rejected("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [randomUUID(), chat, owner, encode({ title: 'legacy' })])
+  })
+
+  it.each([null, '{', 'null', '[]', '{}', '{"v":1}', '{"v":"2"}',
+    '{"id":"legacy","title":"Legacy widget","html":"<p>Old widget</p>"}',
+    '{"text":"\\u0000"}', '{"text":1e1000000}',
+  ])('preserves non-v2 widget inserts and metadata updates: %s', async (content) => {
+    const id = await post(content)
+    await database.query('UPDATE chat.messages SET edited_at=now() WHERE id=$1', [id])
+  })
+
+  it('keeps legacy delete, delete-for-me, clear, retraction and content edit paths working', async () => {
+    const content = JSON.stringify({ id: 'legacy', title: 'Legacy widget', html: '<p>Old widget</p>' })
+    const id = await post(content)
+    const peer = randomUUID()
+    await database.query("INSERT INTO identity.users(id,type,display_name) VALUES($1,'human','Widget peer')", [peer])
+    await database.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'member')", [chat, peer])
+    for (const [actor, sql, values, result] of [
+      [owner, 'SELECT * FROM chat.delete_message($1)', [id], { globally_deleted: true }],
+      [peer, 'SELECT * FROM chat.delete_message($1)', [id], { globally_deleted: false }],
+      [owner, 'SELECT chat.clear_messages_for_me($1)', [chat], {}],
+      [owner, 'UPDATE chat.messages SET retracted_at=now() WHERE id=$1 RETURNING content', [id], { content }],
+      [owner, 'UPDATE chat.messages SET content=$1,edited_at=now() WHERE id=$2 RETURNING content', [content, id], { content }],
+    ] as Array<[string, string, unknown[], Record<string, unknown>]>) {
+      await database.query('SAVEPOINT legacy_action')
+      try {
+        await database.query('SET LOCAL ROLE authenticated')
+        await database.query("SELECT set_config('request.jwt.claim.sub',$1,true)", [actor])
+        expect((await database.query(sql, values)).rows[0]).toMatchObject(result)
+      } finally {
+        await database.query('ROLLBACK TO SAVEPOINT legacy_action')
+        await database.query('RELEASE SAVEPOINT legacy_action')
+      }
+    }
   })
 })

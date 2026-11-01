@@ -80,6 +80,7 @@ describe('widget message SQL contract', () => {
     await rejected("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [randomUUID(), chat, owner, contentLimit + ' '])
     // Ordinary content retains its existing contract.
     await post('{not json ' + 'x'.repeat(6144), 'text')
+    await post('1e1000000', 'text')
   })
 
   const invalid = [
@@ -94,6 +95,12 @@ describe('widget message SQL contract', () => {
     ...['id', 'title'].map((field) => ['reserved ' + field, encode({ [field]: null })]),
     ['both reserved fields', encode({ id: 'old', title: 'Old' })],
     ['version rounds to v2 in JavaScript', '{"v":2.00000000000000000000001,"id":"legacy","title":"Bypass"}'],
+    ['JSON valid but JSONB rejects NUL', '{"text":"\\u0000"}'],
+    ['JSON valid but JSONB rejects huge numeric', '{"text":1e1000000}'],
+    ['v2 JSONB rejects NUL', '{"v":2,"text":"Build","app":"app","view":"view","future":"\\u0000"}'],
+    ['v2 JSONB rejects high surrogate', '{"v":2,"text":"Build","app":"app","view":"view","future":"\\ud800"}'],
+    ['v2 JSONB rejects low surrogate', '{"v":2,"text":"Build","app":"app","view":"view","future":"\\udc00"}'],
+    ['v2 JSONB rejects huge numeric', '{"v":2,"text":"Build","app":"app","view":"view","future":1e1000000}'],
   ] as Array<[string, string | null]>
   it.each(invalid)('rejects %s with the named CHECK instead of a cast exception', async (_name, content) => {
     await rejected("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [randomUUID(), chat, owner, content])
@@ -132,7 +139,6 @@ describe('widget message SQL contract', () => {
 
   it.each([null, '{', 'null', '[]', '{}', '{"v":1}', '{"v":"2"}',
     '{"id":"legacy","title":"Legacy widget","html":"<p>Old widget</p>"}',
-    '{"text":"\\u0000"}', '{"text":1e1000000}',
     '{"v":1e10000}', '{"v":1e-10000}',
   ])('preserves non-v2 widget inserts and metadata updates: %s', async (content) => {
     const id = await post(content)

@@ -35,12 +35,16 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     assert.ok(firstFileRelease)
     const releaseQuery = async (sql) => {
       if (sql.includes(releases.find(release => release.version.endsWith('_widget_message_shape'))?.sql)) {
-        const owner = randomUUID(), group = randomUUID(), legacy = randomUUID()
+        const owner = randomUUID(), group = randomUUID(), legacy = randomUUID(), deep = randomUUID(), deepGroup = randomUUID()
         await db.query("INSERT INTO identity.users(id,type,display_name) VALUES($1,'human','Widget upgrade fixture')", [owner])
         await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','Widget upgrade',$2)", [group, owner])
         await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner')", [group, owner])
         const legacyContent = JSON.stringify({ id: 'legacy', title: 'Legacy widget', html: '<p>Old widget</p>' })
         await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [legacy, group, owner, legacyContent])
+        const deepContent = '['.repeat(16384) + '0' + ']'.repeat(16384)
+        await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','Deep widget upgrade',$2)", [deepGroup, owner])
+        await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner')", [deepGroup, owner])
+        await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [deep, deepGroup, owner, deepContent])
         const preview = () => query("SELECT oid,(SELECT array_agg(acl::text ORDER BY acl::text) FROM unnest(proacl) AS acl) AS proacl,provolatile,prosecdef,proconfig,prosrc FROM pg_proc WHERE oid='chat.message_preview(text,text)'::regprocedure")
         const before = await preview()
         const widget = JSON.stringify({ v: 2, text: 'Build status', app: 'build-board', view: 'board' })
@@ -70,6 +74,19 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
             assert.equal((await db.query('SELECT * FROM chat.delete_message($1)', [legacy])).rows[0].globally_deleted, true)
           } finally { await query('ROLLBACK') }
         })
+        await t.test('pre-existing deeply nested widget updates retain the PostgreSQL parser-limit rejection', async () => {
+          for (const statement of ['UPDATE chat.messages SET retracted_at=now() WHERE id=$1', 'SELECT * FROM chat.delete_message($1)']) {
+            await query('BEGIN')
+            try {
+              await query('SET LOCAL ROLE authenticated')
+              await db.query("SELECT set_config('request.jwt.claim.sub',$1,true)", [owner])
+              await assert.rejects(db.query(statement, [deep]), { code: '54001' })
+            } finally { await query('ROLLBACK') }
+          }
+          assert.equal((await db.query('SELECT content FROM chat.messages WHERE id=$1', [deep])).rows[0].content, deepContent)
+        })
+        await db.query('DELETE FROM chat.messages WHERE id=$1', [deep])
+        await db.query('DELETE FROM chat.chats WHERE id=$1', [deepGroup])
         await db.query('DELETE FROM chat.chats WHERE id=$1', [group])
         await db.query('DELETE FROM identity.users WHERE id=$1', [owner])
         return result

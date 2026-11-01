@@ -57,6 +57,7 @@ ALTER TABLE chat.messages ADD CONSTRAINT messages_widget_shape CHECK (
             ))
         ) IS TRUE
           ELSE true END
+        WHEN pg_input_is_valid(content, 'json') THEN false
         ELSE true
     END
 ) NOT VALID;

@@ -1,4 +1,5 @@
-BEGIN;
+-- The release installer owns the transaction, including its migration ledger.
+SET LOCAL lock_timeout = '5s';
 
 CREATE OR REPLACE FUNCTION chat.message_preview(p_content text, p_content_type text) RETURNS text
     LANGUAGE sql IMMUTABLE
@@ -20,6 +21,10 @@ CREATE OR REPLACE FUNCTION chat.message_preview(p_content text, p_content_type t
         ELSE left(coalesce(p_content, ''), 100)
     END;
 $_$;
+
+-- The function-DDL guard also closes authenticated access on replacement.
+REVOKE ALL ON FUNCTION chat.message_preview(text, text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION chat.message_preview(text, text) TO authenticated, service_role;
 
 COMMENT ON FUNCTION chat.message_preview(text, text) IS
     'Shared list and notification preview: widget text, attachment filename, otherwise the first 100 characters.';
@@ -48,5 +53,3 @@ ALTER TABLE chat.messages ADD CONSTRAINT messages_widget_shape CHECK (
         ELSE false
     END
 ) NOT VALID;
-
-COMMIT;

@@ -34,6 +34,44 @@ test('fresh foundation, repeat installation, authorization and refusal guards', 
     const firstFileRelease = releases.find((release) => release.version === '20261029114000_project_first_file_policy')
     assert.ok(firstFileRelease)
     const releaseQuery = async (sql) => {
+      if (sql.includes(releases.find(release => release.version.endsWith('_widget_message_shape'))?.sql)) {
+        const owner = randomUUID(), group = randomUUID(), legacy = randomUUID()
+        await db.query("INSERT INTO identity.users(id,type,display_name) VALUES($1,'human','Widget upgrade fixture')", [owner])
+        await db.query("INSERT INTO chat.chats(id,kind,name,creator_user_id) VALUES($1,'group','Widget upgrade',$2)", [group, owner])
+        await db.query("INSERT INTO chat.chat_members(chat_id,user_id,role) VALUES($1,$2,'owner')", [group, owner])
+        await db.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,'<div>old widget</div>','widget')", [legacy, group, owner])
+        const preview = () => query("SELECT oid,proacl::text,provolatile,prosecdef,proconfig,prosrc FROM pg_proc WHERE oid='chat.message_preview(text,text)'::regprocedure")
+        const before = await preview()
+        const widget = JSON.stringify({ v: 2, text: 'Build status', app: 'build-board', view: 'board' })
+        assert.equal((await db.query("SELECT chat.message_preview($1,'widget') AS preview", [widget])).rows[0].preview, widget.slice(0, 100))
+        await t.test('widget migration rolls back its function and constraint together', async () => {
+          await query(sql.replace(/COMMIT;\s*$/, 'ROLLBACK;'))
+          assert.deepEqual(await preview(), before)
+          assert.equal((await query("SELECT count(*)::int AS n FROM pg_constraint WHERE conrelid='chat.messages'::regclass AND conname='messages_widget_shape'"))[0].n, 0)
+        })
+        const result = await query(sql)
+        await t.test('widget migration preserves legacy rows and preview ACL without validating old content', async () => {
+          const after = await preview()
+          assert.deepEqual({ ...after[0], prosrc: before[0].prosrc }, before[0])
+          assert.equal((await query("SELECT convalidated FROM pg_constraint WHERE conrelid='chat.messages'::regclass AND conname='messages_widget_shape'"))[0].convalidated, false)
+          assert.equal((await db.query("SELECT chat.message_preview($1,'widget') AS preview", [widget])).rows[0].preview, 'Build status')
+          assert.equal((await db.query('SELECT content,chat.message_preview(content,content_type) AS preview FROM chat.messages WHERE id=$1', [legacy])).rows[0].content, '<div>old widget</div>')
+          assert.equal((await db.query('SELECT chat.message_preview(content,content_type) AS preview FROM chat.messages WHERE id=$1', [legacy])).rows[0].preview, '[Widget]')
+          assert.equal((await query("SELECT has_function_privilege('anon','chat.message_preview(text,text)','EXECUTE') AS allowed"))[0].allowed, false)
+          for (const role of ['authenticated', 'service_role']) {
+            assert.equal((await db.query("SELECT has_function_privilege($1,'chat.message_preview(text,text)','EXECUTE') AS allowed", [role])).rows[0].allowed, true)
+          }
+          await query('BEGIN')
+          try {
+            await assert.rejects(db.query('UPDATE chat.messages SET updated_at=now() WHERE id=$1', [legacy]), { code: '23514', constraint: 'messages_widget_shape' })
+          } finally { await query('ROLLBACK') }
+          // Repairing the old row remains possible; NOT VALID exempts only pre-existing tuples.
+          await db.query("UPDATE chat.messages SET content_type='text' WHERE id=$1", [legacy])
+        })
+        await db.query('DELETE FROM chat.chats WHERE id=$1', [group])
+        await db.query('DELETE FROM identity.users WHERE id=$1', [owner])
+        return result
+      }
       if (sql.includes(firstFileRelease.sql)) {
         await t.test('an already recorded later actor release refuses the older first-file release without changes', async () => {
           const snapshot = async () => ({

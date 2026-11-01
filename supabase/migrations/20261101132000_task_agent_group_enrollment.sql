@@ -40,3 +40,4 @@ END $enrollment$;
 -- Reuse the existing requested-by RLS policy to distinguish one's own pending
 -- join request from a refused enrollment. Expose only these non-content fields.
 GRANT SELECT (chat_id, requester_user_id, status) ON chat.group_join_requests TO authenticated;
+NOTIFY pgrst, 'reload schema';

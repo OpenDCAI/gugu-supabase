@@ -66,6 +66,14 @@ it('legacy callers can still create different topics without supplying an id', a
   const second = (await as(owner, 'SELECT * FROM chat.create_topic($1,$2)', [origin, anchor]))[0]
   expect(first.chat_id).not.toBe(second.chat_id)
 })
+it('legacy named four- and five-argument callers retain generated topic ids', async () => {
+  const four = (await as(owner, 'SELECT * FROM chat.create_topic(p_source_chat_id => $1, p_source_message_id => $2, p_name => NULL, p_member_user_ids => NULL)', [origin, anchor]))[0]
+  const five = (await as(owner, 'SELECT * FROM chat.create_topic(p_source_chat_id => $1, p_source_message_id => $2, p_name => NULL, p_member_user_ids => NULL, p_as_user_id => $3)', [origin, anchor, owner]))[0]
+  expect(four.chat_id).toMatch(/^[0-9a-f-]{36}$/)
+  expect(five.chat_id).toMatch(/^[0-9a-f-]{36}$/)
+  expect(four.chat_id).not.toBe(five.chat_id)
+  expect([four, five]).toEqual([expect.objectContaining({ source_chat_id: origin, source_message_id: anchor, creator_user_id: owner }), expect.objectContaining({ source_chat_id: origin, source_message_id: anchor, creator_user_id: owner })])
+})
 it('text forwarding refuses missing and retracted sources, but accepted ids replay after retraction', async () => {
   const id = randomUUID()
   await forwardText(anchor, id)

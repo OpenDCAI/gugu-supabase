@@ -248,7 +248,7 @@ describe('③ provision_taskpage_agent 只往调用者自己所在的群里加',
     await asService()
     await database.query('UPDATE chat.chats SET max_members = 5 WHERE id = $1', [group])
     const full = await provision(owner, group, withSerial)
-    expect(full.row).toMatchObject({ group_chat_id: '', prior_group_state: 'join_failed', group_created: false })
+    expect(full.row).toMatchObject({ group_chat_id: '', prior_group_state: 'join_failed:member_limit_reached', group_created: false })
     expect(await isMember(group, full.agentId)).toBe(false)
     expect((await database.query<{ owner_user_id: string }>(
       'SELECT owner_user_id FROM identity.users WHERE id=$1', [full.agentId],

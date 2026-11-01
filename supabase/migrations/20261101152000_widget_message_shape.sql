@@ -31,12 +31,17 @@ COMMENT ON FUNCTION chat.message_preview(text, text) IS
 
 -- Only the numeric v=2 marker opts into the new contract. Legacy messages must
 -- remain deletable, retractable and editable, even though CHECK runs on UPDATE.
+-- Match JavaScript's numeric version comparison, including float rounding.
 -- CASE guards every cast; IS TRUE closes missing fields within the v2 shape.
 ALTER TABLE chat.messages ADD CONSTRAINT messages_widget_shape CHECK (
     CASE
         WHEN content_type <> 'widget' THEN true
         WHEN pg_input_is_valid(content, 'jsonb') THEN CASE
-          WHEN content::jsonb -> 'v' = '2'::jsonb THEN (
+          WHEN CASE
+            WHEN jsonb_typeof(content::jsonb -> 'v') = 'number'
+              AND pg_input_is_valid(content::jsonb ->> 'v', 'double precision')
+              THEN (content::jsonb ->> 'v')::double precision = 2
+            ELSE false END THEN (
             octet_length(content) <= 6144
             AND jsonb_typeof(content::jsonb) = 'object'
             AND jsonb_typeof(content::jsonb -> 'text') = 'string'

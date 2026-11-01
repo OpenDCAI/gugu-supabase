@@ -69,6 +69,7 @@ describe('widget message SQL contract', () => {
     await post(encode())
     await post(encode({ data: {}, future: { id: 'nested-is-allowed', title: 'also allowed' } }))
     await post(encode({ text: '😀'.repeat(200) }))
+    await post(encode().replace('"v":2', '"v":2.00000000000000000000001'))
     const dataLimit = encode({ data: { p: 'x'.repeat(4088) } })
     expect((await database.query("SELECT octet_length(($1::json->'data')::text) AS bytes", [dataLimit])).rows[0].bytes).toBe(4096)
     await post(dataLimit)
@@ -92,9 +93,28 @@ describe('widget message SQL contract', () => {
     ...[null, [], 'data', 1, { p: 'x'.repeat(4089) }, { p: '字'.repeat(1363) }].map((data) => ['invalid data', encode({ data })]),
     ...['id', 'title'].map((field) => ['reserved ' + field, encode({ [field]: null })]),
     ['both reserved fields', encode({ id: 'old', title: 'Old' })],
+    ['version rounds to v2 in JavaScript', '{"v":2.00000000000000000000001,"id":"legacy","title":"Bypass"}'],
   ] as Array<[string, string | null]>
   it.each(invalid)('rejects %s with the named CHECK instead of a cast exception', async (_name, content) => {
     await rejected("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [randomUUID(), chat, owner, content])
+  })
+
+  it('rejects extremely nested oversized v2 content atomically', async () => {
+    const id = randomUUID()
+    const content = '{"v":2,"text":"Depth","app":"app","view":"view","data":{"p":'
+      + '['.repeat(16384) + '0' + ']'.repeat(16384) + '}}'
+    await database.query('SAVEPOINT nested_widget')
+    try {
+      await database.query('SET LOCAL ROLE authenticated')
+      await database.query("SELECT set_config('request.jwt.claim.sub',$1,true)", [owner])
+      await expect(database.query("INSERT INTO chat.messages(id,chat_id,sender_user_id,content,content_type) VALUES($1,$2,$3,$4,'widget')", [id, chat, owner, content]))
+        .rejects.toMatchObject({ code: expect.stringMatching(/^(23514|54001)$/) })
+    } finally {
+      await database.query('ROLLBACK TO SAVEPOINT nested_widget')
+      await database.query('RELEASE SAVEPOINT nested_widget')
+    }
+    expect((await database.query('SELECT id FROM chat.messages WHERE id=$1', [id])).rows).toEqual([])
+    await post(encode())
   })
 
   it('enforces direct member writes and updates even when RLS permits them', async () => {
@@ -113,6 +133,7 @@ describe('widget message SQL contract', () => {
   it.each([null, '{', 'null', '[]', '{}', '{"v":1}', '{"v":"2"}',
     '{"id":"legacy","title":"Legacy widget","html":"<p>Old widget</p>"}',
     '{"text":"\\u0000"}', '{"text":1e1000000}',
+    '{"v":1e10000}', '{"v":1e-10000}',
   ])('preserves non-v2 widget inserts and metadata updates: %s', async (content) => {
     const id = await post(content)
     await database.query('UPDATE chat.messages SET edited_at=now() WHERE id=$1', [id])
